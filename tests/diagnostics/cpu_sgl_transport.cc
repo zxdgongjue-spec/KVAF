@@ -25,6 +25,8 @@ std::uint64_t output_base{}, output_bytes{}, done_address{};
 std::uint32_t ready_wrs{}, data_tails{};
 bool delay_output_import{};
 std::function<void()> publish_suffix;
+std::function<void(std::uint64_t)> data_post;
+std::uint32_t read_posts{};
 std::uint64_t head_bytes{}, head_written{}, suffix_descriptor{};
 bool saw_async_suffix_read{};
 std::function<void(std::uint64_t, std::uint32_t)> chunk_read, chunk_write;
@@ -114,9 +116,11 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
       assert(!publish_suffix && pending_data > 0);  // Head CQEs have not been drained.
       saw_async_suffix_read = true;
     }
+    if (wr->opcode == URMA_OPC_READ) ++read_posts;
     if (wr->opcode == URMA_OPC_READ) last_read_cq = queue->jetty_cfg.jfs_cfg.jfc;
     if (chunk_read && wr->opcode == URMA_OPC_READ) chunk_read(src[0].addr, src[0].len);
     const bool data = wr->opcode == URMA_OPC_WRITE && dst->addr >= output_base && dst->addr < output_base + output_bytes;
+    if (data && data_post) data_post(dst->addr);
     if (retain_chunk_storage && data) {
       auto* cq = queue->jetty_cfg.jfs_cfg.jfc;
       pending_sges[cq] += wr->rw.src.num_sge;
@@ -513,6 +517,7 @@ void Reject(std::uint32_t requested, std::uint32_t device_limit, std::uint32_t m
 }
 }  // namespace
 
+#ifndef KVAF_CPU_SGL_REUSE_FIXTURE
 int main() {
   Run(4, 4);
   Run(8, 8);
@@ -556,3 +561,5 @@ int main() {
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);
   Reject(4, 13, kvaf::cpu_push::kScatterOutput);
 }
+
+#endif

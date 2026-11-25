@@ -32,6 +32,7 @@ check_artifacts() {
   grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
   if [[ "$require_scatter" == true ]]; then
     grep -Fq '"KvafAicpuCpuPushScatterExecutionV3"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
+    grep -Fq '"KvafAicpuCpuSglPushExecutionV1"' "$dir/kernel.json" || die "CPU SGL Push missing; rebuild with --cpu-push"
     grep -Fq '"KvafAicpuCpuSglWriteExecutionV1"' "$dir/kernel.json" || die "CPU SGL Write missing from $dir/kernel.json; rebuild with --cpu-push"
   fi
 }
@@ -46,6 +47,7 @@ check_installed() {
   grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
   if [[ "$require_scatter" == true ]]; then
     grep -Fq '"KvafAicpuCpuPushScatterExecutionV3"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
+    grep -Fq '"KvafAicpuCpuSglPushExecutionV1"' "$config_dir/$json" || die "installed JSON lacks CPU SGL Push; rebuild and reinstall with --cpu-push"
     grep -Fq '"KvafAicpuCpuSglWriteExecutionV1"' "$config_dir/$json" || die "installed JSON lacks CPU SGL Write; rebuild and reinstall with --cpu-push"
   fi
   count="$(grep -Fxc "$header" "$load_config" || true)"

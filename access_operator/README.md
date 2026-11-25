@@ -24,6 +24,7 @@ access_operator/
       gather/urma_aicpu/   # CPU Gather + AICPU READ
       scatter/urma_aicpu/  # CPU Push + AICPU Scatter
       cpu_sgl_write/urma_aiv/  # SIMT descriptors + CPU SGL direct output
+      cpu_sgl_push/       # AIV/AICPU descriptor WRITE mailbox + direct output
       common/aicpu/       # Gather/Scatter 共享 ABI、loader、设备入口和测试
     put/
       urma_aiv/           # URMA AIV Put

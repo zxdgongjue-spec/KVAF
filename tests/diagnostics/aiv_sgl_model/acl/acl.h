@@ -31,13 +31,15 @@ int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus*, aclmdlRI*);
 enum {
   ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE, ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE,
   ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US, ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE,
-  ACL_RT_ENGINE_TYPE_AIV,
+  ACL_RT_ENGINE_TYPE_AIV, ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT,
+  ACL_RT_BINARY_LOAD_OPT_CPU_KERNEL_MODE,
 };
 struct aclrtLaunchKernelAttr {
   int id;
   struct {
     int schemMode;
     uint32_t dynUBufSize;
+    uint32_t timeout;
     struct { uint32_t timeoutLow, timeoutHigh; } timeoutUs;
     int engineType;
   } value;
@@ -45,6 +47,10 @@ struct aclrtLaunchKernelAttr {
 struct aclrtLaunchKernelCfg { uint32_t numAttrs; aclrtLaunchKernelAttr* attrs; };
 aclrtBinary aclrtCreateBinary(const void*, size_t);
 int aclrtBinaryLoad(aclrtBinary, aclrtBinHandle*);
+struct aclrtBinaryLoadOption { int type; struct { int cpuKernelMode; } value; };
+struct aclrtBinaryLoadOptions { aclrtBinaryLoadOption* options; uint32_t numOpt; };
+int aclrtBinaryLoadFromFile(const char*, const aclrtBinaryLoadOptions*, aclrtBinHandle*);
+int aclrtBinaryUnLoad(aclrtBinHandle);
 int aclrtDestroyBinary(aclrtBinary);
 int aclrtBinaryGetFunction(aclrtBinHandle, const char*, aclrtFuncHandle*);
 int aclrtLaunchKernelWithHostArgs(aclrtFuncHandle, uint32_t, aclrtStream,

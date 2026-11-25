@@ -29,6 +29,7 @@ enum class Command : uint16_t {
   kEnableGatherLanes = 10U,
   kGetCandidateInfo = 5U,
   kOpenCpuPushGet = 11U,
+  kOpenCpuSglPush = 20U,
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kPrepareGatherWorkspace = 14U,
@@ -201,6 +202,20 @@ struct OpenCpuPushGetResponse {
   uint32_t cpu_psn;
   CpuPushChannelKey channels[4];
 };
+// Dedicated request keeps the existing CPU-read setup/response ABI unchanged.
+struct OpenCpuSglPushRequest {
+  OpenCpuPushGetRequest base;
+  uint64_t control_tp;
+  uint32_t control_psn;
+  CpuPushChannelKey control;
+};
+struct OpenCpuSglPushResponse {
+  OpenCpuPushGetResponse base;
+  uint64_t mailbox_base, mailbox_bytes;
+  uint32_t segment_bytes, max_write_bytes;
+  uint8_t segment[kSegKeyBytes];
+  CpuPushChannelKey control;
+};
 struct CpuPushGetSessionRequest {
   MessageHeader header;
   uint64_t session_id;
@@ -221,6 +236,7 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
+static_assert(sizeof(OpenCpuSglPushRequest) == 512U && sizeof(OpenCpuSglPushResponse) == 456U, "CPU SGL mailbox ABI changed");
 static_assert(sizeof(OpenCpuPushGetRequest) == 432U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");

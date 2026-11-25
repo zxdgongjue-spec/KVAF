@@ -59,6 +59,7 @@ class GetDispatchTrace {
 namespace {
 const char* GetAlgorithmLabel(GetExecutionConfig c) {
   if (c.transport == Transport::Ubmem) return "ubmem";
+  if (c.algorithm == GetAlgorithm::CpuSglPush) return c.executor == Executor::Aiv ? "aiv_cpu_sgl_push" : "cpu_sgl_push";
   if (c.executor == Executor::Aicpu)
     return c.algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
           c.algorithm == GetAlgorithm::Scatter ? "scatter" : "gather";
@@ -935,9 +936,9 @@ Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutput
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   if (c.transport != Transport::Urma ||
-      !((c.executor == Executor::Aiv && (c.algorithm == GetAlgorithm::Direct || c.algorithm == GetAlgorithm::CpuSglWrite)) ||
+      !((c.executor == Executor::Aiv && (c.algorithm == GetAlgorithm::Direct || IsCpuSgl(c.algorithm))) ||
         (c.executor == Executor::Aicpu && (c.algorithm == GetAlgorithm::Gather ||
-                                         c.algorithm == GetAlgorithm::CpuSglWrite))))
+                                         IsCpuSgl(c.algorithm)))))
     return Status::NotImplemented("output binding supports URMA AIV Direct, AICPU Gather and CPU SGL Write");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);

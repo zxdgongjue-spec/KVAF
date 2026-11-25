@@ -69,6 +69,8 @@ struct Queue {
   // Stable storage for one-WR control transfers, including a failed in-flight WR.
   Sge single_local{}, single_remote{};
   urma_jfs_wr_t single_wr{};
+  bool control_pending = false;
+  std::uint64_t control_context = 0, control_started = 0;
   bool poisoned = false;
   urma_jfc_t* jfc = nullptr;
   urma_jfr_t* jfr = nullptr;

@@ -158,7 +158,7 @@ bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
 
 bool TransferQueue(Queue& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                    UmdkControlStatus& status) {
-  if (worker.poisoned || worker.target == nullptr || CurrentState().remote.handle() == nullptr ||
+  if (worker.poisoned || worker.control_pending || worker.target == nullptr || CurrentState().remote.handle() == nullptr ||
       transfers == nullptr || count == 0 || count > kUmdkMaxTransfers)
     return Fail(status, "invalid UMDK transfer queue");
   if (count == 1 && transfers[0].bytes > 0 && transfers[0].bytes <= 65536)
@@ -204,6 +204,44 @@ std::uint32_t TransferControlSync(bool write, const UmdkTransfer* transfers,
 
 namespace kvaf::aicpu_urma {
 using namespace detail;
+// Post and wait separately so the kernel can build the suffix while the
+// immutable head chain and its descriptor source are still in flight.
+std::uint32_t UmdkTransferPost(const UmdkContext* args, const UmdkTransfer* transfers,
+                               std::uint32_t count, std::uint32_t worker_index) {
+  if (!args || !transfers || !count || count > 8) return 16;
+  auto session = FindSession(args->session); if (!session) return 16;
+  std::shared_lock<std::shared_mutex> lock(session->mutex);
+  SessionScope scope(*session);
+  if (args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= CurrentState().worker_count) return 16;
+  std::lock_guard<std::mutex> control_lock(session->control_mutexes[worker_index]);
+  auto* q = FindQueue(kUmdkControlQueueIndex + worker_index);
+  if (!q || q->poisoned || q->control_pending || !q->target || !CurrentState().remote.handle()) return 16;
+  for (std::uint32_t i = 0; i < count; ++i) if (!transfers[i].bytes || transfers[i].bytes > 1024 * 1024) return 16;
+  UmdkControlStatus status{};
+  std::uint32_t index = 0; std::uint64_t offset = 0;
+  if (!BuildTransfers(*q, true, transfers, count, index, offset, status) || index != count || offset) return 16;
+  q->control_context = q->requests.wrs.back().user_ctx;
+  q->control_started = NowNs();
+  // Even a partial post failure owns the WR/SGE arrays until queue destruction.
+  q->control_pending = true;
+  if (!PostBatch(*q, q->requests.wrs.data(), &q->requests.wrs.back(), status)) return 16;
+  return 0;
+}
+std::uint32_t UmdkTransferWait(const UmdkContext* args, std::uint32_t worker_index) {
+  if (!args) return 16;
+  auto session = FindSession(args->session); if (!session) return 16;
+  std::shared_lock<std::shared_mutex> lock(session->mutex);
+  SessionScope scope(*session);
+  if (args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= CurrentState().worker_count) return 16;
+  std::lock_guard<std::mutex> control_lock(session->control_mutexes[worker_index]);
+  auto* q = FindQueue(kUmdkControlQueueIndex + worker_index);
+  if (!q || q->poisoned || !q->control_pending) return 16;
+  UmdkControlStatus status{};
+  if (!WaitCompletion(*q, q->control_context, q->control_started, 30000, status)) return 16;
+  q->control_pending = false;
+  return 0;
+}
+
 std::uint32_t UmdkTransferSync(const UmdkContext* args, bool write, const UmdkTransfer* transfers,
                                std::uint32_t count, std::uint32_t worker_index) {
   if (!args) return 16;

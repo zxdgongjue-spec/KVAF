@@ -2,8 +2,11 @@
 #include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_urma/kernel_loader.h"
 #include "cpu_sgl_write_aiv_abi.h"
+#include "cpu_sgl_push_abi.h"
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
 #include "get/cpu_sgl_write/urma_aiv/include/cpu_sgl_write_aiv.h"
+#include "get/cpu_sgl_push/include/launch.h"
+#include "get/cpu_sgl_push/include/aiv_mailbox_abi.h"
 #endif
 #include "batch_get_args.h"
 #include "aicpu_batch_get_capture.h"
@@ -43,6 +46,11 @@ struct CpuPushTransport::Impl {
   void* profile_host{};
   std::array<std::unique_ptr<d::TargetChannel>, kJettyCount> channels;
   Layout layout;
+  MailboxLaunch mailbox;
+  void* mailbox_import{};
+  void* mailbox_device{};
+  std::unique_ptr<d::TargetChannel> mailbox_channel;
+  std::unique_ptr<aicpu_urma::UmdkSession> mailbox_umdk;
   using Invocation = aicpu_urma::AicpuGetInvocation;
   ExecutionViewState views;
   Invocation default_invocation{this};
@@ -129,7 +137,7 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
       {profile ? profile->device : s.profile_device, profile ? profile->host : s.profile_host,
        s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling, s.config.direct_output,
       s.bound_outputs.count(s.invocation) ? s.outputs.at(s.bound_outputs.at(s.invocation)).target : OutputTarget{},
-      s.config.sgl_pipeline};
+      s.config.sgl_pipeline, s.config.device_push, s.mailbox};
 }
 bool CpuPushTransport::direct_output() const { return impl_->config.direct_output; }
 Status CpuPushTransport::RegisterOutput(const MutableBufferView& output) {
@@ -369,7 +377,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   if (s.context || s.memory || s.initialized) return Status::InvalidState("CPU push already initialized");
   if (s.config.sge_per_wr > 16 || (s.config.sge_per_wr && !s.config.direct_output))
     return Status::InvalidArgument("sge_per_wr requires CPU SGL Write and must be in [0,16]");
-  if (s.config.sgl_payload_only && !s.config.direct_output)
+  if (s.config.sgl_payload_only && (s.config.device_push || !s.config.direct_output))
     return Status::InvalidArgument("sgl_payload_only requires CPU SGL Write");
   if (s.config.sgl_pipeline && (!s.config.direct_output || s.config.sgl_payload_only))
     return Status::InvalidArgument("sgl_pipeline requires CPU SGL Write without sgl_payload_only");
@@ -380,11 +388,14 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   bool loaded = false;
   if (s.config.aiv) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-    loaded = s.config.direct_output && KvafCpuSglWriteAivLoadKernel(s.config.kernel_json.c_str()) == 0;
+    loaded = s.config.direct_output && (s.config.device_push
+        ? KvafCpuSglPushAivLoadKernel(s.config.kernel_json.c_str()) : KvafCpuSglWriteAivLoadKernel(s.config.kernel_json.c_str())) == 0;
 #endif
   } else {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-    loaded = aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str());
+    loaded = s.config.device_push
+        ? aicpu_urma::PrepareUmdkKernel(s.config.kernel_json, aicpu_urma::UmdkKernelKind::CpuSglPush).ok()
+        : aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str());
 #endif
   }
   if (!loaded) return Error("load CPU push device kernel");
@@ -441,6 +452,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
   if (s.config.sgl_payload_only) open.output_mode = kPayloadOnlyOutput;
   if (s.config.sgl_pipeline) open.output_mode = kChunkedOutput;
+  if (s.config.device_push) open.output_mode = kPipelinedOutput;
   open.sge_per_wr = s.config.sge_per_wr;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
@@ -456,16 +468,109 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     open.channels[q].bytes = key.size;
     std::memcpy(open.channels[q].key, key.value, key.size);
   }
+  peer::OpenCpuSglPushRequest push{};
+  push.base = open;
+  if (s.config.device_push) {
+    push.control_psn = 1;
+    if (s.config.aiv) {
+      s.mailbox_channel = std::make_unique<d::TargetChannel>(s.api, s.context);
+      result = s.mailbox_channel->InitializeAiv(s.token, token_value, 1024, 16384);
+      if (!result.ok()) return result;
+      push.control_tp = npu_tp;
+      const auto& key = s.mailbox_channel->jetty_info().key;
+      push.control.bytes = key.size;
+      std::memcpy(push.control.key, key.value, key.size);
+    } else {
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+      s.mailbox_umdk = std::make_unique<aicpu_urma::UmdkSession>(aicpu_urma::UmdkSessionConfig{
+          s.config.kernel_json, 1, s.config.peer_link, s.config.local_eid, aicpu_urma::UmdkQueueProfile::Put});
+      aicpu_urma::UmdkControlStatus endpoint{};
+      result = s.mailbox_umdk->PrepareMailbox(source.base, s.memory, s.layout.bytes, &endpoint);
+      if (!result.ok()) return result;
+      push.control_tp = endpoint.tp;
+      push.control.bytes = endpoint.key_bytes;
+      std::memcpy(push.control.key, endpoint.key, endpoint.key_bytes);
+#endif
+    }
+  }
+  peer::OpenCpuSglPushResponse pushed{};
   peer::OpenCpuPushGetResponse reply{};
   // Even a failed/lost response may have created CPU resources. STOP is idempotent.
   s.peer_open = true;
-  result = s.config.peer_link->OpenCpuPushGet(source.base, open, &reply);
+  result = s.config.device_push ? s.config.peer_link->OpenCpuSglPush(source.base, push, &pushed)
+                                : s.config.peer_link->OpenCpuPushGet(source.base, open, &reply);
+  if (s.config.device_push && result.ok()) reply = pushed.base;
   if (!result.ok()) return result;
   for (std::uint32_t q = 0; q < kJettyCount; ++q) {
     d::QpImportInfoT info{};
     if (!d::ImportPeerJetty(s.api, s.context, reply.channels[q].key, reply.channels[q].bytes,
         token_value, open.npu_tp, reply.cpu_tp, open.npu_psn, reply.cpu_psn, "cpu_push_get",
         &info, s.channels[q]->peer_jetty_output())) return Error("import CPU Jetty");
+  }
+  if (s.config.device_push) {
+    if (!pushed.mailbox_base || pushed.mailbox_bytes < s.layout.staging || pushed.segment_bytes != kSegmentBytes ||
+        !pushed.max_write_bytes || pushed.max_write_bytes > 65536)
+      return Error("invalid CPU mailbox reply");
+    s.mailbox.remote_base = pushed.mailbox_base;
+    s.mailbox.bytes = pushed.mailbox_bytes;
+    if (s.config.aiv) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+      d::MrImportInfo imported{};
+      imported.in.key.size = pushed.segment_bytes;
+      std::memcpy(imported.in.key.value, pushed.segment, pushed.segment_bytes);
+      imported.in.ub.flags = ((1U << 1U) | (1U << 2U)) << 1U;
+      imported.in.ub.token_value = token_value;
+      if (s.api.rmem_import(s.context, &imported, &s.mailbox_import) || !s.mailbox_import)
+        return Error("import CPU mailbox");
+      AivMailboxContext context{};
+      context.max_write_bytes = pushed.max_write_bytes;
+      auto& e = context.entity;
+      e.magic = 0x4b564155U; e.version = 1;
+      e.remote_host_ddr_address = pushed.mailbox_base;
+      e.remote_host_ddr_size = pushed.mailbox_bytes;
+      std::uint32_t remote_token = 0;
+      std::memcpy(&remote_token, pushed.segment + 44, 4);
+      e.remote_token_id = remote_token >> 8;
+      e.remote_token_value = token_value;
+      e.local_token_id = token.token_id;
+      e.local_token_value = token_value;
+      e.local_hbm_address = reinterpret_cast<std::uint64_t>(s.memory);
+      e.local_hbm_size = s.layout.bytes;
+      d::QpImportInfoT info{};
+      if (!d::ImportPeerJetty(s.api, s.context, pushed.control.key, pushed.control.bytes, token_value,
+          npu_tp, reply.cpu_tp, 1, reply.cpu_psn, "sgl_mailbox", &info, s.mailbox_channel->peer_jetty_output()))
+        return Error("import CPU mailbox Jetty");
+      e.tp_id = info.out.ub.tpn;
+      const auto& sq = s.mailbox_channel->jetty_info().ub;
+      const auto& cq = s.mailbox_channel->cq_info().out;
+      e.sq_va = sq.sq_buffer_va; e.sq_db_va = sq.db_addr; e.jetty_id = sq.id;
+      e.sq_depth = 4096; e.wqe_size = 64;
+      e.cq_va = cq.buffer_addr; e.cq_db_va = cq.swdb_addr; e.jfc_id = cq.id;
+      e.cq_depth = 16384; e.cqe_size = cq.cqe_size;
+      for (std::size_t i = 0; i < 16; ++i) e.remote_eid[i] = region.eid[15 - i];
+      if (!e.local_token_id || !e.remote_token_id || !e.tp_id || !e.sq_va || !e.cq_va || e.cqe_size < 32)
+        return Error("invalid AIV mailbox queue ABI");
+      for (auto& words : context.write_templates) {
+        words[0] = (1U << 16) | (1U << 18) | (1U << 20) | (1U << 28) | (1U << 29);
+        words[1] = 3U << 8; words[2] = (e.tp_id & 0xffffffU) | (1U << 24);
+        words[3] = e.remote_token_id & 0xfffffU;
+        std::memcpy(words + 4, e.remote_eid, 16);
+        words[8] = e.remote_token_value; words[13] = e.local_token_id;
+      }
+      if (aclrtMalloc(&s.mailbox_device, sizeof(context), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+          aclrtMemcpy(s.mailbox_device, sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+        return Error("upload AIV mailbox context");
+      s.mailbox.aiv_context = reinterpret_cast<std::uint64_t>(s.mailbox_device);
+#endif
+    } else {
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+      result = s.mailbox_umdk->ConnectMailbox(pushed.mailbox_base, pushed.segment, pushed.segment_bytes,
+          pushed.control.key, pushed.control.bytes, reply.cpu_tp, reply.cpu_psn);
+      if (!result.ok()) return result;
+      const auto context = s.mailbox_umdk->context();
+      s.mailbox.session = context.session; s.mailbox.owner_pid = context.owner_pid;
+#endif
+    }
   }
   result = s.config.peer_link->StartCpuPushGet(source.base);
   if (!result.ok()) return result;
@@ -569,8 +674,9 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.status = detail::PointerValue(view.completion.device);
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
-  if (view.sgl_pipeline) args.sequence = kChunkPipelineLaunch;
+  if (view.sgl_pipeline && !view.device_push) args.sequence = kChunkPipelineLaunch;
   const CpuSglWriteArgs direct_args{args, view.output_target};
+  const CpuSglPushArgs pushed_args{direct_args, view.mailbox};
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;
@@ -579,11 +685,13 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   int launched = -1;
   if (aiv) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-    launched = KvafCpuSglWriteAivLaunch(&direct_args, stream);
+    launched = view.device_push ? KvafCpuSglPushAivLaunch(&pushed_args, stream) : KvafCpuSglWriteAivLaunch(&direct_args, stream);
 #endif
   } else {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-    launched = view.direct_output
+    launched = view.device_push
+        ? aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuSglPushExecutionV1", &pushed_args, sizeof(pushed_args), stream, args.workers)
+        : view.direct_output
         ? aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuSglWriteExecutionV1", &direct_args, sizeof(direct_args), stream, args.workers)
         : aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuPushScatterExecutionV3", &args, sizeof(args), stream, args.workers);
 #endif
@@ -627,6 +735,23 @@ Status CpuPushTransport::Shutdown() {
   // A healthy enqueued request still needs the CPU producer. Drain it before
   // STOP; after an execution failure, STOP must run even if draining failed.
   const auto drained = s.health.failed ? Status::OK() : s.Drain();
+  if (s.config.device_push) {
+    const auto stream = s.invocation->pending ? s.invocation->pending : s.invocation->captured_stream;
+    if (stream && aclrtSynchronizeStream(stream) != ACL_SUCCESS)
+      return Status::CompletionUnknown("device mailbox sender is not fenced; both mailboxes and output retained");
+  }
+  // Stop descriptor WRITE initiators before CPU STOP may release its mailbox.
+  // Payload targets remain registered until the CPU data queues have stopped.
+  if (s.mailbox_channel) {
+    auto closed = s.mailbox_channel->Shutdown(); if (!closed.ok()) return closed;
+    s.mailbox_channel.reset();
+  }
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (s.mailbox_umdk) {
+    auto closed = s.mailbox_umdk->Shutdown(); if (!closed.ok()) return closed;
+    s.mailbox_umdk.reset();
+  }
+#endif
   // Stop the remote initiator before releasing any HBM, even after kernel failure.
   if (s.peer_open) {
     auto stopped = s.config.peer_link->StopCpuPushGet(s.source.base);
@@ -648,6 +773,14 @@ Status CpuPushTransport::Shutdown() {
     it = s.outputs.erase(it);
   }
   s.bound_outputs.clear();
+  if (s.mailbox_import) {
+    if (s.api.rmem_unimport(s.context, s.mailbox_import)) return Error("unimport CPU mailbox");
+    s.mailbox_import = nullptr;
+  }
+  if (s.mailbox_device) {
+    if (aclrtFree(s.mailbox_device) != ACL_SUCCESS) return Error("free mailbox context");
+    s.mailbox_device = nullptr;
+  }
   if (s.memory_handle) {
     if (s.api.lmem_unregister(s.context, s.memory_handle)) return Error("unregister HBM");
     s.memory_handle = nullptr;

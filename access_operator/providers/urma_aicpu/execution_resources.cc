@@ -12,7 +12,7 @@ namespace kvaf {
 struct AicpuExecutionResources::State {
   State(AicpuExecutionResources* owner, UmdkAccessOperatorConfig config)
       : default_invocation(owner), valid_mode(config.batch_get_mode == "gather_read" ||
-                   config.batch_get_mode == "cpu_push_scatter" || config.batch_get_mode == "cpu_sgl_write"),
+                   config.batch_get_mode == "cpu_push_scatter" || (config.batch_get_mode == "cpu_sgl_write" || config.batch_get_mode == "cpu_sgl_push")),
         get_session({config.kernel_json, config.workers,
                  config.peer_link, config.local_eid}),
         put_session({config.kernel_json, config.workers, config.peer_link, config.local_eid,
@@ -20,11 +20,11 @@ struct AicpuExecutionResources::State {
         get(get_session, config.token_bytes),
         put(put_session), enable_get(config.enable_get) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-    if (config.batch_get_mode == "cpu_push_scatter" || config.batch_get_mode == "cpu_sgl_write")
+    if (config.batch_get_mode == "cpu_push_scatter" || (config.batch_get_mode == "cpu_sgl_write" || config.batch_get_mode == "cpu_sgl_push"))
       push = std::make_unique<cpu_push::CpuPushTransport>(cpu_push::Config{
           config.peer_link, config.kernel_json, config.local_eid, config.token_bytes, config.workers,
-          config.batch_get_mode == "cpu_sgl_write", config.sge_per_wr, config.sgl_payload_only, false,
-          config.sgl_pipeline});
+          (config.batch_get_mode == "cpu_sgl_write" || config.batch_get_mode == "cpu_sgl_push"), config.sge_per_wr, config.sgl_payload_only, false,
+          config.sgl_pipeline, config.batch_get_mode == "cpu_sgl_push"});
 #else
     valid_mode = config.batch_get_mode == "gather_read";
 #endif

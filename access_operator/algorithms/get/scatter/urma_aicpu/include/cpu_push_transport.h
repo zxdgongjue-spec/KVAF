@@ -19,6 +19,7 @@ struct Config {
   // device kernel. kernel_json then names an AIV binary object.
   bool aiv{false};
   bool sgl_pipeline{false};
+  bool device_push{false};
 };
 class CpuPushTransport {
  public:

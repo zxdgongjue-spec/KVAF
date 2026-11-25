@@ -302,6 +302,54 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   return Status::OK();
 }
 
+Status UmdkSession::PrepareMailbox(std::uint64_t region_base, void* source, std::size_t bytes,
+                                   UmdkControlStatus* endpoint) {
+  if (args_.session || !endpoint || !source || !bytes || config_.workers != 1 ||
+      config_.queue_profile != UmdkQueueProfile::Put)
+    return Status::InvalidArgument("invalid UMDK mailbox sender preparation");
+  auto ready = Load(); if (!ready.ok()) return ready;
+  peer::PeerRegion region;
+  ready = config_.peer_link->LookupRegion(region_base, &region); if (!ready.ok()) return ready;
+  if (aclrtCreateStream(&stream_) != ACL_SUCCESS) return Status::Internal("create mailbox setup stream");
+  void* status = nullptr;
+  if (aclrtMalloc(&status, sizeof(UmdkControlStatus), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+    return Status::OutOfMemory("allocate mailbox sender status");
+  args_.status = reinterpret_cast<std::uint64_t>(status);
+  args_.local_buffer = reinterpret_cast<std::uint64_t>(source);
+  args_.buffer_bytes = bytes;
+  args_.worker_count = 1;
+  args_.queue_profile = UmdkQueueProfile::Put;
+  args_.token = region.token_value;
+  std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);
+  std::copy(config_.local_eid.begin(), config_.local_eid.end(), args_.local_eid);
+  ready = Run(UmdkControlOp::kPrepare, *endpoint);
+  if (!ready.ok()) return ready;
+  if (!std::equal(config_.local_eid.begin(), config_.local_eid.end(), endpoint->eid) || endpoint->key_bytes != 28)
+    return Status::Internal("mailbox sender EID/key mismatch");
+  return Status::OK();
+}
+Status UmdkSession::ConnectMailbox(std::uint64_t base, const std::uint8_t* segment, std::uint32_t segment_bytes,
+                                   const std::uint8_t* key, std::uint32_t key_bytes, std::uint64_t tp, std::uint32_t psn) {
+  if (!args_.session || connected_ || !base || !segment || segment_bytes > sizeof(args_.segment) ||
+      !key || key_bytes != 28 || !tp || !psn)
+    return Status::InvalidArgument("invalid CPU mailbox endpoint");
+  args_.remote_address = base;
+  args_.segment_bytes = segment_bytes;
+  args_.key_bytes = key_bytes;
+  args_.peer_tp = tp;
+  args_.peer_psn = psn;
+  args_.worker_index = kUmdkControlQueueIndex;
+  std::copy_n(segment, segment_bytes, args_.segment);
+  std::copy_n(key, key_bytes, args_.peer_key);
+  UmdkControlStatus status{};
+  auto ready = Run(UmdkControlOp::kConnect, status);
+  if (ready.ok()) {
+    connected_ = true;
+    registered_buffers_.push_back({args_.local_buffer, args_.buffer_bytes});
+  }
+  return ready;
+}
+
 Status UmdkSession::EnsureSession(std::uint64_t region_base, void* setup_buffer,
                                   std::size_t setup_bytes) {
   if (failed_ || pending_)

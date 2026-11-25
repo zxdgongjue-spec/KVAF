@@ -1,5 +1,6 @@
 add_library(kvaf_execute_batch_get_host SHARED batch_get_host.cpp execute_batch_get_loader.cpp
-  ../../../cpu_sgl_write/urma_aiv/host/loader.cpp)
+  ../../../cpu_sgl_write/urma_aiv/host/loader.cpp
+  ../../../cpu_sgl_push/host/loader.cpp)
 target_include_directories(kvaf_execute_batch_get_host
   PUBLIC "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}"
   PRIVATE "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/algorithms/get/cpu_sgl_write/urma_aiv/include"

@@ -42,6 +42,11 @@ class UmdkSession {
   explicit UmdkSession(UmdkSessionConfig config) : config_(std::move(config)) {}
   UmdkWriteView WriteView() { return UmdkWriteView(this); }
   Status Load();
+  Status PrepareMailbox(std::uint64_t region_base, void* source, std::size_t bytes, UmdkControlStatus* endpoint);
+  Status ConnectMailbox(std::uint64_t base, const std::uint8_t* segment, std::uint32_t segment_bytes,
+                        const std::uint8_t* key, std::uint32_t key_bytes, std::uint64_t peer_tp, std::uint32_t psn);
+  UmdkContext context() const { return {args_.session, args_.owner_pid}; }
+
   Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,
                 bool prepared_only = false);
   // Establish transport once without re-registering a released setup buffer.

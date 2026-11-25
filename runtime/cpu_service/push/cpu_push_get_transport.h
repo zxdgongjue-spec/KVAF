@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -18,10 +19,11 @@ class Transport {
   ~Transport();
   Status Initialize(urma_context_t*, urma_target_seg_t* source, const peer::OpenCpuPushGetRequest&,
                     urma::GetTpList, urma::ImportJettyEx, std::uint32_t psn,
-                    peer::OpenCpuPushGetResponse*, std::uint64_t canonical_base = 0);
+                    peer::OpenCpuPushGetResponse*, std::uint64_t canonical_base = 0,
+                    const peer::OpenCpuSglPushRequest* push = nullptr, peer::OpenCpuSglPushResponse* mailbox = nullptr);
   Status ReadRequest(std::uint64_t* sequence);
   Status ReadDescriptor(std::uint64_t sequence);
-  Status WriteBatch();
+  Status WriteBatch(const std::atomic<bool>* stop = nullptr);
   Status Complete(std::uint64_t sequence, Result result);
   void PrintProfile() const;
   Status Shutdown();
@@ -85,6 +87,7 @@ class Transport {
   Status WritePayloadOnly();
   Status WritePipeline();
   Status WriteChunks();
+  Status WritePushed(const std::atomic<bool>* stop);
   Status ValidateSources(std::uint32_t begin, std::uint32_t end);
   Status BeginControlRead(std::uint64_t offset, std::uint64_t bytes);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
@@ -109,6 +112,7 @@ class Transport {
   urma_target_seg_t* remote_{};
   urma_target_seg_t* output_remote_{};
   OutputTarget output_;
+  bool device_push_{};
   bool direct_output_{};
   bool payload_only_{};
   bool pipeline_{};

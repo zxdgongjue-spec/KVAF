@@ -39,7 +39,8 @@ Transport::~Transport() {
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                              const peer::OpenCpuPushGetRequest& setup, urma::GetTpList query,
                              urma::ImportJettyEx import, std::uint32_t psn,
-                             peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base) {
+                             peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base,
+                             const peer::OpenCpuSglPushRequest* push, peer::OpenCpuSglPushResponse* mailbox) {
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
@@ -49,6 +50,10 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
+  if (push && (!mailbox || setup.output_mode != kPipelinedOutput || !push->control_tp ||
+      !push->control_psn || (push->control.bytes != 28 && push->control.bytes != 32)))
+    return Status::InvalidArgument("invalid device-push mailbox setup");
+  device_push_ = push != nullptr;
   context_ = context;
   source_ = source;
   source_base_ = canonical_base ? canonical_base : source->seg.ubva.va;
@@ -108,7 +113,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   // This pinned buffer receives local READ results and supplies local WRITE
   // payloads. Use the probe's direct-host registration, not remote DDR flags.
   cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-  cfg.flag.bs.access = 1U;  // LOCAL_WRITE in the deployed public UMDK ABI.
+  cfg.flag.bs.access = device_push_ ? (1U | (1U << 2U)) : 1U; // Mailbox also accepts remote WRITE.
   cfg.flag.bs.non_pin = 0;
   cfg.flag.bs.token_id_valid = 1;
   Stage("register_control");
@@ -134,15 +139,32 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     queue.remote.reserve(1);
     queue.wrs.reserve(1);
     Stage("import_jetty", q);
-    c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[peer_queue].key,
-        setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
+    const bool control_push = device_push_ && q == kJettyCount;
+    c.remote_jetty = urma::ImportJetty(import, context_, control_push ? push->control.key : setup.channels[peer_queue].key,
+        setup.token_value, cpu_tp, control_push ? push->control_tp : setup.npu_tp, psn,
+        control_push ? push->control_psn : setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
-    if (q == kJettyCount) continue;  // Private control queue, same remote target as queue 0.
+    if (q == kJettyCount) {
+      if (device_push_) {
+        mailbox->control.bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
+        std::memcpy(mailbox->control.key, &c.local_jetty->jetty_id, sizeof(urma_jetty_id_t));
+        std::memcpy(mailbox->control.key + sizeof(urma_jetty_id_t), &c.local_jetty->jetty_cfg.jfs_cfg.trans_mode,
+                    sizeof(urma_transport_mode_t));
+      }
+      continue;
+    }  // Private control queue, same remote target as queue 0.
     auto& key = response->channels[q];
     key.bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
     std::memcpy(key.key, &c.local_jetty->jetty_id, sizeof(urma_jetty_id_t));
     std::memcpy(key.key + sizeof(urma_jetty_id_t), &c.local_jetty->jetty_cfg.jfs_cfg.trans_mode,
                 sizeof(urma_transport_mode_t));
+  }
+  if (device_push_) {
+    mailbox->mailbox_base = reinterpret_cast<std::uint64_t>(memory_);
+    mailbox->mailbox_bytes = layout_.staging;
+    mailbox->segment_bytes = sizeof(urma_seg_t);
+    mailbox->max_write_bytes = max_bytes_;
+    std::memcpy(mailbox->segment, &control_->seg, sizeof(urma_seg_t));
   }
   auto& done = done_.queues[0];
   // Publish the report before the ordered done token. The NPU may observe
@@ -239,6 +261,14 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
 Status Transport::ReadRequest(std::uint64_t* sequence) {
   // The profile bit is known only after the READ. Measure just this probe,
   // never the idle interval spent repeatedly reading an unchanged sequence.
+  if (device_push_) {
+    const auto notify = __atomic_load_n(reinterpret_cast<const std::uint64_t*>(memory_ + layout_.notify), __ATOMIC_ACQUIRE);
+    *sequence = notify & ~kProfileNotify;
+    profile_.enabled = (notify & kProfileNotify) != 0;
+    profile_.notify_read_ns = 0;
+    profile_.cpu_start_ns = profile_.enabled ? BatchGetProfileNowNs() : 0;
+    return Status::OK();
+  }
   const auto start = (payload_only_ || pipeline_) ? BatchGetProfileNowNs() : 0;
   auto result = Transfer(false, layout_.notify, sizeof(Word));
   if (result.ok()) {
@@ -263,7 +293,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   Status result;
   {
     BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
-    result = Transfer(false, layout_.request, sizeof(Request));
+    result = device_push_ ? Status::OK() : Transfer(false, layout_.request, sizeof(Request));
   }
   if (!result.ok()) return result;
   const auto& r = request();
@@ -293,7 +323,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     if (output_remote_) return Error("previous output is still imported");
     {
       BatchGetProfileScope stage(detail ? &profile_.output_desc_read_ns : nullptr);
-      read = Transfer(false, layout_.output_target, sizeof(OutputTarget));
+      read = device_push_ ? Status::OK() : Transfer(false, layout_.output_target, sizeof(OutputTarget));
     }
     if (!read.ok()) return read;
     output_ = *reinterpret_cast<const OutputTarget*>(memory_ + layout_.output_target);
@@ -320,7 +350,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (pipeline_ && !chunked_) {
     {
       BatchGetProfileScope stage(detail ? &profile_.address_list_read_ns : nullptr);
-      read = Transfer(false, layout_.descriptor, std::uint64_t{head_count_} * 8);
+      read = device_push_ ? Status::OK() : Transfer(false, layout_.descriptor, std::uint64_t{head_count_} * 8);
     }
     if (!read.ok()) return read;
     return ValidateSources(0, head_count_);
@@ -397,7 +427,7 @@ void Transport::SealPrepared(PreparedWrite& plan) {
     q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
     // Preserve the probe's conservative SGE budget across concurrent chunks,
     // rather than applying that limit only within an individual plan.
-    plan.fences[plan.fence_count++] = {index, chunked_ ? std::max(q.wrs.size(), q.local.size()) : q.wrs.size(), 0};
+    plan.fences[plan.fence_count++] = {index, (chunked_ || device_push_) ? std::max(q.wrs.size(), q.local.size()) : q.wrs.size(), 0};
   }
 }
 Status Transport::PrepareWrites(std::uint32_t count) {
@@ -737,6 +767,76 @@ Status Transport::WritePipeline() {
   return Status::OK();
 }
 
+// aiv-scatter's mailbox consumption and credit-driven prefix/suffix posting,
+// adapted to caller-owned direct output. No device descriptor READ is issued.
+Status Transport::WritePushed(const std::atomic<bool>* stop) {
+  auto* p = profile_.enabled ? &profile_ : nullptr;
+  std::uint32_t inflight = 0;
+  auto poll = [&](bool wait) -> Status {
+    std::uint64_t completed = 0;
+    auto status = PollAnyPrepared(&completed, p, wait);
+    if (status.ok() && completed) {
+      if (!inflight || completed > prepared_.size()) return Error("unexpected mailbox data CQE");
+      --inflight;
+    }
+    return status;
+  };
+  auto post = [&](std::size_t begin, std::size_t end) -> Status {
+    for (auto w = begin; w < end; ++w) {
+      bool accepted = false;
+      while (!accepted) {
+        if (inflight < 4) {
+          auto status = BeginPrepared(*prepared_[w], w + 1, &accepted);
+          if (!status.ok()) return status;
+        }
+        if (!accepted) {
+          if (!inflight) return Error("mailbox plan exceeds drained SQ credits");
+          auto status = poll(true); if (!status.ok()) return status;
+        }
+      }
+      auto status = PostPrepared(*prepared_[w], true, p);
+      if (!status.ok()) return status;
+      ++inflight;
+      if (p) p->max_inflight = std::max(p->max_inflight, inflight);
+    }
+    return Status::OK();
+  };
+  Status status;
+  {
+    BatchGetProfileScope timer(p ? &p->head_submit_ns : nullptr);
+    status = post(0, head_waves_);
+  }
+  if (!status.ok()) return status;
+  if (head_count_ < request().count) {
+    const auto suffix_started = p ? BatchGetProfileNowNs() : 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+    for (;;) {
+      const auto token = __atomic_load_n(reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset), __ATOMIC_ACQUIRE);
+      if ((token >> 32) > request().sequence) { batch_result_ = Result::kSequenceError; break; }
+      if ((token >> 32) == request().sequence) {
+        const auto r = static_cast<std::uint32_t>(token);
+        batch_result_ = r >= std::uint32_t(Result::kOk) && r <= std::uint32_t(Result::kCopyError)
+            ? static_cast<Result>(r) : Result::kInvalidRequest;
+        break;
+      }
+      if ((stop && stop->load(std::memory_order_acquire)) || std::chrono::steady_clock::now() >= deadline) {
+        batch_result_ = Result::kTimeout; break;
+      }
+      if (inflight) { status = poll(false); if (!status.ok()) return status; }
+    }
+    if (p) p->suffix_wait_ns = BatchGetProfileNowNs() - suffix_started;
+    if (batch_result_ == Result::kOk && !ValidateSources(head_count_, request().count).ok())
+      batch_result_ = Result::kInvalidRequest;
+    if (batch_result_ == Result::kOk) {
+      BatchGetProfileScope timer(p ? &p->suffix_submit_ns : nullptr);
+      status = post(head_waves_, prepared_.size());
+      if (!status.ok()) return status;
+    }
+  }
+  while (inflight) { status = poll(true); if (!status.ok()) return status; }
+  return Status::OK();
+}
+
 Status Transport::WriteChunks() {
   auto* p = profile_.enabled ? &profile_ : nullptr;
   const auto count = request().count;
@@ -847,7 +947,7 @@ Status Transport::WriteChunks() {
   return Status::OK();
 }
 
-Status Transport::WriteBatch() {
+Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   Status status;
   {
@@ -855,6 +955,7 @@ Status Transport::WriteBatch() {
     status = PrepareWrites(request().count);
   }
   if (!status.ok()) return status;
+  if (device_push_) return WritePushed(stop);
   if (payload_only_) return WritePayloadOnly();
   if (chunked_) return WriteChunks();
   if (pipeline_) return WritePipeline();
@@ -915,6 +1016,18 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
 
 void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
+  if (device_push_) {
+    const auto& p = profile_;
+    std::fprintf(stderr, "CPU_SGL_PUSH_PROFILE sequence=%" PRIu64 " rows=%u descriptor_reads=0 ready_wrs=0"
+        " head_first_post_us=%.3f head_submit_us=%.3f suffix_wait_us=%.3f suffix_submit_us=%.3f"
+        " output_import_us=%.3f address_validate_us=%.3f source_sge_update_us=%.3f cpu_total_us=%.3f"
+        " data_wrs=%u tail_cqes=%u max_inflight=%u plan_reused=%u result=%u\n",
+        request().sequence, request().count, p.first_post_ns ? (p.first_post_ns - p.cpu_start_ns) / 1000.0 : 0,
+        p.head_submit_ns / 1000.0, p.suffix_wait_ns / 1000.0, p.suffix_submit_ns / 1000.0,
+        p.output_import_ns / 1000.0, p.address_validate_ns / 1000.0, p.source_sge_update_ns / 1000.0,
+        p.cpu_total_ns / 1000.0, p.data_wrs, p.tail_cqes, p.max_inflight, unsigned(p.plan_reused), unsigned(batch_result_));
+    return;
+  }
   if (chunked_) {
     const auto& p = profile_;
     std::fprintf(stderr,

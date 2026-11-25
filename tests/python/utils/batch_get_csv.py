@@ -51,9 +51,9 @@ class BatchGetCsv:
             payload_bytes_per_call=args.miss_count * args.token_bytes,
             jettys_per_core=args.jettys_per_core if args.backend == "aiv" else None,
             max_inflight_total=args.max_inflight_total if args.backend == "aiv" else None,
-            sge_per_wr=args.sge_per_wr if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write") else None,
+            sge_per_wr=args.sge_per_wr if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push") else None,
             sgl_pipeline=int(getattr(args, "sgl_pipeline", False)),
-            sgl_pipeline_mode="chunked" if getattr(args, "sgl_pipeline", False) else "disabled",
+            sgl_pipeline_mode="device_push_head_suffix" if args.backend in ("cpu_sgl_push", "aiv_cpu_sgl_push") else "chunked" if getattr(args, "sgl_pipeline", False) else "disabled",
         )
 
     def add_summary(self, execution, measurements):

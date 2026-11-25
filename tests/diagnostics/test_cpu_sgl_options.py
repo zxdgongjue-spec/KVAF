@@ -16,6 +16,40 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_device_push_is_a_distinct_pipelined_algorithm(self):
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        for backend, executor in (("cpu_sgl_push", "aicpu"), ("aiv_cpu_sgl_push", "aiv")):
+            args = parse_args(["--backend", backend, "--sge-per-wr", "8"])
+            self.assertIsNone(validate_args(args))
+            self.assertTrue(args.sgl_pipeline)
+            child = parse_args(workload_command(args))
+            self.assertEqual((child.backend, child.sge_per_wr, child.sgl_pipeline), (backend, 8, True))
+            execution = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push",
+                                           get_cores=4, sge_per_wr=8, sgl_pipeline=True)
+            self.assertEqual(execution.get_config, ("urma", executor, "cpu_sgl_push"))
+            self.assertEqual(execution.output_binding, "reused")
+            budget = execution.runtime_kwargs["get_resources"][0][1]
+            self.assertTrue(budget["sgl_pipeline"])
+            self.assertEqual(budget["sge_per_wr"], 8)
+            self.assertNotIn("jettys", budget)
+            self.assertNotIn("max_inflight_total", budget)
+            for invalid in (["--sgl-payload-only"], ["--sort-input-indices"],
+                            ["--output-access-pattern", "random"]):
+                self.assertIsNotNone(validate_args(parse_args(["--backend", backend, *invalid])))
+            with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+                args.output_dir = Path(directory)
+                report = BatchGetCsv(args)
+                report.add_summary("eager", {})
+                report.write()
+                with report.summary_path.open() as source:
+                    row = next(csv.DictReader(source))
+                    self.assertEqual(row["sgl_pipeline_mode"], "device_push_head_suffix")
+                    self.assertEqual(row["sgl_pipeline"], "1")
+        for backend in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
+            self.assertFalse(parse_args(["--backend", backend]).sgl_pipeline)
+
     def test_timing_sources_and_outliers_keep_iteration_pairs(self):
         for backend, clock, timestamps, source in (
             ("cpu_sgl_write", 500, (120_000, 140_000), "device_ns"),

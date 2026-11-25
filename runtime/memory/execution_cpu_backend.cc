@@ -93,11 +93,14 @@ class UrmaSession final : public execution::Session {
          command == peer::Command::kPrepareGatherWorkspace) &&
         (profile_.put || profile_.algorithm != GetAlgorithm::Gather))
       return Status::InvalidArgument("session has no Gather profile");
-    if ((command == peer::Command::kOpenCpuPushGet || command == peer::Command::kStartCpuPushGet ||
+    if ((command == peer::Command::kOpenCpuPushGet || command == peer::Command::kOpenCpuSglPush || command == peer::Command::kStartCpuPushGet ||
          command == peer::Command::kStopCpuPushGet) &&
         (profile_.put || (profile_.algorithm != GetAlgorithm::Scatter &&
-                          profile_.algorithm != GetAlgorithm::CpuSglWrite)))
+                          profile_.algorithm != GetAlgorithm::CpuSglWrite && profile_.algorithm != GetAlgorithm::CpuSglPush)))
       return Status::InvalidArgument("session has no Scatter profile");
+    if ((command == peer::Command::kOpenCpuSglPush && profile_.algorithm != GetAlgorithm::CpuSglPush) ||
+        (command == peer::Command::kOpenCpuPushGet && profile_.algorithm == GetAlgorithm::CpuSglPush))
+      return Status::InvalidArgument("CPU SGL mailbox protocol does not match the session profile");
     return backend_.Call(in, out);
   }
   Status Close() override { return backend_.Shutdown(); }

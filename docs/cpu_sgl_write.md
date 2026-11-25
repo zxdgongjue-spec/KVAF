@@ -1,5 +1,8 @@
 # CPU SGL Write：连续输出的 BatchGet
 
+设备主动 WRITE 地址清单到 CPU 的新增独立版本见 [CPU SGL Push](cpu_sgl_push.md)。
+本文的 `cpu_sgl_write` 及可选逐 chunk READ 流水继续保留。
+
 `GetExecutionConfig("urma", "aicpu", "cpu_sgl_write")` 复用 CPU Push Scatter
 的请求构建、四路 Jetty、预构建 WRITE 链和 done 协议。CPU 将离散 DDR 源直接
 SGL WRITE 到调用方注册的 HBM output，AICPU 不执行 scatter，也不分配 payload staging。

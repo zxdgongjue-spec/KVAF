@@ -130,12 +130,14 @@ std::vector<GetExecutionConfig> BuiltGetConfigs(TransportMode mode) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   add({Transport::Urma, Executor::Aiv, GetAlgorithm::Direct});
   add({Transport::Urma, Executor::Aiv, GetAlgorithm::CpuSglWrite});
+  add({Transport::Urma, Executor::Aiv, GetAlgorithm::CpuSglPush});
 #endif
 #if defined(KVAF_ENABLE_AICPU_URMA)
   add({Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather});
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   add({Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter});
   add({Transport::Urma, Executor::Aicpu, GetAlgorithm::CpuSglWrite});
+  add({Transport::Urma, Executor::Aicpu, GetAlgorithm::CpuSglPush});
 #endif
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -199,7 +201,9 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    return detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
+    auto resources = detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
+    if (get && algorithm == GetAlgorithm::CpuSglPush) resources.sgl_pipeline = true;
+    return resources;
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {
@@ -213,21 +217,23 @@ struct NpuRuntime::Impl {
     }
     if (explicit_resources) {
       const auto& r = *explicit_resources;
-      if (r.jettys && (e != Executor::Aiv || t != Transport::Urma || algorithm == GetAlgorithm::CpuSglWrite))
+      if (r.jettys && (e != Executor::Aiv || t != Transport::Urma || IsCpuSgl(algorithm)))
         throw std::invalid_argument("Jetty budget is configurable only for URMA AIV");
-      if (r.max_inflight_total && (!get || e != Executor::Aiv || t != Transport::Urma || algorithm == GetAlgorithm::CpuSglWrite))
+      if (r.max_inflight_total && (!get || e != Executor::Aiv || t != Transport::Urma || IsCpuSgl(algorithm)))
         throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
       if (r.cpu_threads && (!get || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
         throw std::invalid_argument("CPU thread budget requires AICPU Gather");
       if ((r.sge_per_wr || r.sgl_payload_only || r.sgl_pipeline) && (!get || t != Transport::Urma ||
-                           algorithm != GetAlgorithm::CpuSglWrite))
+                           !IsCpuSgl(algorithm)))
         throw std::invalid_argument("SGL write resources require URMA CPU SGL Write Get");
+      if (algorithm == GetAlgorithm::CpuSglPush && r.sgl_payload_only)
+        throw std::invalid_argument("cpu_sgl_push uses device descriptor WRITE and does not support sgl_payload_only");
       if (r.sgl_pipeline && r.sgl_payload_only)
         throw std::invalid_argument("sgl_pipeline and sgl_payload_only are mutually exclusive");
       if (!r.kernel_path.empty() && e == Executor::Aicpu)
         throw std::invalid_argument("AICPU kernel package is resolved through the CANN installation");
     }
-    if (!budget.cores || budget.cores > (e == Executor::Aicpu || algorithm == GetAlgorithm::CpuSglWrite ? 8U : 48U) ||
+    if (!budget.cores || budget.cores > (e == Executor::Aicpu || IsCpuSgl(algorithm) ? 8U : 48U) ||
         !budget.request_capacity || budget.request_capacity > 65536U || budget.cpu_threads > 64U ||
         budget.sge_per_wr > 16U ||
         (t == Transport::Urma && e == Executor::Aiv &&
@@ -296,7 +302,7 @@ struct NpuRuntime::Impl {
     q.token_bytes = options.batch_get_token_bytes;
     q.cpu_threads = budget.cpu_threads;
     q.auxiliary_bytes = 0;
-    const auto eids = ProviderEids(transport, executor, get && algorithm != GetAlgorithm::CpuSglWrite, budget);
+    const auto eids = ProviderEids(transport, executor, get && !IsCpuSgl(algorithm), budget);
     if (!eids.empty()) q.local_eid = eids.front();
     return std::make_unique<SessionAccessOperator>(
         peer_link, q, std::move(candidates),
@@ -348,7 +354,7 @@ struct NpuRuntime::Impl {
                                                     const PeerExecutionResources::Links& links) {
     const auto& link = links.front();
     const auto budget = Resources(transport, executor, algorithm, get);
-    const auto eids = ProviderEids(transport, executor, get && algorithm != GetAlgorithm::CpuSglWrite, budget);
+    const auto eids = ProviderEids(transport, executor, get && !IsCpuSgl(algorithm), budget);
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
     if (transport == Transport::Ubmem) {
       return std::make_unique<ubmem::AccessOperator>(
@@ -356,10 +362,10 @@ struct NpuRuntime::Impl {
                                  options.device_id, budget.cores, link, mappings});
     }
     if (executor == Executor::Aiv) {
-      if (get && algorithm == GetAlgorithm::CpuSglWrite)
+      if (get && IsCpuSgl(algorithm))
         return cpu_push::CreateAivCpuSglWriteOperator(cpu_push::Config{
             link, budget.kernel_path, eids.front(), options.batch_get_token_bytes, budget.cores,
-            true, budget.sge_per_wr, budget.sgl_payload_only, true, budget.sgl_pipeline});
+            true, budget.sge_per_wr, budget.sgl_payload_only, true, budget.sgl_pipeline, algorithm == GetAlgorithm::CpuSglPush});
       AccessOperatorConfig c;
       c.peer_local = cache_peer_local;
       c.peer_link = link;
@@ -383,7 +389,8 @@ struct NpuRuntime::Impl {
     EnsureAicpuPackage();
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
-        algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
+        algorithm == GetAlgorithm::CpuSglPush ? "cpu_sgl_push" :
+        IsCpuSgl(algorithm) ? "cpu_sgl_write" :
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
         eids.front(), get, budget.sge_per_wr, budget.sgl_payload_only, budget.sgl_pipeline});
 #else

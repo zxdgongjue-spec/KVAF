@@ -11,7 +11,10 @@ enum class TransportMode { Urma, Ubmem, UrmaAndUbmem };
 // Keep the original enumerators source compatible.
 enum class Transport { Urma, Ubmem, kUrma = Urma, kUbmem = Ubmem };
 enum class Executor { Aiv, Aicpu };
-enum class GetAlgorithm { Direct, Gather, Scatter, CpuSglWrite };
+enum class GetAlgorithm { Direct, Gather, Scatter, CpuSglWrite, CpuSglPush };
+constexpr bool IsCpuSgl(GetAlgorithm a) {
+  return a == GetAlgorithm::CpuSglWrite || a == GetAlgorithm::CpuSglPush;
+}
 struct PutExecutionConfig {
   Transport transport{Transport::Urma};
   Executor executor{Executor::Aiv};

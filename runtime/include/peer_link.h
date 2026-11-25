@@ -102,6 +102,8 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   Status PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes, PeerRegion* workspace);
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status OpenCpuSglPush(uint64_t region_base, OpenCpuSglPushRequest request,
+                        OpenCpuSglPushResponse* response) const;
   Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
                         OpenCpuPushGetResponse* response) const;
   Status StartCpuPushGet(uint64_t region_base) const;

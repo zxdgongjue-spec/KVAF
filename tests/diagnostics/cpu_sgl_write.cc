@@ -146,6 +146,7 @@ struct Fixture {
 };
 }  // namespace
 
+#ifndef KVAF_CPU_SGL_REUSE_FIXTURE
 int main() {
   for (uint64_t mode : {uint64_t(0), kPipelineLaunch, kChunkPipelineLaunch}) for (auto workers : {1U, 4U, 5U, 8U}) {
     Fixture f(workers);
@@ -256,4 +257,14 @@ int main() {
   assert(execution::Decode(execution::Encode(request), &decoded).ok());
   assert(decoded.op == request.op);
   assert(decoded.algorithm == config.algorithm);
+  for (auto executor : {Executor::Aiv, Executor::Aicpu}) {
+    assert(ValidateExecution(TransportMode::Urma,
+        GetExecutionConfig{Transport::Urma, executor, GetAlgorithm::CpuSglPush}).ok());
+    request.algorithm = GetAlgorithm::CpuSglPush;
+    request.executor = executor;
+    assert(execution::Decode(execution::Encode(request), &decoded).ok());
+    assert(decoded.algorithm == request.algorithm && decoded.executor == executor);
+  }
 }
+
+#endif

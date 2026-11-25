@@ -210,7 +210,7 @@ def write_summary(directory, isolated, concurrent, config=None):
                 ("Jetty 数 / AIV 核", "jettys_per_core"),
                 ("未完成 READ 上限 / 卡", "max_inflight_total"),
             ) if key in config]
-        if backend in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
+        if backend in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push"):
             settings.append(("每个 WRITE WR 的源 SGE 上限（0=自动）", config.get("sge_per_wr", 0)))
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
     device_rows = [

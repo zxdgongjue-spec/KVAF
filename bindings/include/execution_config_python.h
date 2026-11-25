@@ -16,8 +16,9 @@ inline GetAlgorithm ParseAlgorithm(const std::string& s) {
   if (s == "direct") return GetAlgorithm::Direct;
   if (s == "gather") return GetAlgorithm::Gather;
   if (s == "scatter") return GetAlgorithm::Scatter;
+  if (s == "cpu_sgl_push") return GetAlgorithm::CpuSglPush;
   if (s == "cpu_sgl_write") return GetAlgorithm::CpuSglWrite;
-  throw pybind11::value_error("algorithm must be direct, gather, scatter or cpu_sgl_write");
+  throw pybind11::value_error("algorithm must be direct, gather, scatter, cpu_sgl_write or cpu_sgl_push");
 }
 inline void BindExecutionConfigs(pybind11::module_& m) {
   namespace py = pybind11;
@@ -64,6 +65,7 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
       .def_property_readonly("executor", [](GetExecutionConfig c) { return c.executor == Executor::Aiv ? "aiv" : "aicpu"; })
       .def_property_readonly("algorithm", [](GetExecutionConfig c) {
         return c.algorithm == GetAlgorithm::Direct ? "direct" : c.algorithm == GetAlgorithm::Gather ? "gather" :
+               c.algorithm == GetAlgorithm::CpuSglPush ? "cpu_sgl_push" :
                c.algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" : "scatter";
       });
 }

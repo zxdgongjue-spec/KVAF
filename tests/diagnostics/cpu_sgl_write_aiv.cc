@@ -141,6 +141,7 @@ struct Fixture {
   }
 };
 }
+#ifndef KVAF_CPU_SGL_REUSE_FIXTURE
 int main() {
   for (uint64_t mode : {uint64_t(0), kPipelineLaunch, kChunkPipelineLaunch}) for (uint32_t workers : {1U, 4U, 5U, 8U}) {
     Fixture f(workers);
@@ -248,3 +249,5 @@ int main() {
   assert(sgl_model::descriptor_copies > 0);
   std::cout << "AIV CPU SGL kernel model passed\n";
 }
+
+#endif

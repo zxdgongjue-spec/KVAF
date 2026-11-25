@@ -75,7 +75,7 @@ Run the actual AICPU request/completion kernel against a simulated CPU producer:
 ```bash
 c++ -std=c++17 -pthread -fsanitize=address,undefined -g \
   -Icommon/include -Iaccess_operator/include -Iaccess_operator/algorithms -Iruntime/include \
-  tests/diagnostics/cpu_sgl_write.cc \
+  tests/diagnostics/cpu_sgl_write.cc tests/diagnostics/umdk_mailbox_model.cc \
   access_operator/algorithms/get/scatter/urma_aicpu/kernel/cpu_push_scatter.cc \
   runtime/execution/execution_config.cc runtime/peer/execution_protocol.cc \
   -o /tmp/kvaf-cpu-sgl-write-test
@@ -142,3 +142,11 @@ with GM in a distinct address space, catching unsupported local/GM struct copies
 that the executable model cannot detect. AIV's model verifies that its only MTE writes are source descriptors;
 the simulated CPU writes payload and publishes done. See
 [CPU SGL Write](../../docs/cpu_sgl_write.md#aiv-cpu-sgl-write) for hardware validation.
+
+The same runner includes the independent `cpu_sgl_push` AIV/AICPU models.
+The AIV model consumes actual USER_CTL WQEs, checks splitting and SQ/CQ wrap,
+and delays CPU done. The CPU fake-provider model poisons remote descriptors
+and supplies only the local mailbox, verifies zero descriptor READ WRs, posts
+the suffix while head CQEs remain pending, preserves in-flight WR/SGE arrays,
+and drains accepted data on suffix failure. See
+[CPU SGL Push](../../docs/cpu_sgl_push.md) for the API, pipeline and comparisons.

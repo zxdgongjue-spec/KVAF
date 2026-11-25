@@ -1,5 +1,6 @@
 #include "cpu_push_scatter.h"
 #include "cpu_push_pipeline.h"
+#include "get/cpu_sgl_push/kernel/aicpu_mailbox.h"
 
 namespace kvaf::cpu_push {
 namespace {
@@ -44,6 +45,7 @@ struct Execution {
   BatchGetWorkerProfile* profile;
   bool pipeline{};
   bool chunked{};
+  const MailboxLaunch* mailbox{};
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   void Relax(bool check_remote = true) {
@@ -147,17 +149,18 @@ struct Execution {
     Barrier();
     return true;
   }
-  void Notify() {
+  void Notify(std::uint32_t count = 0) {
     BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
     auto* notify = reinterpret_cast<Word*>(Memory() + layout.notify);
     Store(*notify, args.sequence | (profile ? kProfileNotify : 0));
     Barrier();
+    if (mailbox && PostDescriptorMailbox(*mailbox, args, layout, count, false)) Fail(coordination, Result::kTransportError);
   }
 };
 }  // namespace
 
 static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target,
-                                    bool pipeline = false, bool chunked = false) {
+                                    bool pipeline = false, bool chunked = false, const MailboxLaunch* mailbox = nullptr) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
@@ -175,7 +178,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   Execution io{*args, output_target, layout, c, CounterNow(),
-      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked};
+      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox};
   std::uint32_t count = 0;
   Range range{};
   if (io.Status() == Result::kPending && !io.Build(worker, &count, &range))
@@ -199,7 +202,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
       Store(*progress, Progress(args->sequence, ++completed));
       Barrier();
       if (!worker && !head_notified) {
-        io.Notify();
+        io.Notify(count);
         head_notified = true;
         Store(c.published, args->sequence);
       }
@@ -210,7 +213,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
     Barrier();
   }
   if (pipeline && !worker && count && io.Status() == Result::kPending) {
-    io.Notify();
+    io.Notify(count);
     head_notified = true;
     Store(c.published, args->sequence);
     BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
@@ -225,11 +228,16 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
     if (head_notified && !chunked) {
       const auto result = io.Status() == Result::kPending && built ? Result::kOk : io.Status();
       auto* suffix = reinterpret_cast<Word*>(io.Memory() + layout.notify);
-      __atomic_store_n(&suffix->reserved[0], Progress(args->sequence, std::uint32_t(result)), __ATOMIC_RELEASE);
+      if (mailbox && RetireDescriptorMailbox(*mailbox)) Fail(c, Result::kTransportError);
+      const auto committed = io.Status() == Result::kPending ? result : io.Status();
+      __atomic_store_n(&suffix->reserved[0], Progress(args->sequence, std::uint32_t(committed)), __ATOMIC_RELEASE);
       Barrier();
+      if (mailbox && count > std::min(count, kPipelineHeadRows) &&
+          (PostDescriptorMailbox(*mailbox, *args, layout, count, true, committed != Result::kOk) ||
+           RetireDescriptorMailbox(*mailbox))) Fail(c, Result::kTransportError);
     }
     if (built && io.Status() == Result::kPending) {
-      if (count && !pipeline && !chunked) io.Notify();
+      if (count && !pipeline && !chunked) io.Notify(count);
       Store(c.published, args->sequence);
     }
   } else {
@@ -291,5 +299,11 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) { return ExecuteCpuPush(ar
 std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
   return args ? ExecuteCpuPush(&args->execution, &args->output_target,
       (args->execution.sequence & kPipelineLaunch) != 0, (args->execution.sequence & kChunkPipelineLaunch) != 0) : 1;
+}
+}  // namespace kvaf::cpu_push
+
+namespace kvaf::cpu_push {
+std::uint32_t ExecuteCpuSglPush(CpuSglPushArgs* args) {
+  return args ? ExecuteCpuPush(&args->write.execution, &args->write.output_target, true, false, &args->mailbox) : 1;
 }
 }  // namespace kvaf::cpu_push

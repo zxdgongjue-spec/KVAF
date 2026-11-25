@@ -961,6 +961,20 @@ Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_addres
   return Status::OK();
 }
 
+Status PeerLink::OpenCpuSglPush(uint64_t base, OpenCpuSglPushRequest request,
+                                OpenCpuSglPushResponse* response) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end() || !response) return Status::NotFound("peer DDR region was not found");
+  request.base.header = MakeHeader(Command::kOpenCpuSglPush, sizeof(request));
+  request.base.session_id = found->second.session_id;
+  std::string error;
+  if (!Exchange(*this, request, response, &error) ||
+      !IsValidResponseHeader(response->base.header, Command::kOpenCpuSglPush, sizeof(*response)) ||
+      !ResultOk(static_cast<Result>(response->base.result), &error))
+    return ToStatus("CPU SGL mailbox setup failed", std::move(error));
+  return Status::OK();
+}
+
 Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
                                 OpenCpuPushGetResponse* response) const {
   const auto found = regions_.find(base);

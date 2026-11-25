@@ -28,7 +28,14 @@ set(cpu_push_libraries "${KVAF_AICPU_SECUREC_LIBRARY}")
 set(cpu_push_dependencies "${KVAF_AICPU_SECUREC_LIBRARY}" "${KVAF_AICPU_SECUREC_INCLUDE_DIR}/securec.h")
 set(cpu_push_commands COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${KVAF_AICPU_SECUREC_LIBRARY}" "${kernel_dir}/${securec_library_name}")
-set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV3": {
+set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuSglPushExecutionV1": {
+    "opInfo": {
+      "functionName": "KvafAicpuCpuSglPushExecutionV1",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuCpuPushScatterExecutionV3": {
     "opInfo": {
       "functionName": "KvafAicpuCpuPushScatterExecutionV3",
       "kernelSo": "libkvaf_aicpu_urma.so",
@@ -71,6 +78,8 @@ set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
   "${CMAKE_SOURCE_DIR}/common/include/batch_get_profile.h"
   "${CMAKE_SOURCE_DIR}/common/include/batch_get_profile_abi.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_kernel_abi.h"
+  "${CMAKE_SOURCE_DIR}/common/include/cpu_sgl_push_abi.h"
+  "${CMAKE_SOURCE_DIR}/access_operator/algorithms/get/cpu_sgl_push/kernel/aicpu_mailbox.h"
   "${CMAKE_SOURCE_DIR}/common/include/batch_get_ticket.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_abi.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_layout.h"

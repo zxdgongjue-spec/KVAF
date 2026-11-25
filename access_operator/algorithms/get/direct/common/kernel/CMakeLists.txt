@@ -16,7 +16,10 @@ add_custom_command(
           ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
   COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_EXECUTE_KERNEL_TMP}"
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cpu_sgl_write/urma_aiv/kernel/cpu_sgl_write_aiv.asc"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cpu_sgl_push/kernel/aiv_mailbox.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../../cpu_sgl_push/include/aiv_mailbox_abi.h"
+          "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_sgl_push_abi.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../../cpu_sgl_write/urma_aiv/kernel/cpu_sgl_write_aiv.asc"
           "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_sgl_write_aiv_abi.h"
           "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_push_kernel_abi.h"
           "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_push_get_abi.h"

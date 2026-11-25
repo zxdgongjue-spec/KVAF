@@ -844,7 +844,8 @@ class CpuService {
   }
 
   Result OpenCpuPushGet(const peer::OpenCpuPushGetRequest& request,
-                        peer::OpenCpuPushGetResponse* response) {
+                        peer::OpenCpuPushGetResponse* response, const peer::OpenCpuSglPushRequest* push = nullptr,
+                        peer::OpenCpuSglPushResponse* mailbox = nullptr) {
     const std::uint64_t session_id = request.session_id;
     const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kNotFound;
@@ -858,7 +859,7 @@ class CpuService {
     auto transport = std::make_unique<cpu_push::Transport>();
     const auto status = transport->Initialize(
         region.resources->context(), region.registration->segment(), request, region.resources->tp_query(),
-        region.resources->jetty_import(), NextPsn(), response, region.base);
+        region.resources->jetty_import(), NextPsn(), response, region.base, push, mailbox);
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
       const auto stopped = transport->Shutdown();
@@ -1212,6 +1213,19 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       return;
     }
 
+    case Command::kOpenCpuSglPush: {
+      peer::OpenCpuSglPushRequest request{};
+      request.base.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest); return;
+      }
+      peer::OpenCpuSglPushResponse response{};
+      response.base.header = MakeHeader(command, sizeof(response));
+      response.base.header.command = ResponseCommand(command);
+      response.base.result = static_cast<int32_t>(service->OpenCpuPushGet(request.base, &response.base, &request, &response));
+      (void)WriteAll(fd, &response, sizeof(response)); return;
+    }
     case Command::kOpenCpuPushGet: {
       peer::OpenCpuPushGetRequest request{};
       request.header = header;
@@ -1345,6 +1359,7 @@ Status UrmaCpuBackend::Call(const std::vector<std::uint8_t>& input,
     case Command::kEnableGatherLanes:
     case Command::kPrepareGatherWorkspace:
     case Command::kOpenCpuPushGet:
+    case Command::kOpenCpuSglPush:
     case Command::kStartCpuPushGet:
     case Command::kStopCpuPushGet:
       break;

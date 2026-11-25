@@ -7,6 +7,7 @@
 #include "aicpu_urma/control_abi.h"
 #include "aicpu_urma/session.h"
 #include "cpu_push_get_abi.h"
+#include "cpu_sgl_push_abi.h"
 
 namespace kvaf::aicpu_urma {
 struct PutPreparation final : ExecutionState {
@@ -70,5 +71,7 @@ struct ScatterLaunchView {
   bool direct_output{false};
   cpu_push::OutputTarget output_target;
   bool sgl_pipeline{false};
+  bool device_push{false};
+  cpu_push::MailboxLaunch mailbox;
 };
 }  // namespace kvaf::aicpu_urma
