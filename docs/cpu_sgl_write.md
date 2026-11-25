@@ -280,6 +280,10 @@ segment 导入和 done 协议，直接写调用方连续 output。AIV 不分配 
 `start_batch_get_kernel_profile` / `batch_get_kernel_profile`，时间戳和 request/notify/ack
 分段为 AIV cycles。CPU payload sample 仍为 CPU 纳秒，两种时钟不能直接相减。
 性能入口的 `--kernel-profile-clock-mhz` 负责换算 AIV cycles，请填写目标设备的实际频率。
+AIV 在每核独占的 GM profile 中保存入口时间和完成的分段，避免跨 SIMT 调用保留
+本地 profile 对象，结束后刷新整个记录。Host 和性能脚本都会在换算前检查每核
+`request + notify + ack <= exit - enter`；异常记录会报错，不输出 kernel 带宽。
+该校验不依赖配置的计数器频率；修改频率不能修复分段超过总时间的异常。
 
 AIV 设备入口 `KvafCpuSglWriteAivKernelV1` 编入
 `bin/kvaf_execute_batch_get_kernels.o`。重建 NPU Host/Python 库和该 kernel object；

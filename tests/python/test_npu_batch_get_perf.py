@@ -156,6 +156,16 @@ def device_profile_ms(profiles, clock_mhz):
         start, finish = int(p[begin]), int(p[end])
         if start <= 0 or finish < start:
             raise AssertionError("invalid BatchGet device timeline")
+        sgl_stages = ("sgl_request_cycles", "sgl_notify_cycles", "sgl_ack_cycles")
+        if any(field in p for field in sgl_stages):
+            # AIV SGL stages are disjoint within each worker. Validate before
+            # aggregating or converting units, including snapshots from older Hosts.
+            stages = [int(p.get(field, -1)) for field in sgl_stages]
+            if nanoseconds or min(stages) < 0 or sum(stages) > finish - start:
+                raise AssertionError(
+                    f"invalid AIV CPU SGL cycle profile: core={p.get('core', '?')} "
+                    f"start={start} finish={finish} request={stages[0]} notify={stages[1]} ack={stages[2]}; "
+                    "rebuild the matching NPU Host and kernel object")
         starts.append(start)
         finishes.append(finish)
     elapsed = max(finishes) - min(starts)

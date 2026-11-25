@@ -341,6 +341,20 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
   const auto profile = View().profile;
   auto copied = detail::CopyAicpuProfiles(profile.device, profile.host, s.config.workers, profiles);
   if (copied.ok() && s.config.aiv) for (auto& p : *profiles) {
+    // These three stages are disjoint within one worker. Check raw cycles so
+    // broken timestamps cannot turn into a plausible-looking bandwidth result.
+    auto remaining = p.device_finish_ns - p.device_start_ns;
+    for (const auto stage : {p.aicpu_profile.request_ns, p.aicpu_profile.notify_ns, p.aicpu_profile.ack_ns}) {
+      if (stage > remaining) {
+        const auto& raw = p.aicpu_profile;
+        return Status::InvalidState("invalid AIV CPU SGL cycle profile: core=" +
+            std::to_string(&p - profiles->data()) + " start=" + std::to_string(raw.enter_ns) +
+            " finish=" + std::to_string(raw.exit_ns) + " request=" + std::to_string(raw.request_ns) +
+            " notify=" + std::to_string(raw.notify_ns) + " ack=" + std::to_string(raw.ack_ns) +
+            "; request/notify/ack exceed worker timeline; rebuild the matching NPU Host and kernel object");
+      }
+      remaining -= stage;
+    }
     // The shared buffer stores raw AIV cycles, never nanoseconds.
     p.kernel_start_cycle = p.device_start_ns;
     p.kernel_finish_cycle = p.device_finish_ns;

@@ -9,13 +9,36 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-from test_npu_batch_get_perf import parse_args, print_measurements, validate_args, validate_sgl_payload_sample
+from test_npu_batch_get_perf import device_profile_ms, parse_args, print_measurements, validate_args, validate_sgl_payload_sample
 from utils.batch_get_csv import BatchGetCsv
 from utils.get_options import workload_command
 from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_aiv_sgl_timeline_and_stages_share_one_cycle_window(self):
+        start = 415_359_716_975_000
+        worker = dict(core=0, kernel_start_cycle=start, kernel_finish_cycle=start + 120_000,
+                      sgl_request_cycles=20_000, sgl_notify_cycles=200, sgl_ack_cycles=96_000)
+        self.assertEqual(device_profile_ms([worker], 1000), 0.12)
+        for change in (dict(kernel_finish_cycle=start + 680),
+                       dict(sgl_request_cycles=start, sgl_notify_cycles=start),
+                       dict(sgl_ack_cycles=100_000), dict(sgl_notify_cycles=-1)):
+            with self.subTest(change=change), self.assertRaisesRegex(AssertionError, "invalid AIV CPU SGL cycle profile"):
+                device_profile_ms([{**worker, **change}], 1000)
+        missing = worker.copy()
+        del missing["sgl_notify_cycles"]
+        with self.assertRaisesRegex(AssertionError, "invalid AIV CPU SGL cycle profile"):
+            device_profile_ms([missing], 1000)
+        # Validate per worker, even if another worker makes the global wall time long enough.
+        with self.assertRaisesRegex(AssertionError, "invalid AIV CPU SGL cycle profile"):
+            device_profile_ms([worker, {**worker, "core": 1, "kernel_finish_cycle": start + 680}], 1000)
+        with redirect_stdout(StringIO()) as output, self.assertRaisesRegex(AssertionError, "invalid AIV CPU SGL cycle profile"):
+            args = parse_args(["--backend", "aiv_cpu_sgl_write", "--aiv-cores", "1"])
+            self.assertIsNone(validate_args(args))
+            print_measurements(args, "graph", [0.16], [[{**worker, "kernel_finish_cycle": start + 680}]])
+        self.assertEqual(output.getvalue(), "")
+
     def test_pipeline_configuration_and_csv(self):
         kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
                                PutExecutionConfig=lambda *args: args,

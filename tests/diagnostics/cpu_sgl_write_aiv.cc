@@ -110,6 +110,12 @@ struct Fixture {
       for (auto reserved : statuses[w].reserved) assert(reserved == 0);
       assert(profiles[w].scatter_ns == 0 && profiles[w].scatter_copies == 0 && profiles[w].ready_queries == 0);
       assert(profiles[w].enter_ns && profiles[w].exit_ns >= profiles[w].enter_ns);
+      auto remaining = profiles[w].exit_ns - profiles[w].enter_ns;
+      for (const auto stage : {profiles[w].request_ns, profiles[w].notify_ns, profiles[w].ack_ns}) {
+        assert(stage <= remaining);
+        remaining -= stage;
+      }
+      if (w) assert(profiles[w].notify_ns == 0 && profiles[w].ack_ns == 0);
       assert(profiles[w].bytes == profiles[w].spans * kBytes);
       assert(profiles[w].input_cache_ns == 0 && profiles[w].descriptor_cache_ns == 0 && profiles[w].source_write_ns == 0);
       assert(profiles[w].read_ns == 0 && profiles[w].read_setup_ns == 0 && profiles[w].wr_build_ns == 0);
