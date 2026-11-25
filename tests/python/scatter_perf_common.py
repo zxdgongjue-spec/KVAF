@@ -36,8 +36,7 @@ PAYLOAD_TIMINGS = ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns",
 HOST_TIMINGS = (
     "host_binding_ns", "host_tensor_metadata_ns", "host_stream_resolve_ns",
     "host_native_ns", "host_runtime_validation_ns", "host_operator_ns",
-    "host_mutex_wait_ns", "host_capture_query_ns", "host_prior_drain_ns",
-    "host_input_ns", "host_launch_ns", "host_status_copy_enqueue_ns",
+    "host_launch_ns", "host_status_copy_enqueue_ns",
     "host_stream_sync_ns", "host_status_validate_ns",
 )
 
@@ -193,7 +192,7 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
         if any(key not in host or not math.isfinite(host[key]) or host[key] < 0
                for key in HOST_TIMINGS):
             raise ValueError("invalid or incomplete Host profile")
-        # Detect a mismatched/old binding or an unshared profiling context.
+        # Prepared submissions measure the actual submission, not setup.
         # Prepared submissions read Tensor metadata once during setup. The
         # stream timer still includes torch_npu's required Host-queue fence.
         if any(host[key] <= 0 for key in ("host_binding_ns", "host_native_ns", "host_operator_ns")):

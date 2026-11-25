@@ -47,11 +47,11 @@ class GatherBatchGet final : public SequentialBatchGet {
   explicit GatherBatchGet(AccessOperatorConfig config);
   ~GatherBatchGet() override;
   Status Initialize(const RemoteRegionDesc& region) override;
-  Status Execute(const BatchGetExecRequest& exec) override;
-  Status Drain() override;
+  Status ExecuteBatchGet(const BatchGetExecRequest& exec) override;
+  Status DrainGet() override;
   Status Shutdown() override;
-  Status SetGatherProfiling(bool enabled) override;
-  Status CopyGatherProfile(GatherBatchGetProfile* profile) const override;
+  Status SetGatherBatchGetProfiling(bool enabled) override;
+  Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const override;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -445,11 +445,11 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks, s.args.first_chunk_divisor);
   return Status::OK();
 }
-Status GatherBatchGet::Drain() {
+Status GatherBatchGet::DrainGet() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->Drain();
 }
-Status GatherBatchGet::SetGatherProfiling(bool enabled) {
+Status GatherBatchGet::SetGatherBatchGetProfiling(bool enabled) {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
@@ -466,7 +466,7 @@ Status GatherBatchGet::SetGatherProfiling(bool enabled) {
   s.profile_valid = false;
   return Status::OK();
 }
-Status GatherBatchGet::CopyGatherProfile(GatherBatchGetProfile* profile) const {
+Status GatherBatchGet::CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!profile) return Status::InvalidArgument("gather profile output must not be null");
@@ -477,7 +477,7 @@ Status GatherBatchGet::CopyGatherProfile(GatherBatchGetProfile* profile) const {
   *profile = s.latest_profile;
   return Status::OK();
 }
-Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
+Status GatherBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");

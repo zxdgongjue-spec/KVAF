@@ -6,18 +6,11 @@
 
 #include "types.h"
 #include "execution_config.h"
+#include "get_provider_timing.h"
 
 namespace kvaf {
 
 struct BatchGetProfile;
-// Optional Host diagnostics for one Get launch. The caller owns this storage;
-// providers write it only before ExecuteBatchGet returns.
-struct GetProviderTiming {
-  std::uint64_t prepare_ns{}, submit_ns{}, completion_ns{}, cleanup_ns{};
-  // AIV Direct diagnostics nested within prepare/submit. Zero for other providers.
-  std::uint64_t aiv_capture_prepare_ns{}, aiv_capture_submit_ns{};
-  std::uint64_t aiv_status_reset_ns{}, aiv_kernel_launch_ns{};
-};
 
 // Optional host-only diagnostics. Pointers to this storage are borrowed only
 // until the public Put call returns, never by retained/recovery state.
@@ -133,7 +126,6 @@ struct BatchFreeRequest {
 // 类型；当前 CANN Adapter 将它解释为 aclrtStream。默认只向 stream enqueue，
 // 不替调用方同步；同一 stream 上的后续 Torch/ACL 操作天然按序执行。跨 stream
 // 依赖、buffer 生命周期与显式 synchronize 由调用方/框架负责。
-enum class ScatterGraphAction { kNone, kAttach, kCheck, kDetach };
 
 // One graph node's resources. Each containing graph keeps its own fixed stream;
 // callers serialize shared queues/workspaces across graphs and ordinary Gets.
@@ -163,9 +155,8 @@ struct BatchGetExecutionOptions {
   std::uint64_t output_lease{0};
   // Scatter/Gather callers guarantee live contiguous, correctly typed NPU
   // tensors, valid indices/offsets, unique output rows and a valid stream.
-  // Gather uses eager submission; Scatter capture uses scatter_graph actions.
+  // Gather uses eager submission; Scatter capture uses an ordinary graph lease.
   bool trusted_npu_request{false};
-  ScatterGraphAction scatter_graph{ScatterGraphAction::kNone};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

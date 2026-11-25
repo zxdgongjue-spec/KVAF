@@ -151,7 +151,7 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
         args.miss_count = args.request_length
 
 
-def validate_workload(args):
+def validate_workload_shape(args):
     if not 1 <= args.request_length <= 65536:
         return "request-length must be in [1, 65536]"
     if not 1 <= args.table_capacity <= MAX_INT32:
@@ -164,6 +164,13 @@ def validate_workload(args):
         return "configured table size must fit uint64"
     if not 0 <= args.miss_count <= args.request_length:
         return "miss-count must be between zero and request-length"
+    return None
+
+
+def validate_workload(args):
+    error = validate_workload_shape(args)
+    if error:
+        return error
     maximum = 8 if uses_aicpu(args) else 48
     if args.parallelism is not None and not 1 <= args.parallelism <= maximum:
         return f"{parallelism_field(args.backend).replace('_', '-')} must be in [1, {maximum}]"

@@ -84,8 +84,9 @@ class GetResourceView {
     if (!timing) return op_->ExecuteBatchGet(r);
     const auto start = std::chrono::steady_clock::now();
     auto profiled = r;
-    profiled.host_timing = &timing->provider_detail;
+    if (!profiled.host_timing) profiled.host_timing = &timing->provider_detail;
     auto s = op_->ExecuteBatchGet(profiled);
+    if (r.host_timing) timing->provider_detail = *r.host_timing;
     timing->provider_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
     return s;

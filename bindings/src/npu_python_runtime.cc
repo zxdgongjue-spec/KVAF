@@ -27,7 +27,6 @@
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
-#include "scatter_host_profile.h"
 #include "npu_runtime_constructor.h"
 #include "npu_tensor_python.h"
 #include "hbm_read_python.h"
@@ -473,8 +472,6 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->InitializeDdr(ddr_bytes, slot_size));
   }
   void ShutdownDdr() {
-    if (!scatter_graph_nodes_.empty())
-      throw py::value_error("destroy and detach the caller's Scatter graph before DDR shutdown");
     ++generation_;
     Status status;
     std::unique_lock<std::mutex> get(get_mutex_, std::defer_lock), put(put_mutex_, std::defer_lock);
@@ -870,10 +867,6 @@ class NpuPythonRuntime final {
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
-    for (const auto& node : scatter_graph_nodes_) {
-      if (node.table.opaque == handle.opaque)
-        throw py::value_error("detach the Scatter graph before releasing its AccessTable");
-    }
     ThrowIfError(native_->core().ReleaseAccessTable(handle));
   }
 
@@ -930,8 +923,17 @@ class NpuPythonRuntime final {
       item["scatter_chunks"] = profile.scatter_chunks;
       if (!core && host_profile_enabled_ && host_profile_ready_) {
         py::dict host;
-        for (std::size_t phase = 0; phase < scatter_host::kCount; ++phase)
-          host[scatter_host::kNames[phase]] = host_profile_.ns[phase];
+        const auto& timing = host_profile_;
+        host["host_binding_ns"] = timing.total_ns;
+        host["host_tensor_metadata_ns"] = timing.tensor_views_ns;
+        host["host_stream_resolve_ns"] = timing.stream_ns;
+        host["host_native_ns"] = timing.core_call_ns;
+        host["host_runtime_validation_ns"] = timing.core_validate_ns;
+        host["host_operator_ns"] = timing.provider.total_ns;
+        host["host_launch_ns"] = timing.provider.aiv_kernel_launch_ns;
+        host["host_status_copy_enqueue_ns"] = timing.provider.status_copy_ns;
+        host["host_stream_sync_ns"] = timing.stream_sync_ns + timing.provider.stream_sync_ns;
+        host["host_status_validate_ns"] = timing.provider.status_validate_ns;
         item["host_profile"] = std::move(host);
       }
       result.append(std::move(item));
@@ -1115,76 +1117,48 @@ class NpuPythonRuntime final {
                                    const py::object& indices, const py::object& offsets,
                                    const py::object& miss_count, const py::object& output_indices,
                                    const py::object& output, const py::object& stream,
-                                   bool synchronize, bool wait_stream, bool capture_into_graph) {
+                                   bool synchronize, bool wait_stream, std::uint64_t graph_lease) {
     const auto config = native_->default_get();
     if (!config || !(*config == GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter}) ||
         !native_->ddr_initialized())
       throw py::value_error("prepare_scatter_batch_get requires initialized cpu_push_scatter");
     if (synchronize && wait_stream)
       throw py::value_error("choose synchronize (validated) or wait_stream (deferred status), not both");
-    if (capture_into_graph && (synchronize || wait_stream))
+    if (graph_lease && (synchronize || wait_stream))
       throw py::value_error("graph capture requires an asynchronous node");
     if (!tensor_methods_) tensor_methods_.emplace();
     const auto selected = tensor_methods_->SelectStream(stream);
     const auto request = TrustedNpuRequest(table.source(), table.addresses(), table.valid(),
         indices, offsets, miss_count, output_indices, output, native_->batch_get_token_bytes(),
         native_->batch_get_tokens_per_block(), *tensor_methods_);
-    if (capture_into_graph) {
-      const auto capacity = request.indices.bytes / sizeof(std::int32_t);
-      if (!capacity || capacity > UINT32_MAX)
-        throw py::value_error("Scatter graph requires a valid request capacity");
-      WarmupGet(*config, static_cast<std::uint32_t>(capacity), selected);
-    }
     const auto generation = generation_;
     auto storage = py::make_tuple(selected, table.addresses(), table.valid(), indices,
                                   offsets, miss_count, output_indices, output);
     return py::cpp_function(
-        [this, request, selected, synchronize, wait_stream, generation, capture_into_graph,
+        [this, request, selected, synchronize, wait_stream, generation, graph_lease,
          storage = std::move(storage), owner = py::cast(this, py::return_value_policy::reference)]() {
           (void)owner;  // Keep Runtime alive for the prepared callable.
-          scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
-          scatter_host::Timer binding_timer(scatter_host::kBinding);
-          host_profile_ready_ = false;
+          std::optional<BatchGetHostTiming> host;
+          auto* timing = BeginScatterHostTiming(host, graph_lease);
+          const auto started = timing ? BatchGetProfileNowNs() : 0U;
           if (generation != generation_)
             throw py::value_error("prepared scatter request expired after Runtime shutdown/reinitialize");
           // Read the stream handle on every submission to fence torch_npu's
           // Host task queue before consuming in-place Tensor updates.
-          scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
-          const auto acl_stream = tensor_methods_->Stream(selected);
-          stream_timer.Stop();
-          if (capture_into_graph) {
-            scatter_graph_nodes_.push_back({storage, request.access_table});
-            try {
-              SubmitScatterBatchGet(request, acl_stream, false, ScatterGraphAction::kAttach);
-            } catch (...) {
-              scatter_graph_nodes_.pop_back();
-              throw;
-            }
-            host_profile_ready_ = false;
-            return;
+          aclrtStream acl_stream;
+          {
+            BatchGetProfileScope stream_timer(timing ? &timing->stream_ns : nullptr);
+            acl_stream = tensor_methods_->Stream(selected);
           }
-          SubmitScatterBatchGet(request, acl_stream, synchronize, ScatterGraphAction::kNone, storage);
+          SubmitScatterBatchGet(request, acl_stream, synchronize, graph_lease, storage, timing);
           if (wait_stream) {
             // Preserve the eager prepared API: wait only for this stream's DMA;
             // status validation remains in the ordinary drain/profile path.
-            scatter_host::Timer sync_timer(scatter_host::kStreamSync);
+            BatchGetProfileScope sync_timer(timing ? &timing->stream_sync_ns : nullptr);
             ThrowIfAclError(aclrtSynchronizeStream(acl_stream), "synchronize prepared scatter stream");
           }
+          FinishScatterHostTiming(timing, started);
         }, py::name("submit_scatter_batch_get"));
-  }
-
-  void CheckScatterGraphReplay() {
-    if (scatter_graph_nodes_.empty()) throw py::value_error("no Scatter graph attached");
-    const auto stream = tensor_methods_->Stream(scatter_graph_nodes_.front().storage[0]);
-    SubmitScatterBatchGet({}, stream, false, ScatterGraphAction::kCheck);
-    host_profile_ready_ = false;
-  }
-
-  void DetachScatterGraph() {
-    if (scatter_graph_nodes_.empty()) return;
-    SubmitScatterBatchGet({}, nullptr, false, ScatterGraphAction::kDetach);
-    scatter_graph_nodes_.clear();
-    host_profile_ready_ = false;
   }
 
  private:
@@ -1215,20 +1189,20 @@ class NpuPythonRuntime final {
         selected->executor == Executor::Aiv && !graph_lease && !output_lease && !active_graph_scope_;
     if (sequential && trusted_scatter_inputs_ && selected->algorithm == GetAlgorithm::Scatter) {
       if (!tensor_methods_) tensor_methods_.emplace();
-      scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
-      scatter_host::Timer binding_timer(scatter_host::kBinding);
-      scatter_host::Timer tensor_timer(scatter_host::kTensorMetadata);
-      host_profile_ready_ = false;
+      std::optional<BatchGetHostTiming> scatter_host;
+      auto* timing = BeginScatterHostTiming(scatter_host, 0);
+      const auto started = timing ? BatchGetProfileNowNs() : 0U;
       const auto request = TrustedNpuRequest(access_table, addresses, valid, indices, offsets,
           miss_count, output_indices, output, native_->batch_get_token_bytes(),
           native_->batch_get_tokens_per_block(), *tensor_methods_);
-      tensor_timer.Stop();
-      scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
+      const auto stream_begin = timing ? BatchGetProfileNowNs() : 0U;
+      if (timing) timing->tensor_views_ns = stream_begin - started;
       const auto stream_owner = tensor_methods_->SelectStream(stream);
       const auto acl_stream = tensor_methods_->Stream(stream_owner);
-      stream_timer.Stop();
-      SubmitScatterBatchGet(request, acl_stream, synchronize, ScatterGraphAction::kNone,
-          py::make_tuple(addresses, valid, indices, offsets, miss_count, output_indices, output, stream_owner));
+      if (timing) timing->stream_ns = BatchGetProfileNowNs() - stream_begin;
+      SubmitScatterBatchGet(request, acl_stream, synchronize, 0,
+          py::make_tuple(addresses, valid, indices, offsets, miss_count, output_indices, output, stream_owner), timing);
+      FinishScatterHostTiming(timing, started);
       return py::none();
     }
 
@@ -1357,40 +1331,54 @@ class NpuPythonRuntime final {
   }
 
   void SubmitTrustedGet(const BatchGetRequest& request, const BatchGetExecutionOptions& exec,
-                        const py::object& storage) {
+                        const py::object& storage, BatchGetHostTiming* timing = nullptr) {
     std::unique_lock<std::mutex> direction(get_mutex_, std::defer_lock);
     {
+      BatchGetProfileScope timer(timing ? &timing->binding_lock_ns : nullptr);
       py::gil_scoped_release release;
       direction.lock();
+    }
+    if (exec.graph_lease) {
+      const auto it = graph_refs_.find(exec.graph_lease);
+      if (it == graph_refs_.end()) throw py::value_error("Get graph lease not found");
+      it->second.push_back(storage);
+      ThrowIfError(native_->core().BatchGet(request, exec));
+      return;
     }
     // Reserve before enqueueing work. A failed submission may still own the
     // buffers until the dispatcher drains or closes its provider.
     pending_get_refs_.reserve(pending_get_refs_.size() + 1);
     Status status;
     {
-      scatter_host::Timer timer(scatter_host::kNative);
-      status = native_->core().BatchGet(request, exec);
+      BatchGetProfileScope timer(timing ? &timing->core_call_ns : nullptr);
+      status = native_->core().BatchGet(request, exec, timing);
     }
     if (status.ok()) pending_get_refs_.clear();
     if (!status.ok() || !exec.synchronize) pending_get_refs_.push_back(storage);
     ThrowIfError(status);
   }
 
+  BatchGetHostTiming* BeginScatterHostTiming(std::optional<BatchGetHostTiming>& timing,
+                                             std::uint64_t graph_lease) {
+    host_profile_ready_ = false;
+    return !graph_lease && host_profile_enabled_ ? &timing.emplace() : nullptr;
+  }
+  void FinishScatterHostTiming(BatchGetHostTiming* timing, std::uint64_t started) {
+    if (!timing || !host_profile_enabled_) return;
+    timing->total_ns = BatchGetProfileNowNs() - started;
+    host_profile_ = *timing;
+    host_profile_ready_ = true;
+  }
   void SubmitScatterBatchGet(const BatchGetRequest& request, aclrtStream stream, bool synchronize,
-                             ScatterGraphAction graph, const py::object& storage = {}) {
+                             std::uint64_t graph_lease, const py::object& storage,
+                             BatchGetHostTiming* timing) {
     BatchGetExecutionOptions exec;
     exec.stream = stream;
     exec.synchronize = synchronize;
     exec.config = GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter};
     exec.trusted_npu_request = true;
-    exec.scatter_graph = graph;
-    if (storage) {
-      SubmitTrustedGet(request, exec, storage);
-    } else {
-      scatter_host::Timer timer(scatter_host::kNative);
-      ThrowIfError(native_->core().BatchGet(request, exec));
-    }
-    host_profile_ready_ = host_profile_enabled_;
+    exec.graph_lease = graph_lease;
+    SubmitTrustedGet(request, exec, storage, timing);
   }
 
  public:
@@ -1595,8 +1583,6 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->Warmup(c, {capacity, native_stream}));
   }
   void Shutdown() {
-    if (!scatter_graph_nodes_.empty())
-      throw py::value_error("destroy and detach the caller's Scatter graph before shutdown");
     ++generation_;
     host_profile_enabled_ = host_profile_ready_ = false;
     Status status;
@@ -1626,7 +1612,6 @@ class NpuPythonRuntime final {
       // Preserve Python storage as well as native DMA owners on failed cleanup.
       for (auto& ref : pending_get_refs_) (void)ref.release();
       (void)pending_put_ref_.release();
-      for (auto& node : scatter_graph_nodes_) (void)node.storage.release();
       for (auto& entry : graph_refs_)
         for (auto& ref : entry.second) (void)ref.release();
       for (auto& entry : output_refs_) (void)entry.second.release();
@@ -1653,15 +1638,10 @@ class NpuPythonRuntime final {
   }
 
  private:
-  struct ScatterGraphNode {
-    py::tuple storage;
-    AccessTableHandle table;
-  };
-  std::vector<ScatterGraphNode> scatter_graph_nodes_;
   std::uint64_t generation_{};
   std::optional<TensorMetadataMethods> tensor_methods_;
   bool host_profile_enabled_{false}, host_profile_ready_{false};
-  scatter_host::Profile host_profile_{};
+  BatchGetHostTiming host_profile_{};
   bool trusted_scatter_inputs_{false};
   bool trusted_gather_inputs_{false};
   friend class PythonGetGraphResources;
@@ -2062,7 +2042,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,
            py::arg("stream") = py::none(), py::kw_only(), py::arg("execution") = py::none(),
            py::arg("graph_lease") = 0,
-           "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
+           "Synchronize and check AICPU BatchGet or a captured AIV Scatter lease outside capture.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_eids", &NpuPythonRuntime::NpuEids)
@@ -2118,21 +2098,16 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("miss_count"), py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            py::arg("wait_stream") = false,
-           py::arg("capture_into_graph") = false,
+           py::arg("graph_lease") = 0,
            "Return a no-argument submit callable for fixed Tensor storage and stream. "
            "In-place contents may change; do not resize/rebind storage or release the table. "
            "Retains Runtime, Tensors and stream; keep callable alive until completion. "
            "Expires on shutdown/reinitialize. "
            "synchronize=True includes status validation. wait_stream=True waits for DMA only; "
            "status validation stays deferred. The two options are mutually exclusive. "
-           "capture_into_graph=True attaches "
-           "one asynchronous Scatter node when called during capture. "
-           "Keep the callable and Runtime alive until the caller destroys and detaches the graph. "
+           "Pass a lease from begin_get_graph to capture one asynchronous node. "
+           "Destroy the graph before ending its leases. "
            "Set profiling before capture.")
-      .def("check_scatter_graph_replay", &NpuPythonRuntime::CheckScatterGraphReplay,
-           "Synchronize and validate one caller-managed replay, including all captured Scatter nodes.")
-      .def("detach_scatter_batch_get_graph", &NpuPythonRuntime::DetachScatterGraph,
-           "Release a caller-managed Scatter attachment after the caller destroys its graph.")
       .def("start_gather_batch_get_profile",
            &NpuPythonRuntime::StartGatherBatchGetProfile,
            "Enable serial gather Host and per-core AIV timelines; use synchronize=True.")

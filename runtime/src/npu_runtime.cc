@@ -77,34 +77,6 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
   peer::PeerRegion allocated_{};
 };
 
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-class SequentialGetOperator final : public AccessOperator {
- public:
-  explicit SequentialGetOperator(AccessOperatorConfig config)
-      : owner_(CreateSequentialBatchGet(std::move(config))) {}
-  Status Initialize(const RemoteRegionDesc& region) override { return owner_->Initialize(region); }
-  Status Shutdown() override { return owner_->Shutdown(); }
-  Status DrainGet() override { return owner_->Drain(); }
-  Status ExecuteBatchGet(const BatchGetExecRequest& request) override {
-    return owner_->Execute(request);
-  }
-  Status ExecuteBatchPut(const BatchPutExecRequest&) override {
-    return Status::NotImplemented("sequential provider is Get-only");
-  }
-  Status SetScatterProfiling(bool enabled) override { return owner_->SetScatterProfiling(enabled); }
-  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* out) const override {
-    return owner_->CopyScatterProfiles(out);
-  }
-  Status SetGatherBatchGetProfiling(bool enabled) override { return owner_->SetGatherProfiling(enabled); }
-  Status CopyGatherBatchGetProfile(GatherBatchGetProfile* out) const override {
-    return owner_->CopyGatherProfile(out);
-  }
-
- private:
-  std::unique_ptr<SequentialBatchGet> owner_;
-};
-#endif
-
 // Register only compiled implementations. Registration stores factories and does
 // not load kernels, open communication sessions, or reserve algorithm workspace.
 std::vector<PutExecutionConfig> BuiltPutConfigs(TransportMode mode) {
@@ -386,7 +358,7 @@ struct NpuRuntime::Impl {
         c.aiv_batch_get_mode = algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read";
         c.aiv_gather_sgl_size = options.aiv_gather_sgl_size;
         c.batch_get_token_bytes = options.batch_get_token_bytes;
-        return std::make_unique<SequentialGetOperator>(std::move(c));
+        return CreateSequentialBatchGet(std::move(c));
       }
       c.enable_get = get;
       if (get) c.batch_put_kernel_object_path.clear();

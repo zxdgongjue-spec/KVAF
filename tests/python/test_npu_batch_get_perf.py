@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.backend import detect_torch_backend
 from utils.batch_get_csv import BatchGetCsv
-from utils.batch_get_workload import token_pattern
+from utils.batch_get_workload import generate_request_plan, sort_request_plan_prefix, token_pattern
 from utils.dsa_keys import build_dsa_keys
 from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
                              captured_get_resources, validate_graph_inputs)
@@ -491,38 +491,6 @@ def check_graph_resource_scopes(args, runtime, torch, kvaf, make_plan, device_ta
     print(f"BATCH_GET_GRAPH_RESOURCES_PASS backend={args.backend} api={args.graph_api} "
           "automatic_nodes=1 streams=2 caller_serialized=1 shared_output=1 "
           "graph_eager_interleave=1 survivor_replayed=1", flush=True)
-
-
-def sort_request_plan_prefix(
-    torch: object,
-    address_table: object,
-    indices: object,
-    offsets: object,
-    output_indices: object,
-    active_count: int,
-) -> tuple[object, object, object]:
-    """Sort active requests by resolved table entry and offset."""
-    if active_count <= 1:
-        return indices, offsets, output_indices
-
-    active_indices = indices[:active_count]
-    active_offsets = offsets[:active_count]
-    active_output_indices = output_indices[:active_count]
-    entry_addresses = address_table.index_select(
-        0, active_indices.to(torch.int64)
-    )
-    # Every valid table entry owns one non-overlapping, fixed-size block, so
-    # sorting the resolved remote byte address is equivalent to sorting first
-    # by the actual slot ID and then by the offset inside that slot.
-    sort_keys = entry_addresses + active_offsets.to(torch.int64)
-    _, permutation = torch.sort(sort_keys)
-    sorted_indices = active_indices.index_select(0, permutation)
-    sorted_offsets = active_offsets.index_select(0, permutation)
-    sorted_output_indices = active_output_indices.index_select(0, permutation)
-    indices[:active_count].copy_(sorted_indices)
-    offsets[:active_count].copy_(sorted_offsets)
-    output_indices[:active_count].copy_(sorted_output_indices)
-    return indices, offsets, output_indices
 
 
 def print_samples(
@@ -1053,54 +1021,9 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         # exact same remote working set as contiguous.
         contiguous_source_token_ids = request_ids % total_tokens
 
-        def create_request_plan() -> tuple[object, object, object]:
-            if args.source_access_pattern == "random":
-                # Preserve the established benchmark's full-table random source
-                # distribution as the default behavior.
-                indices = torch.randint(
-                    0,
-                    table_capacity,
-                    (request_length,),
-                    dtype=torch.int32,
-                    device=device,
-                )
-                token_slots = torch.randint(
-                    0,
-                    tokens_per_block,
-                    (request_length,),
-                    dtype=torch.int32,
-                    device=device,
-                )
-            else:
-                source_token_ids = contiguous_source_token_ids
-                if args.source_access_pattern == "shuffled-contiguous":
-                    source_token_ids = contiguous_source_token_ids.clone()
-                    active_permutation = torch.randperm(
-                        miss_count_value, device=device
-                    )
-                    source_token_ids[:miss_count_value].copy_(
-                        contiguous_source_token_ids[:miss_count_value].index_select(
-                            0, active_permutation
-                        )
-                    )
-                indices = (source_token_ids // tokens_per_block).to(torch.int32)
-                token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
-            offsets = token_slots * token_bytes
-            output_indices = (
-                request_ids.to(torch.int32)
-                if args.output_access_pattern == "contiguous"
-                else torch.randperm(request_length, device=device).to(torch.int32)
-            )
-            if args.sort_input_indices:
-                indices, offsets, output_indices = sort_request_plan_prefix(
-                    torch,
-                    device_table.addresses,
-                    indices,
-                    offsets,
-                    output_indices,
-                    miss_count_value,
-                )
-            return indices, offsets, output_indices
+        def create_request_plan():
+            return generate_request_plan(torch, args, device, request_ids, device_table.addresses,
+                                         contiguous_source_token_ids)
 
         def check_output(plan, count, full=True, *, result=output):
             if not count:

@@ -2,7 +2,7 @@
 #include "sequential_batch_get_common.h"
 #include "kvaf_aiv_batch_get.h"
 #include "cpu_push_get_layout.h"
-#include "scatter_host_profile.h"
+#include "get_host_timing.h"
 #include "scatter_mailbox_templates.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "direct_hccp/target_channel.h"
@@ -46,12 +46,21 @@ class ScatterBatchGet final : public SequentialBatchGet {
   explicit ScatterBatchGet(AccessOperatorConfig config);
   ~ScatterBatchGet() override;
   Status Initialize(const RemoteRegionDesc& region) override;
-  Status Execute(const BatchGetExecRequest& exec) override;
-  Status Drain() override;
+  Status ExecuteBatchGet(const BatchGetExecRequest& exec) override;
+  Status DrainGet() override;
   Status Shutdown() override;
   Status SetScatterProfiling(bool enabled) override;
-  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) override;
+  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const override;
+  std::unique_ptr<ExecutionState> CreateExecutionState() override;
+  Status BindExecutionState(ExecutionState*) override;
+  Status PrepareGetGraph(const GetGraphOptions&) override;
+  Status CheckBatchGetStatus(void*) override;
+  Status FinishGetGraph(void*, bool discard) override;
+  bool GetGraphNeedsRecovery() const override;
  private:
+  struct GraphNode final : ExecutionState {
+    bool prepared{}, captured{}, recovery_fenced{};
+  };
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -75,10 +84,13 @@ struct ScatterBatchGet::Impl {
   std::array<std::unique_ptr<d::TargetChannel>, cpu_push::kMaxJettyCount> channels;
   uint32_t payload_jettys{cpu_push::kJettyCount}, payload_jettys_per_core{};
   aclrtStream pending{};
+  GraphNode* node{};
   struct Graph {
     aclrtStream stream{};
     aclmdlRI id{};
     uint32_t nodes{};
+    uint32_t leases{};
+    bool checked{}, retiring{};
   } graph;
   uint64_t sequence{};
   bool push_open{}, initialized{}, failed{}, profile_ready{};
@@ -98,33 +110,34 @@ struct ScatterBatchGet::Impl {
         "; resources retained");
   }
 
-  Status Drain(bool allow_initial_status = false) {
-    if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
-    if (!pending) return Status::OK();
-    scatter_host::Timer copy_timer(scatter_host::kStatusCopy);
+  Status ReadStatus(aclrtStream stream, GetProviderTiming* timing = nullptr) {
+    const auto copy = GetHostTimingStart(timing);
     const aclError copied = aclrtMemcpyAsync(status_host, StatusBytes(), status_device,
-                                            StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, pending);
-    copy_timer.Stop();
+                                            StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    GetHostTimingRecord(timing, &GetProviderTiming::status_copy_ns, copy);
     if (copied != ACL_SUCCESS) {
       failed = true; return AclFailure("copy_status", copied);
     }
-    scatter_host::Timer sync_timer(scatter_host::kStreamSync);
-    const aclError synchronized = aclrtSynchronizeStream(pending);
-    sync_timer.Stop();
+    const auto sync = GetHostTimingStart(timing);
+    const aclError synchronized = aclrtSynchronizeStream(stream);
+    GetHostTimingRecord(timing, &GetProviderTiming::stream_sync_ns, sync);
     if (synchronized != ACL_SUCCESS) {
       failed = true; return AclFailure("synchronize", synchronized);
     }
-    pending = nullptr;
-    scatter_host::Timer validation_timer(scatter_host::kStatusValidate);
+    return Status::OK();
+  }
+
+  Status ValidateStatus(uint64_t expected, GetProviderTiming* timing = nullptr) {
+    BatchGetProfileScope validation(timing ? &timing->status_validate_ns : nullptr);
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
-      if (allow_initial_status && sequence == 0 && s.sequence == 0) continue;
-      if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence ||
+      if (expected == 0 && s.sequence == 0 && s.magic == 0) continue;
+      if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != expected ||
           s.result != KVAF_SEQ_OK || s.phase != KVAF_SEQ_COMPLETE) {
         failed = true;
         return Status::Internal("AIV sequential BatchGet worker=" + std::to_string(i) +
-            " sequence=" + std::to_string(sequence) + " observed_sequence=" +
+            " sequence=" + std::to_string(expected) + " observed_sequence=" +
             std::to_string(s.sequence) + " phase=" + std::to_string(s.phase) +
             " result=" + std::to_string(s.result));
       }
@@ -132,10 +145,19 @@ struct ScatterBatchGet::Impl {
     return Status::OK();
   }
 
+  Status Drain(GetProviderTiming* timing = nullptr) {
+    if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
+    if (!pending) return Status::OK();
+    BatchGetProfileScope completion(timing ? &timing->completion_ns : nullptr);
+    auto status = ReadStatus(pending, timing);
+    if (!status.ok()) return status;
+    pending = nullptr;
+    return ValidateStatus(sequence, timing);
+  }
+
   Status QueryCapture(aclrtStream stream, bool* capturing, aclmdlRI* captured = nullptr) const {
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI active = nullptr;
-    scatter_host::Timer timer(scatter_host::kCaptureQuery);
     const auto result = aclmdlRICaptureGetInfo(stream, &capture, &active);
     if (result != ACL_SUCCESS) return Error("query stream capture state");
     *capturing = capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE;
@@ -143,36 +165,33 @@ struct ScatterBatchGet::Impl {
     return Status::OK();
   }
 
-  // Replay validation and detach share the same stream/capture guard. The
-  // caller owns graph destruction; only its Scatter attachment is reset here.
-  Status ControlGraph(ScatterGraphAction action, aclrtStream stream) {
-    const bool detach = action == ScatterGraphAction::kDetach;
-    if (!graph.stream || (!detach && stream != graph.stream))
-      return Status::InvalidState("Scatter graph requires its capture stream");
+  Status RequireOutsideCapture(aclrtStream stream) const {
     bool capturing = false;
-    auto status = QueryCapture(graph.stream, &capturing);
+    auto status = QueryCapture(stream, &capturing);
     if (!status.ok()) return status;
-    if (capturing) return Status::InvalidState("end graph capture before checking or detaching Scatter");
-    if (!detach) {
-      if (graph.nodes > UINT32_MAX - sequence)
-        return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+    return capturing ? Status::InvalidState("Scatter graph operation requires an idle capture stream")
+                     : Status::OK();
+  }
+
+  // The status slab belongs to the complete graph, not to individual nodes.
+  // Its final sequence advances once per captured Scatter kernel. Repeated
+  // checks through sibling leases observe the same completed replay.
+  Status ReadGraphStatus(bool closing) {
+    auto status = ReadStatus(graph.stream);
+    if (!status.ok()) return status;
+    const auto observed = static_cast<const KvafSequentialStatus*>(status_host)[0].sequence;
+    if (observed == sequence && (closing || graph.checked)) return ValidateStatus(sequence);
+    if (graph.nodes > UINT32_MAX - sequence) {
+      failed = true;
+      return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+    }
+    status = ValidateStatus(sequence + graph.nodes);
+    if (status.ok()) {
       sequence += graph.nodes;
+      graph.checked = true;
+      profile_ready = ScatterProfileEnabled(args.reserved);
     }
-    if (detach && failed) {
-      const auto result = aclrtSynchronizeStream(graph.stream);
-      if (result != ACL_SUCCESS) return AclFailure("external_graph_synchronize", result);
-      pending = nullptr;
-    } else {
-      pending = graph.stream;
-      status = Drain(/*allow_initial_status=*/detach);
-      if (!detach) profile_ready = status.ok() && ScatterProfileEnabled(args.reserved);
-      if (!status.ok()) return status;
-    }
-    if (detach) {
-      graph = {};
-      profile_ready = false;
-    }
-    return Status::OK();
+    return status;
   }
 
   Status InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
@@ -288,8 +307,8 @@ struct ScatterBatchGet::Impl {
   }
 
   Status Shutdown() {
-    if (graph.stream)
-      return Status::InvalidState("destroy and detach the caller's Scatter graph before shutdown");
+    if (graph.leases)
+      return Status::InvalidState("release Scatter graph leases before shutdown");
     // A normal close must let the CPU finish serving the pending request first.
     // On execution errors, keep closing the transports before releasing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
@@ -417,70 +436,129 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
                unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys);
   return Status::OK();
 }
-Status ScatterBatchGet::Drain() {
+Status ScatterBatchGet::DrainGet() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->Drain();
 }
-Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
-  const auto graph_action = exec.execution.scatter_graph;
-  scatter_host::Timer operator_timer(scatter_host::kOperator);
+std::unique_ptr<ExecutionState> ScatterBatchGet::CreateExecutionState() {
+  return std::make_unique<GraphNode>();
+}
+Status ScatterBatchGet::BindExecutionState(ExecutionState* state) {
+  impl_->node = state && state->graph_node ? static_cast<GraphNode*>(state) : nullptr;
+  return Status::OK();
+}
+Status ScatterBatchGet::PrepareGetGraph(const GetGraphOptions& options) {
   auto& s = *impl_;
-  scatter_host::Timer mutex_timer(scatter_host::kMutexWait);
   std::lock_guard<std::mutex> lock(s.mutex);
-  mutex_timer.Stop();
-  if (graph_action == ScatterGraphAction::kDetach) return s.ControlGraph(graph_action, nullptr);
+  const auto status = s.CheckExecutionState();
+  if (!status.ok()) return status;
+  const auto stream = static_cast<aclrtStream>(options.stream);
+  if (!s.node || s.node->prepared || !stream || s.pending || s.graph.id || s.graph.retiring ||
+      (s.graph.stream && s.graph.stream != stream) || s.graph.leases == UINT32_MAX)
+    return Status::InvalidState("prepare all Scatter graph leases on one idle stream before capture");
+  auto capture = s.RequireOutsideCapture(stream);
+  if (!capture.ok()) return capture;
+  s.graph.stream = stream;
+  ++s.graph.leases;
+  s.node->prepared = true;
+  return Status::OK();
+}
+Status ScatterBatchGet::CheckBatchGetStatus(void* stream) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const auto status = s.CheckExecutionState();
+  if (!status.ok()) return status;
+  if (!s.node || !s.node->captured || s.graph.stream != stream || s.graph.retiring)
+    return Status::InvalidState("check Scatter replay using a captured graph lease and its stream");
+  auto capture = s.RequireOutsideCapture(s.graph.stream);
+  return capture.ok() ? s.ReadGraphStatus(false) : capture;
+}
+Status ScatterBatchGet::FinishGetGraph(void* stream, bool discard) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.node || !s.node->prepared || s.graph.stream != stream)
+    return Status::InvalidState("finish Scatter using its prepared graph lease and stream");
+  if (s.failed && !discard)
+    return Status::InvalidState("destroy and discard the failed Scatter graph");
+  if (!s.graph.retiring) {
+    auto status = s.RequireOutsideCapture(s.graph.stream);
+    if (!status.ok()) return status;
+    if (s.graph.nodes && !s.failed) {
+      status = s.ReadGraphStatus(true);
+      if (!status.ok() && !discard) return status;
+    }
+    if (s.failed) {
+      const auto result = aclrtSynchronizeStream(s.graph.stream);
+      if (result != ACL_SUCCESS) return s.AclFailure("external_graph_synchronize", result);
+    }
+    s.graph.retiring = true;
+  }
+  s.node->prepared = false;
+  s.node->recovery_fenced = s.failed;
+  if (--s.graph.leases == 0) {
+    s.graph = {};
+    s.profile_ready = false;
+  }
+  return Status::OK();
+}
+bool ScatterBatchGet::GetGraphNeedsRecovery() const {
+  return impl_->node && impl_->node->recovery_fenced;
+}
+Status ScatterBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  auto* timing = exec.host_timing;
+  BatchGetProfileScope total(timing ? &timing->total_ns : nullptr);
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
   auto state = s.CheckExecutionState();
   if (!state.ok()) return state;
-  if (graph_action == ScatterGraphAction::kCheck)
-    return s.ControlGraph(graph_action, static_cast<aclrtStream>(exec.execution.stream));
-  if (s.graph.stream && graph_action != ScatterGraphAction::kAttach)
-    return Status::InvalidState("detach the caller's Scatter graph before another BatchGet");
-  if (!exec.execution.stream) return Status::InvalidArgument("BatchGet needs a stream");
+  const bool attach_graph = exec.execution.graph_lease != 0;
+  if (s.graph.leases && !attach_graph)
+    return Status::InvalidState("release Scatter graph leases before another eager BatchGet");
+  if (!exec.request || !exec.execution.stream)
+    return Status::InvalidArgument("BatchGet needs a request and stream");
+  const auto prepare = GetHostTimingStart(timing);
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  const bool attach_graph = graph_action == ScatterGraphAction::kAttach;
   aclmdlRI external_capture = nullptr;
   if (attach_graph || !exec.execution.trusted_npu_request) {
     bool capturing = false;
     const auto status = s.QueryCapture(stream, &capturing, &external_capture);
     if (!status.ok()) return status;
     if (attach_graph) {
-      if (!capturing || s.pending || exec.execution.synchronize)
-        return Status::InvalidState("attach Scatter during active capture after draining previous work");
-      if (!external_capture || (s.graph.stream &&
-          (stream != s.graph.stream || external_capture != s.graph.id)))
-        return Status::InvalidState("attach Scatter nodes to the same caller-managed graph and stream");
+      if (!capturing || !s.node || !s.node->prepared || s.node->captured ||
+          s.graph.retiring || s.pending || exec.execution.synchronize)
+        return Status::InvalidState("capture Scatter with an unused graph lease");
+      if (!external_capture || stream != s.graph.stream ||
+          (s.graph.id && external_capture != s.graph.id))
+        return Status::InvalidState("capture all Scatter leases in the same graph and stream");
       if (s.graph.nodes >= UINT32_MAX - s.sequence)
         return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
     } else if (capturing) {
-      return Status::NotImplemented("use capture_into_graph for caller-managed capture");
+      return Status::InvalidState("use a Get graph lease for Scatter capture");
     }
   }
-  scatter_host::Timer prior_timer(scatter_host::kPriorDrain);
-  auto result = s.Drain();
-  prior_timer.Stop();
+  auto result = s.Drain(timing);
   if (!result.ok()) return result;
   auto args = s.args;
   if (exec.execution.trusted_npu_request) args.reserved |= kScatterTrustedInputs;
-  scatter_host::Timer input_timer(scatter_host::kInput);
   if (exec.execution.trusted_npu_request) FillTrustedScatterInput(*exec.request, s.config, &args.request);
   else result = Input(exec, s.config, &args.request);
-  input_timer.Stop();
   if (!result.ok()) return result;
   if (s.payload_jettys_per_core) args.request.jettys_per_core = s.payload_jettys_per_core;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
   args.request.core_status = Ptr(s.status_device);
   args.request.channel_entity = s.mailbox_context;
   args.request.queue_state = s.mailbox_context + offsetof(KvafScatterMailboxContext, queue);
+  GetHostTimingRecord(timing, &GetProviderTiming::prepare_ns, prepare);
   if (attach_graph) {
     args.sequence = 0;
     args.reserved |= kScatterDeviceSequence;
+    s.graph.id = external_capture;
+    s.node->captured = true;
+    ++s.graph.nodes;
     if (KvafScatterBatchGetLaunch(&args, stream)) {
       s.failed = true;
-      return Error("attach Scatter node to caller's graph");
+      return Status::CompletionUnknown("Scatter graph launch failed; destroy and discard the graph");
     }
-    s.graph.stream = stream;
-    s.graph.id = external_capture;
-    ++s.graph.nodes;
     s.profile_ready = false;
     return Status::OK();
   }
@@ -490,14 +568,18 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   // Every launched core overwrites its complete status. Drain checks this
   // request's monotonically increasing sequence, so an old status cannot pass.
   // Avoid submitting a separate device memset task before every kernel.
-  scatter_host::Timer launch_timer(scatter_host::kLaunch);
+  const auto launch = GetHostTimingStart(timing);
   const auto launch_result = KvafScatterBatchGetLaunch(&args, s.pending);
-  launch_timer.Stop();
+  if (timing) {
+    const auto elapsed = GetHostTimingStart(timing) - launch;
+    timing->submit_ns += elapsed;
+    timing->aiv_kernel_launch_ns += elapsed;
+  }
   if (launch_result) {
     s.failed = true; return Error("enqueue failed; resources retained");
   }
   s.profile_ready = ScatterProfileEnabled(args.reserved);
-  return exec.execution.synchronize ? s.Drain() : Status::OK();
+  return exec.execution.synchronize ? s.Drain(timing) : Status::OK();
 }
 Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
   auto& s = *impl_;
@@ -511,7 +593,7 @@ Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
   s.profile_ready = false;
   return Status::OK();
 }
-Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) {
+Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!profiles) return Status::InvalidArgument("scatter profile output is null");

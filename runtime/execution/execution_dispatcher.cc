@@ -80,9 +80,11 @@ class PutDispatchPhase {
   std::uint64_t PutDispatchTiming::*field_;
   std::uint64_t started_;
 };
-Status LaunchGet(GetExecutionContext& context, GetLaunchTiming* timing = nullptr) {
+Status LaunchGet(GetExecutionContext& context, GetLaunchTiming* timing, GetProviderTiming* detail) {
   try {
-    return context.view().LaunchPrepared(context.invocation(), timing);
+    auto request = context.invocation();
+    request.host_timing = detail;
+    return context.view().LaunchPrepared(request, timing);
   } catch (const std::exception& e) {
     return Status::CompletionUnknown(std::string("provider Get threw after submission: ") + e.what());
   } catch (...) {
@@ -629,8 +631,7 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   const auto locked = get_trace_ ? TraceNowNs() : 0;
-  const auto action = request.execution.scatter_graph;
-  if (!ready_ && action != ScatterGraphAction::kDetach)
+  if (!ready_)
     return Status::NotInitialized("dispatcher is not accepting work");
   if (!request.request) return Status::InvalidArgument("missing Get request");
   GetExecutionConfig c;
@@ -640,18 +641,6 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
                           c.algorithm != GetAlgorithm::Direct;
   if (request.execution.trusted_npu_request && !sequential)
     return Status::InvalidArgument("trusted Get requires an AIV Gather/Scatter provider");
-  if (action != ScatterGraphAction::kNone &&
-      (!sequential || c.algorithm != GetAlgorithm::Scatter ||
-       request.execution.graph_lease || request.execution.output_lease))
-    return Status::InvalidArgument("Scatter graph action requires the AIV Scatter provider");
-  if (action == ScatterGraphAction::kCheck || action == ScatterGraphAction::kDetach) {
-    auto* instance = FindGetInstanceLocked(c);
-    if (!instance) {
-      if (action == ScatterGraphAction::kDetach) return Status::OK();
-      return Status::NotInitialized("Scatter graph has not been prepared");
-    }
-    return instance->view().operation()->ExecuteBatchGet(request);
-  }
   const auto resolved = get_trace_ ? TraceNowNs() : 0;
   const auto& r = *request.request;
   if (r.indices.bytes % sizeof(std::int32_t) || r.indices.bytes / sizeof(std::int32_t) > UINT32_MAX)
@@ -696,15 +685,6 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
         r.output.device != bound.output.device || capacity > bound.request_capacity)
       return Status::InvalidArgument("request differs from bound Get output/capacity");
   }
-  if (action == ScatterGraphAction::kAttach) {
-    if (pending_get_)
-      return Status::Busy("drain pending Get before capturing Scatter");
-    if (!instance || instance->cleanup_only || !instance->warmed ||
-        instance->warmed_stream != request.execution.stream ||
-        instance->warmed_request_capacity < capacity)
-      return Status::InvalidState("prepare Scatter on the capture stream before beginning ACL capture");
-    return instance->view().operation()->ExecuteBatchGet(request);
-  }
   GetDispatchTrace::Row row{};
   if (get_trace_) {
     row.event = "submit";
@@ -737,7 +717,7 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   if (get_trace_) row.context_ns += TraceNowNs() - phase;
   pending_get_ = instance;
   instance->last_graph_profile.clear();
-  s = LaunchGet(*instance, get_trace_ ? &row.launch : nullptr);
+  s = LaunchGet(*instance, get_trace_ ? &row.launch : nullptr, request.host_timing);
   phase = get_trace_ ? TraceNowNs() : 0;
   if (s.ok() && request.execution.synchronize) {
     instance->ClearRequest();

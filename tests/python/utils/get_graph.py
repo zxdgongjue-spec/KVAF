@@ -125,15 +125,23 @@ def captured_get_nodes(args, runtime, torch, kvaf, execution, stream, nodes):
             stream.synchronize()
             if graph is not None:
                 graph.reset()
-            failure = None
-            for lease in leases:
-                try:
-                    runtime.end_get_graph(lease, stream, discard_result=not (replay and replay.validated))
-                except Exception as error:
-                    if failure is None:
-                        failure = error
-            if failure is not None:
-                raise failure
+            end_get_graph_leases(runtime, stream, leases, discard=not (replay and replay.validated))
+
+
+def end_get_graph_leases(runtime, stream, leases, *, discard):
+    """End all leases after graph destruction, retrying shared-domain discard."""
+    remaining = list(leases)
+    for _ in range(2 if discard else 1):
+        failed = []
+        for lease in remaining:
+            try:
+                runtime.end_get_graph(lease, stream, discard_result=discard)
+            except Exception as error:
+                failed.append((lease, error))
+        if not failed:
+            return
+        remaining = [lease for lease, _ in failed]
+    raise failed[0][1]
 
 
 def validate_graph_inputs(graph, inputs, check, count, replays):

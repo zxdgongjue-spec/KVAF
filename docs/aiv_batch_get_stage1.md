@@ -128,7 +128,7 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 ```
 
 - 支持 1～8 核和单 EID。普通 Scatter 入口使用 eager 执行；图捕获使用下面的
-  `capture_into_graph=True` prepared 入口。
+  通用 Get graph lease。
 - 请求容量 1～65536，固定 token 长度 1～65535 B；`miss_count=0` 是合法空批次。
 - 仅搬运有效前缀，允许重复源和不连续输出行；输出行必须唯一，offset 不能越过源 block。
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
@@ -158,45 +158,51 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 启用 kernel profiling 时，多节点图的阶段数据保存在 `last_call_*` 和 JSON 的
 `last_call_profile`，只描述末次调用；平均值的 `aiv_wall_us` 和 `call_outside_aiv_us` 留空。
 
-推理框架可以把多个 prepared 节点挂到已有图中，调用
-`prepare_scatter_batch_get(..., stream=stream, capture_into_graph=True)` 获取节点，在捕获期间
-调用这些节点。准备节点时会在捕获开始前初始化该 stream 的 Scatter 资源。每次 replay 后调用一次
-`check_scatter_graph_replay()` 验证累计序号与状态。
-设备失败状态会传递到后续节点。保留 Runtime、stream、Tensor 和 AccessTable，直到图完成、
-销毁并调用 `detach_scatter_batch_get_graph()`；同一 Runtime 的所有节点须使用同一图和 stream。
-profiling 开关须在捕获前设置。
-普通 prepared Scatter 继续支持 `wait_stream=True`，在调用内等待 DMA 完成并推迟状态校验；
-它与 `synchronize=True` 互斥。图捕获需将二者设为 false，使用 `capture_into_graph=True`。
-无图性能对照的 `--completion-scope native-stream` 继续映射到这一原有接口；图模式使用
-`--completion-scope stream` 或 `device`。
+推理框架可通过 `runtime.graph_resources()` 把 Scatter 节点接入调用方已有的图。
+显式管理节点时，使用 `begin_get_graph(...)` 预备每个节点的 lease，
+再将 `graph_lease=lease` 传给 `batch_get` 或 `prepare_scatter_batch_get`。
+准备发生在 capture 之前。同一 Runtime 的 Scatter 节点共享工作区，须使用同一张图和同一个 stream。
 
-最小调用流程如下。`input_plans` 为 8 组固定存储的输入，Runtime、表、输出和 stream 已初始化。
-无需在重放循环内重新 prepare 或 capture；只原地更新输入内容。
+每次 replay 后通过 `check_batch_get_status(stream, graph_lease=lease)` 检查整张 Scatter 图的
+累计序号和最终状态。任一节点失败会传递到后续节点。图、stream、Tensor 和 AccessTable 的存储须保持
+有效且地址不变。销毁 ACL 图后释放 lease，失败的图使用 `discard_result=True` 清理。
+profiling 开关须在准备图资源前设置。
+
+普通 prepared Scatter 支持 `wait_stream=True`，在调用内等待 DMA 完成并推迟状态校验。
+它与 `synchronize=True` 互斥。图节点捕获时两者均为 false。
+无图性能对照可选 `--completion-scope native-stream`，图模式使用 `stream` 或 `device`。
+
+最小框架接入流程如下。`input_plans` 为 8 组固定地址的输入，Scatter Runtime、表、输出和 stream 已初始化。
 
 ```python
-nodes = [runtime.prepare_scatter_batch_get(
-    view, indices, offsets, count, output_indices, output,
-    stream=stream, capture_into_graph=True)
-    for indices, offsets, output_indices in input_plans]
-graph = kvaf.AclGraph()
-try:
-    graph.capture_begin(stream)
-    for node in nodes:
-        node()
-    graph.capture_end()
+def forward():
+    for indices, offsets, output_indices in input_plans:
+        runtime.batch_get(
+            view, indices, offsets, count, output_indices, output, stream=stream)
 
+resources = runtime.graph_resources()
+graph = kvaf.AclGraph()
+discard = True
+try:
+    with resources.prepare(stream):
+        forward()
+    with resources.capture(stream):
+        graph.capture_begin(stream)
+        forward()
+        graph.capture_end()
     for _ in range(iterations):
-        refresh_inputs_in_place()  # 生产新输入并保证其已就绪；存储地址保持不变。
+        refresh_inputs_in_place()
         graph.replay()
         graph.synchronize()
-        runtime.check_scatter_graph_replay()
+        runtime.check_batch_get_status(stream, graph_lease=resources.leases[-1])
+    discard = False
 finally:
     if graph.capturing:
         graph.capture_end()
     if graph.ready:
         graph.synchronize()
         graph.reset()
-    runtime.detach_scatter_batch_get_graph()
+    resources.close(discard_result=discard)
 ```
 
 图只捕获一次，随后多次执行 `aclmdlRIExecuteAsync`；每次重放后同步并检查整图状态。

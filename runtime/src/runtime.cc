@@ -1,5 +1,4 @@
 #include "runtime.h"
-#include "scatter_host_profile.h"
 
 #include <chrono>
 #include <cstdio>
@@ -349,26 +348,15 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     phase = now;
   };
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-  if (execution.trusted_npu_request) {
-    scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
-    const auto action = execution.scatter_graph;
-    if (action == ScatterGraphAction::kNone) {
-      // Preserve the ordinary Gather/Scatter trusted-input contract.
-      if (!initialized_ || closing_) return Status::NotInitialized("Runtime has not been initialized");
-      if (request.indices.device != DeviceKind::kNpu || !execution.stream)
-        return Status::InvalidArgument("trusted BatchGet requires NPU inputs and an eager stream");
-    } else {
-      // Graph controls are Scatter-only. A failed shutdown can still detach
-      // the graph before retrying cleanup, without supplying input tensors.
-      const bool detach_for_cleanup = needs_cleanup_ && action == ScatterGraphAction::kDetach;
-      if ((!initialized_ || closing_) && !detach_for_cleanup)
-        return Status::NotInitialized("Runtime has not been initialized");
-      if ((action == ScatterGraphAction::kAttach && request.indices.device != DeviceKind::kNpu) ||
-          (action != ScatterGraphAction::kDetach && !execution.stream))
-        return Status::InvalidArgument("Scatter graph control requires valid inputs/stream");
-    }
-    validation_timer.Stop();
-    return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
+  auto* provider_timing = host_timing ? &host_timing->provider : nullptr;
+  if (execution.trusted_npu_request && !execution.graph_lease) {
+    if (!initialized_ || closing_) return Status::NotInitialized("Runtime has not been initialized");
+    if (request.indices.device != DeviceKind::kNpu || !execution.stream)
+      return Status::InvalidArgument("trusted BatchGet requires NPU inputs and a stream");
+    mark(&BatchGetHostTiming::core_validate_ns);
+    const auto status = access_operator_.ExecuteBatchGet({{}, &request, execution, provider_timing});
+    mark(&BatchGetHostTiming::core_dispatch_ns);
+    return status;
   }
   if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
@@ -484,7 +472,7 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   } else if (access_operator_.TracksGetCompletion())
     pending_get_table_ = table_ref;
   mark(&BatchGetHostTiming::core_validate_ns);
-  const auto status = access_operator_.ExecuteBatchGet({view, &request, execution});
+  const auto status = access_operator_.ExecuteBatchGet({view, &request, execution, provider_timing});
   mark(&BatchGetHostTiming::core_dispatch_ns);
   if (status.ok() && execution.synchronize && !execution.graph_lease) pending_get_table_.reset();
   if (!status.ok() && access_operator_.TracksGetCompletion() && !execution.graph_lease) {

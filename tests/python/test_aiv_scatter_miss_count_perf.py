@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Steady-state CPU SGL WRITE + AIV scatter aligned with the direct-READ miss sweep.
 
-Keep test_aiv_scatter_perf.py for changing-data end-to-end regression. This entry
-uses the reference CLI defaults and the exact same request-plan generator.
+Keep test_aiv_scatter_perf.py for changing-data end-to-end regression.
 """
 import argparse
 import copy
@@ -19,9 +18,14 @@ import subprocess
 import sys
 import time
 
-import aiv_scatter_perf_reference as reference
 from aiv_batch_get_test_common import shutdown_runtime
+from utils.batch_get_workload import (generate_request_plan, refresh_request_buffers,
+                                     sort_request_plan_prefix)
 from utils.dsa_keys import build_dsa_keys
+from utils.get_graph import end_get_graph_leases
+from utils.get_options import add_workload_arguments, environment_int, validate_workload_shape
+from utils.npu_eids import parse_npu_eids
+from utils.statistics import percentile
 from scatter_perf_common import PAYLOAD_TIMINGS, SCATTER_CHUNK_ROWS, profile_metrics, sample_metrics
 from test_aiv_scatter_perf import (SCATTER_MAX_JETTYS, resolve_scatter_options,
                                    scatter_payload_jettys, write_results)
@@ -98,11 +102,23 @@ def arguments(argv=None):
     parser.add_argument("--completion-scope", choices=("device", "stream", "native-stream"), default="device",
                         help="wait on the device, the selected stream, or inside the eager prepared call")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
-    extra, remaining = parser.parse_known_args(argv)
-    if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
-        remaining.append("--kernel-profile")  # Reference sweep profiles every formal case.
-    args = reference.parse_args(remaining)
-    vars(args).update(vars(extra))
+    parser.add_argument("--aiv-cores", type=int,
+                        default=environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", 2))
+    parser.add_argument("--npu-eids", type=parse_npu_eids,
+                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
+                        help="local NPU EID for Scatter (at most one)")
+    parser.add_argument("--peer-ub-device", default="", help="pin the K-side UB device")
+    parser.add_argument("--iterations", type=int,
+                        default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
+    parser.add_argument("--kernel-profile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--kernel-profile-clock-mhz", type=int,
+                        default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
+                            environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
+                        help="AIV profiling counter frequency in MHz")
+    add_workload_arguments(parser)
+    args = parser.parse_args(argv)
+    if args.miss_count is None:
+        args.miss_count = args.request_length
     args.build = args.build.expanduser().resolve()
     args.cores = args.aiv_cores  # Reuse the existing compact sample writer.
     if args.pipeline is None:
@@ -112,7 +128,7 @@ def arguments(argv=None):
         args.pipeline = int(value)
     resolve_scatter_options(parser, args)
     if args.host_profile is None:
-        args.host_profile = False  # Reference sweep enables device profiling, not Host RAII clocks.
+        args.host_profile = False
     if args.single and any((args.token_sizes, args.miss_counts, args.core_counts)):
         parser.error("use scalar options with --single; list options select a sweep")
     if not args.single and (args.json or args.csv):
@@ -124,15 +140,13 @@ def arguments(argv=None):
         ("miss_counts", "miss_count", MISS_COUNTS),
         ("core_counts", "aiv_cores", CORE_COUNTS),
     ):
-        supplied = any(x.split("=", 1)[0] == "--" + scalar.replace("_", "-") for x in remaining)
+        supplied = any(x.split("=", 1)[0] == "--" + scalar.replace("_", "-") for x in argv)
         if getattr(args, plural) is None:
             # Reference sweep explicitly overrides scalar environment defaults
             # at every point. Only an explicit CLI scalar narrows this sweep.
             setattr(args, plural, (getattr(args, scalar),) if supplied else defaults)
     for case in cases(args):
-        reference_case = copy.copy(case)
-        reference_case.jettys_per_core = 2  # Match the Host topology used for BatchPut.
-        error = validate_scatter(case) or reference.validate_args(reference_case)
+        error = validate_workload_shape(case) or validate_scatter(case)
         if error:
             parser.error(f"token={case.token_bytes} miss={case.miss_count} cores={case.aiv_cores}: {error}")
     return args
@@ -143,14 +157,18 @@ def validate_scatter(args):
         return "CPU-push scatter supports 1..8 AIV cores; 16/32-core reference points are unsupported"
     if scatter_payload_jettys(args) > SCATTER_MAX_JETTYS:
         return f"aiv-cores times jettys-per-core must be at most {SCATTER_MAX_JETTYS}"
-    if len(args.npu_eids) > 1 or args.adaptive_ub_device or args.adaptive_calibration_only:
-        return "scatter supports one EID and a fixed peer-ub-device, without adaptive UB calibration"
+    if len(args.npu_eids) > 1:
+        return "scatter supports one local NPU EID"
     if not 1 <= args.miss_count <= args.request_length <= 65536:
         return "scatter performance requires 1 <= miss-count <= request-length <= 65536"
     if not 1 <= args.token_bytes <= 65535 or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
         return "scatter token_bytes must be <=65535 and block bytes must fit uint32"
     if args.case_timeout <= 0:
         return "case-timeout must be positive seconds"
+    if args.warmup < 0 or args.iterations <= 0:
+        return "warmup must be non-negative and iterations must be positive"
+    if args.populate_chunk_entries <= 0 or args.kernel_profile_clock_mhz <= 0:
+        return "populate-chunk-entries and kernel-profile-clock-mhz must be positive"
     if args.host_profile and not args.kernel_profile:
         return "host-profile requires kernel-profile"
     if not 1 <= args.graph_calls <= 0xFFFFFFFF:
@@ -232,7 +250,7 @@ def statistics_ns(values, payload=None):
     if not values or any(not math.isfinite(x) or x < 0 for x in values):
         raise ValueError("invalid timing samples")
     result = {"samples": len(values), "mean_us": statistics.mean(values) / 1000,
-              **{f"p{q}_us": reference.percentile(values, q / 100) / 1000 for q in (50, 90, 99)},
+              **{f"p{q}_us": percentile(values, q / 100) / 1000 for q in (50, 90, 99)},
               "min_us": min(values) / 1000, "max_us": max(values) / 1000}
     if payload is not None:
         if min(values) <= 0:
@@ -242,32 +260,32 @@ def statistics_ns(values, payload=None):
     return result
 
 
-def complete_outside_measurement(runtime, profiling, caller_graph=False):
-    if caller_graph:
-        runtime.check_scatter_graph_replay()
+def complete_outside_measurement(runtime, profiling, check_replay=None):
+    if check_replay:
+        check_replay()
     if profiling:
         # Snapshot drains/checks all business statuses before copying records.
         return list(runtime.scatter_profile())
-    if not caller_graph:
+    if not check_replay:
         runtime.drain_get()
     return None
 
 
-def warmup_calls(runtime, torch, args, refresh_inputs, submit, wait):
+def warmup_calls(runtime, torch, args, refresh_inputs, submit, wait, check_replay):
     for _ in range(args.warmup):
         refresh_inputs()
         torch.npu.synchronize()
         submit()
         if wait is not None:
             wait()
-        if args.acl_graph:
-            runtime.check_scatter_graph_replay()
+        if check_replay:
+            check_replay()
     if args.warmup and not args.acl_graph:
         # No last-warmup status drain may spill into the first timed Execute.
         complete_outside_measurement(runtime, args.kernel_profile)
 
 
-def measure_call(runtime, args, iteration, submit, wait, clock=time.perf_counter_ns):
+def measure_call(runtime, args, iteration, submit, wait, check_replay=None, clock=time.perf_counter_ns):
     calls = graph_call_count(args)
     begin = clock()
     submit()
@@ -286,7 +304,7 @@ def measure_call(runtime, args, iteration, submit, wait, clock=time.perf_counter
         sample[f"{args.completion_scope}_sync_ns"] = (completed - submitted) / calls
     if args.kernel_profile:
         begin = clock()
-        records = complete_outside_measurement(runtime, True, args.acl_graph)
+        records = complete_outside_measurement(runtime, True, check_replay)
         metrics = profile_metrics(records, args.aiv_cores, args.miss_count,
                                   args.token_bytes, args.kernel_profile_clock_mhz)
         if calls == 1:
@@ -303,7 +321,7 @@ def measure_call(runtime, args, iteration, submit, wait, clock=time.perf_counter
         sample["snapshot_ns"] = clock() - begin
     else:
         begin = clock()
-        complete_outside_measurement(runtime, False, args.acl_graph)
+        complete_outside_measurement(runtime, False, check_replay)
         sample["status_validation_ns"] = clock() - begin
     sample["graph_total_gbps"] = sample["graph_payload_bytes"] / sample["graph_total_ns"]
     return sample_metrics(sample)
@@ -345,7 +363,7 @@ def run_case(args):
     runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
         device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=2,
         batch_put_kernel_object_path=str(put_kernel), npu_eids=args.npu_eids,
-        peer_ub_device=args.peer_ub_device, batch_get_max_inflight_total=args.max_inflight_total,
+        peer_ub_device=args.peer_ub_device,
         aiv_batch_get_mode="cpu_push_scatter")
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "worker"}
@@ -364,9 +382,9 @@ def run_case(args):
         cpu_jettys=cpu_jettys, host_jettys_per_core=2,
         queue_matched_direct_jettys_per_core=(cpu_jettys // args.aiv_cores
                                              if cpu_jettys % args.aiv_cores == 0 else None),
-        read_inflight_budget_applies=False, device_id=device_id,
+        device_id=device_id,
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
-        reference="tests/python/aiv_scatter_perf_reference.py",
+        workload="tests/python/utils/batch_get_workload.py",
         input_mode="steady_table_new_request_plan_per_call",
         request_plans_per_sample=calls,
         sample_timing_scope=("replay_to_completion_divided_by_calls" if graph_mode
@@ -398,6 +416,8 @@ def run_case(args):
     report = dict(config=config, setup_us={}, samples={phase: []}, summary={})
     table = None
     caller_graph = None
+    graph_leases = []
+    check_replay = None
     try:
         with setup_phase(report, "initialize", ddr_bytes=config["ddr_bytes"],
                          table_capacity=args.table_capacity):
@@ -448,7 +468,7 @@ def run_case(args):
                         (preflight_slots * args.token_bytes).to(torch.int32),
                         request_ids.to(torch.int32))
         if args.sort_input_indices:
-            fixed_inputs = reference.sort_request_plan_prefix(
+            fixed_inputs = sort_request_plan_prefix(
                 torch, view.addresses, *fixed_inputs, args.miss_count)
         input_plans = [fixed_inputs]
         # Each node owns its input storage. Refresh all plans outside timing
@@ -475,11 +495,19 @@ def run_case(args):
                     stream.synchronize()
                     complete_outside_measurement(runtime, args.kernel_profile)
                     verify(inputs, guard=True)
+            if graph_mode:
+                execution = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
+                for _ in input_plans:
+                    graph_leases.append(runtime.begin_get_graph(execution, output, args.request_length, stream))
+
+                def check_replay():
+                    runtime.check_batch_get_status(stream, execution=execution, graph_lease=graph_leases[-1])
+
             capture_nodes = [runtime.prepare_scatter_batch_get(
                 view, inputs[0], inputs[1], count, inputs[2], output,
                 stream=stream, synchronize=False,
                 wait_stream=args.completion_scope == "native-stream",
-                capture_into_graph=args.acl_graph) for inputs in input_plans]
+                graph_lease=lease) for inputs, lease in zip(input_plans, graph_leases or [0])]
             submit = capture_nodes[0]
             if args.acl_graph:
                 caller_graph = kvaf.AclGraph()
@@ -499,7 +527,7 @@ def run_case(args):
         submit()
         if wait is not None:
             wait()
-        complete_outside_measurement(runtime, graph_mode and args.kernel_profile, args.acl_graph)
+        complete_outside_measurement(runtime, graph_mode and args.kernel_profile, check_replay)
         verify(input_plans[-1], guard=calls == 1 or args.output_access_pattern == "contiguous")
         check = "per_node_preflight_and_last_payload" if calls > 1 else "active_prefix_and_guard"
         print(f"SCATTER_ALIGNED_CORRECTNESS_PASS {check}=1", flush=True)
@@ -512,14 +540,14 @@ def run_case(args):
         if args.kernel_profile and not graph_mode:
             runtime.start_scatter_profile()
         log_phase("warmup", "begin", calls=args.warmup)
-        warmup_calls(runtime, torch, args, refresh_inputs, submit, wait)
+        warmup_calls(runtime, torch, args, refresh_inputs, submit, wait, check_replay)
         log_phase("warmup", "end")
         log_phase("measure", "begin", calls=args.iterations)
         for iteration in range(args.iterations):
             refresh_inputs()
             torch.npu.synchronize()  # Same pre-call isolation as the reference.
             report["samples"][phase].append(
-                measure_call(runtime, args, iteration, submit, wait))
+                measure_call(runtime, args, iteration, submit, wait, check_replay))
         log_phase("measure", "end")
         verify(input_plans[-1], guard=args.output_access_pattern == "contiguous")
         samples = report["samples"][phase]
@@ -543,8 +571,8 @@ def run_case(args):
         log_phase("teardown", "begin")
         original = sys.exc_info()[1]
         try:
-            if caller_graph is not None:
-                close_caller_graph(runtime, caller_graph)
+            if graph_leases:
+                close_caller_graph(runtime, caller_graph, stream, graph_leases, discard=original is not None)
                 if original is None and args.kernel_profile:
                     runtime.stop_scatter_profile()
         except Exception as error:
@@ -556,13 +584,15 @@ def run_case(args):
         log_phase("teardown", "end")
 
 
-def close_caller_graph(runtime, graph):
-    if graph.capturing:
-        graph.capture_end()
-    if graph.ready:
-        graph.synchronize()
-        graph.reset()
-    runtime.detach_scatter_batch_get_graph()
+def close_caller_graph(runtime, graph, stream, leases, *, discard):
+    try:
+        if graph is not None and graph.capturing:
+            graph.capture_end()
+    finally:
+        if graph is not None and graph.ready:
+            graph.synchronize()
+            graph.reset()
+        end_get_graph_leases(runtime, stream, leases, discard=discard)
 
 
 def close_case(runtime, table):
@@ -573,45 +603,12 @@ def close_case(runtime, table):
         shutdown_runtime(runtime)
 
 
-def generate_request_plan(torch, args, device, request_ids, address_table,
-                          contiguous_source_token_ids=None):
-    """Shared steady-state source/output distribution for transport comparisons."""
-    if args.source_access_pattern == "random":
-        indices = torch.randint(0, args.table_capacity, (args.request_length,),
-                                dtype=torch.int32, device=device)
-        token_slots = torch.randint(0, args.tokens_per_block, (args.request_length,),
-                                    dtype=torch.int32, device=device)
-    else:
-        source_token_ids = (request_ids % (args.table_capacity * args.tokens_per_block)
-                            if contiguous_source_token_ids is None else contiguous_source_token_ids)
-        if args.source_access_pattern == "shuffled-contiguous":
-            original = source_token_ids
-            source_token_ids = source_token_ids.clone()
-            permutation = torch.randperm(args.miss_count, device=device)
-            source_token_ids[:args.miss_count].copy_(
-                original[:args.miss_count].index_select(0, permutation))
-        indices = (source_token_ids // args.tokens_per_block).to(torch.int32)
-        token_slots = (source_token_ids % args.tokens_per_block).to(torch.int32)
-    offsets = token_slots * args.token_bytes
-    output_indices = (request_ids.to(torch.int32) if args.output_access_pattern == "contiguous"
-                      else torch.randperm(args.request_length, device=device).to(torch.int32))
-    if args.sort_input_indices:
-        indices, offsets, output_indices = reference.sort_request_plan_prefix(
-            torch, address_table, indices, offsets, output_indices, args.miss_count)
-    return indices, offsets, output_indices
-
-
-def refresh_request_buffers(plan, fixed_inputs):
-    for destination, source in zip(fixed_inputs, plan):
-        destination.copy_(source)
-
-
 def case_command(args):
     command = [sys.executable, str(Path(__file__).resolve()), "--build", str(args.build), "--single", "--worker"]
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
                  "aiv_cores", "warmup", "iterations", "populate_chunk_entries",
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
-                 "max_inflight_total", "pipeline", "jetty_cursors", "overlap_head_cq", "case_timeout",
+                 "pipeline", "jetty_cursors", "overlap_head_cq", "case_timeout",
                  "graph_calls"):
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
     if args.jettys_per_core is not None:
