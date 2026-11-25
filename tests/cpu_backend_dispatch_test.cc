@@ -64,9 +64,9 @@ int main() {
       runtime, Command::kCreateChannel, Result::kResourceError);
   Exchange<OpenCpuPushGetRequest, OpenCpuPushGetResponse>(
       runtime, Command::kOpenCpuPushGet, Result::kResourceError);
-  Exchange<OpenCpuPushGetRequest, OpenAivCpuPushGetResponse>(
+  Exchange<OpenAivCpuPushGetRequest, OpenAivCpuPushGetResponse>(
       runtime, Command::kOpenCpuPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
-  Exchange<OpenCpuPushGetRequest, OpenAivCpuPushGetResponse>(
+  Exchange<OpenAivCpuPushGetRequest, OpenAivCpuPushGetResponse>(
       runtime, Command::kOpenAivCpuGatherPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
   for (const auto command : {Command::kOpenCpuPushGet, Command::kOpenAivCpuGatherPushGet})
     Exchange<OpenAivCpuPushJettyRequest, OpenAivCpuPushJettyResponse>(

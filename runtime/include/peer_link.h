@@ -100,6 +100,8 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   Status ReleaseRegion(uint64_t base);
   virtual Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes, PeerRegion* workspace);
+  Status PrepareGatherWindow(uint64_t region_base, uint64_t budget, uint32_t token_bytes,
+                             uint32_t workers, PeerRegion* workspace, uint32_t* capacity);
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes,
                            bool aiv = false) const;
@@ -108,7 +110,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
                         OpenCpuPushGetResponse* response) const;
   Status StartCpuPushGet(uint64_t region_base) const;
   Status StopCpuPushGet(uint64_t region_base) const;
-  Status OpenAivCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
+  Status OpenAivCpuPushGet(uint64_t region_base, OpenAivCpuPushGetRequest request,
                           OpenAivCpuPushGetResponse* response) const;
   Status OpenAivCpuPushGet(uint64_t region_base, OpenAivCpuPushJettyRequest request,
                           OpenAivCpuPushJettyResponse* response, bool cpu_gather = false) const;

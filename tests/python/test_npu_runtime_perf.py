@@ -129,7 +129,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
         and token_bytes > 0
         and tokens_per_block > 0
         and source_stride == block_bytes
-        and 0 < requests <= 65536
+        and 0 < requests <= (1 << 31) - 1
         and requests % REQUESTS_PER_BATCH == 0
         and table_capacity >= PUT_BATCH_SIZE
         and table_capacity % PUT_BATCH_SIZE == 0

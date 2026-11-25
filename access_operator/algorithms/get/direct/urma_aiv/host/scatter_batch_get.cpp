@@ -196,7 +196,8 @@ struct ScatterBatchGet::Impl {
 
   Status InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
     cpu_push::Layout layout;
-    if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout, payload_jettys))
+    if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout,
+                              kDefaultGetWindow, payload_jettys))
       return Status::InvalidArgument("invalid scatter workspace shape");
     args.descriptor_offset = layout.descriptor; args.staging_offset = layout.staging;
     // Queue context follows the shared layout and precedes the private

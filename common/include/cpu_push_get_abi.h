@@ -8,9 +8,11 @@
 #endif
 
 namespace kvaf::cpu_push {
-// V3 ports the a12bb16 V24 per-row pipeline and removes the V2 sort workspace.
+// The V3 wire message retains the a12bb16 V24 pipeline. V4 kernels add
+// window coordination locally; setup now also carries the window capacity.
 constexpr std::uint64_t kMagic = 0x4b56414650555333ULL;
 inline constexpr char kReferenceCommit[] = "a12bb16c120e885eb18ed61581739e1c212c32e8";
+// Legacy default workspace capacity, not a total BatchGet limit.
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kMaxJettyCount = 32;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
@@ -56,9 +58,13 @@ struct alignas(64) Coordination {
   // Cumulative counts/epochs, initialized once per transport. result retains
   // the first error; failed transports must be rebuilt, never reset in place.
   Word claimed, built, arrivals, finished, result, published;
+  // Launch tickets remain one per worker/call. Wire sequences advance once
+  // per window, including the empty window used for a zero-count replay.
+  Word window_next, launch_first_window, launch_count, started;
 };
 struct alignas(64) WorkerStatus {
-  std::uint64_t magic{kMagic}, sequence{}, result{}, worker{}, consumed{}, reserved[3]{};
+  std::uint64_t magic{kMagic}, sequence{}, result{}, worker{}, consumed{};
+  std::uint64_t completed_requests{}, failed_request{}, reserved{};
 };
 inline constexpr std::uint64_t Progress(std::uint64_t sequence, std::uint32_t chunks) {
   return (sequence << 32) | chunks;
@@ -88,9 +94,10 @@ KVAF_CPU_PUSH_INLINE Range WorkerRange(std::uint32_t count, std::uint32_t bytes,
   const auto active = ActiveWorkers(count, bytes, workers);
   if (worker >= active) return {count, count};
   const auto quantum = RowsPerCacheGroup(bytes);
-  const auto groups = (count + quantum - 1) / quantum;
+  const auto groups = std::uint64_t{(count + quantum - 1) / quantum};
+  const auto begin = groups * worker / active * quantum;
   const auto end = groups * (worker + 1) / active * quantum;
-  return {groups * worker / active * quantum, end < count ? end : count};
+  return {static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end < count ? end : count)};
 }
 KVAF_CPU_PUSH_INLINE std::uint32_t ChunkCount(Range r) {
   return (r.end - r.begin + kChunkRows - 1) / kChunkRows;

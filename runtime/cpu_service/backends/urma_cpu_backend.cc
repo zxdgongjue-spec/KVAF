@@ -444,7 +444,8 @@ class CpuGatherWorker {
                   CpuGatherMode mode, uint64_t control_address = 0U,
                   void* workspace_memory = nullptr, uint64_t workspace_base = 0U,
                   uint64_t workspace_bytes = 0U, uint64_t session_id = 0U,
-                  uint32_t lane = 0U, bool affinity = false, std::size_t cpu_offset = 0U)
+                  uint32_t lane = 0U, bool affinity = false, std::size_t cpu_offset = 0U,
+                  uint32_t max_spans = UINT32_MAX)
       : memory_(static_cast<std::uint8_t*>(workspace_memory ? workspace_memory : memory)),
         base_(workspace_memory ? workspace_base : base),
         bytes_(workspace_memory ? workspace_bytes : bytes),
@@ -452,7 +453,7 @@ class CpuGatherWorker {
             (control_address ? control_address - base_ : peer::GatherControlOffset(bytes_)))),
         executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), memory_, base_,
                   affinity, cpu_offset), mode_(mode),
-        session_id_(session_id), lane_(lane) {
+        session_id_(session_id), lane_(lane), max_spans_(max_spans) {
     const char* profile = std::getenv("KVAF_GATHER_PROFILE");
     profile_enabled_ = profile && std::strcmp(profile, "1") == 0;
     if (profile_enabled_) {
@@ -559,7 +560,7 @@ class CpuGatherWorker {
       try {
         {
           BatchGetProfileScope timer(profile_enabled_ ? &prepare_ns : nullptr);
-          active_threads = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans,
+          active_threads = executor_.PrepareDirect(bytes_, address, sequence, max_spans_,
                                                    control_, &stop_);
         }
         valid = active_threads != 0U;
@@ -621,7 +622,7 @@ class CpuGatherWorker {
   peer::CpuGatherExecutor executor_;
   CpuGatherMode mode_;
   uint64_t session_id_;
-  uint32_t lane_;
+  uint32_t lane_, max_spans_;
   bool profile_enabled_{false};
   std::vector<ProfileSample> profile_samples_;
   std::size_t profile_count_{}, profile_dropped_{};
@@ -633,6 +634,7 @@ struct GatherWorkspace {
   void* memory = nullptr;
   std::size_t mapped_bytes = 0U;
   uint64_t bytes = 0U, base = 0U;
+  uint32_t window_capacity = 0U, token_bytes = 0U, workers = 0U;
   std::unique_ptr<CpuDdrRegistration> registration;
 };
 
@@ -831,6 +833,41 @@ class CpuService {
     return Result::kOk;
   }
 
+  Result PrepareGatherWindow(const peer::PrepareGatherWindowRequest& request,
+                             peer::PrepareGatherWindowResponse* response) {
+    if (!response) return Result::kInvalidRequest;
+    const auto found = regions_.find(request.session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    const auto alignment = CpuDdrBackingAlignment(memory_page_mode_);
+    if (!alignment) return Result::kInvalidRequest;
+    const auto capacity = GatherWindowCapacity(request.token_bytes, request.workers, request.budget, alignment);
+    if (!capacity) return Result::kInvalidRequest;
+    const auto bytes = GatherRemoteWorkspaceBytes(request.token_bytes, request.workers, capacity);
+    auto& region = *found->second;
+    if (region.gather_workspace && !region.gather_workspace->window_capacity &&
+        (region.gather || !region.gather_lanes.empty()))
+      return Result::kResourceError;
+    if (region.gather_workspace &&
+        (region.gather_workspace->bytes != bytes ||
+         (region.gather_workspace->window_capacity &&
+          (region.gather_workspace->window_capacity != capacity ||
+           region.gather_workspace->token_bytes != request.token_bytes ||
+           region.gather_workspace->workers != request.workers))))
+      return Result::kInvalidRequest;
+    const auto result = PrepareGatherWorkspace(request.session_id, bytes, &response->workspace);
+    if (result != Result::kOk) return result;
+    auto& workspace = *region.gather_workspace;
+    workspace.window_capacity = capacity;
+    workspace.token_bytes = request.token_bytes;
+    workspace.workers = request.workers;
+    response->window_capacity = capacity;
+    response->backing_bytes = workspace.mapped_bytes ? workspace.mapped_bytes : workspace.bytes;
+    if (request.budget && response->backing_bytes > request.budget) return Result::kResourceError;
+    Log("[KVAF_CPU] GATHER_WINDOW capacity=%u budget=%" PRIu64 " bytes=%" PRIu64
+        " backing_bytes=%" PRIu64 "\n", capacity, request.budget, bytes, response->backing_bytes);
+    return Result::kOk;
+  }
+
   Result CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response) {
     if (response == nullptr ||
         (request.local_qp_key_bytes != kJettyKeyBytes &&
@@ -970,7 +1007,8 @@ class CpuService {
             region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
             gather_mode_, control_address + lane * sizeof(peer::GatherControl),
             workspace ? workspace->memory : nullptr, workspace_base, workspace_bytes,
-            session_id, lane, aiv && gather_affinity_, cpu_offset));
+            session_id, lane, aiv && gather_affinity_, cpu_offset,
+            aiv ? peer::kMaxGatherSpans : UINT32_MAX));
         cpu_offset += budget;
       }
     } catch (const std::exception& error) {
@@ -991,7 +1029,7 @@ class CpuService {
   Result OpenCpuPushGet(const Request& request, Response* response,
                         std::unique_ptr<Worker> Region::*slot) {
     constexpr bool aiv = std::is_same_v<Transport, cpu_push::aiv::Transport>;
-    const auto& setup = [&]() -> const peer::OpenCpuPushGetRequest& {
+    const auto& setup = [&]() -> const auto& {
       if constexpr (aiv) return request.base;
       else return request;
     }();
@@ -1284,6 +1322,19 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
+    case Command::kPrepareGatherWindow: {
+      peer::PrepareGatherWindowRequest request{};
+      request.header = header;
+      peer::PrepareGatherWindowResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(Result::kInvalidRequest);
+      if (IsValidHeader(header, command, sizeof(request)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header)))
+        response.result = static_cast<int32_t>(service->PrepareGatherWindow(request, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
     case Command::kGetCacheCandidateCount:
     case Command::kGetCandidateCount: {
       if (!IsValidHeader(header, command, sizeof(CandidateCountRequest))) {
@@ -1539,6 +1590,7 @@ Status UrmaCpuBackend::Call(const std::vector<std::uint8_t>& input,
     case Command::kEnableGatherLanes:
     case Command::kEnableAivGatherLanes:
     case Command::kPrepareGatherWorkspace:
+    case Command::kPrepareGatherWindow:
     case Command::kOpenCpuPushGet:
     case Command::kOpenAivCpuGatherPushGet:
     case Command::kStopGatherLanes:

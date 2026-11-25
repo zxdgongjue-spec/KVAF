@@ -87,7 +87,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       !jettys || jettys > kMaxJettyCount ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      !MakeLayout(setup.token_bytes, setup.workers, &layout_, jettys) ||
+      !MakeLayout(setup.token_bytes, setup.workers, &layout_, kDefaultGetWindow, jettys) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");

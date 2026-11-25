@@ -185,7 +185,7 @@ struct AccessOperatorConfig {
   // Zero selects the link defaults: local Get 2 x 2, remote Get 4 x 1, Put 2 x 2.
   std::uint32_t npu_core_count{0};
   std::uint32_t jettys_per_core{0};
-  // Per-launch total READ budget; 0 selects the original whole-batch path.
+  // Per-launch total READ budget; 0 selects automatic SQ/CQ capacity windows.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Zero inherits an explicit jettys_per_core (capped at 2) or the Put default.
   std::uint32_t batch_put_jettys_per_core{0};

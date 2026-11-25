@@ -47,9 +47,9 @@ void Doorbell(uint32_t value, uint32_t* address);
 inline thread_local struct { uint32_t x; } threadIdx;
 enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2, PIPE_ALL };
 using event_t = uint32_t;
-inline thread_local bool model_events[4][4][3]{};
-inline thread_local uint64_t model_event_fences[4][4][3]{};
-inline thread_local uint64_t model_mte3_fences[4][3]{};
+inline thread_local bool model_events[4][4][8]{};
+inline thread_local uint64_t model_event_fences[4][4][8]{};
+inline thread_local uint64_t model_mte3_fences[4][8]{};
 namespace aiv_model {
 // Defer public DMA copies until their producer event is waited on. DMA-to-DMA
 // waits are queued on the consumer, so Scalar can issue a stage ring ahead.
@@ -225,6 +225,18 @@ template <int pipe> inline void PipeBarrier() {
   aiv_model::mte3.Finish();
   aiv_model::FinishRawCopies(aiv_model::raw_submitted);
 }
+enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S };
+template <HardEvent Event>
+inline constexpr int event_source = Event == HardEvent::MTE2_MTE3 ? PIPE_MTE2 : PIPE_MTE3;
+template <HardEvent Event>
+inline constexpr int event_target = Event == HardEvent::MTE2_MTE3 ? PIPE_MTE3 :
+    Event == HardEvent::MTE3_MTE2 ? PIPE_MTE2 : PIPE_S;
+template <HardEvent Event> void SetFlag(event_t event) {
+  set_flag(event_source<Event>, event_target<Event>, event);
+}
+template <HardEvent Event> void WaitFlag(event_t event) {
+  wait_flag(event_source<Event>, event_target<Event>, event);
+}
 inline uint32_t GetBlockIdx() { return aiv_model::core; }
 inline uint64_t GetSystemCycle() { return ++aiv_model::cycle; }
 enum class CacheLine { SINGLE_CACHE_LINE };
@@ -244,12 +256,16 @@ template <typename T> struct GlobalTensor {
   GlobalTensor operator[](uint64_t offset) const { return GlobalTensor{data + offset}; }
 };
 template <typename T> struct LocalTensor {
-  struct { uint8_t logicPos; uintptr_t bufferAddr; uint32_t dataLen; } address_{};
+  struct { uint8_t logicPos; uint32_t bufferAddr, dataLen; } address_{};
   LocalTensor() = default;
   LocalTensor(TPosition pos, uint32_t offset, uint32_t elements) {
     if (offset % 32 || uint64_t(offset) + uint64_t(elements) * sizeof(T) > sizeof(aiv_model::ub))
       std::abort();
-    address_ = {static_cast<uint8_t>(pos), get_imm(offset), elements * uint32_t(sizeof(T))};
+    address_ = {static_cast<uint8_t>(pos), offset, elements * uint32_t(sizeof(T))};
+  }
+  uint8_t* Data() const {
+    if (uint64_t(address_.bufferAddr) + address_.dataLen > sizeof(aiv_model::ub)) std::abort();
+    return aiv_model::ub + address_.bufferAddr;
   }
   LocalTensor operator[](uint32_t offset) const {
     const uint64_t byte_offset = uint64_t(offset) * sizeof(T);
@@ -261,7 +277,7 @@ template <typename T> struct LocalTensor {
   }
   T GetValue(uint32_t offset) const {
     const auto tensor = (*this)[offset];
-    const auto* address = reinterpret_cast<const T*>(tensor.address_.bufferAddr);
+    const auto* address = tensor.Data();
     if (tensor.address_.dataLen < sizeof(T) || aiv_model::mte2.Writes(address, sizeof(T)))
       std::abort();
     T value;
@@ -270,7 +286,7 @@ template <typename T> struct LocalTensor {
   }
   void SetValue(uint32_t offset, T value) const {
     const auto tensor = (*this)[offset];
-    auto* address = reinterpret_cast<T*>(tensor.address_.bufferAddr);
+    auto* address = tensor.Data();
     if (tensor.address_.dataLen < sizeof(T) || aiv_model::mte2.Writes(address, sizeof(T)) ||
         aiv_model::mte3.Reads(address, sizeof(T))) std::abort();
     std::memcpy(address, &value, sizeof(T));
@@ -290,13 +306,13 @@ template <typename T> struct DataCopyPadExtParams {
 template <typename T>
 void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t count) {
   const uint64_t bytes = uint64_t(count) * sizeof(T);
+  auto* ub = dst.Data();
   aiv_model::CheckMte2Source(src.data, bytes);
   if (!bytes || bytes % 32 || dst.address_.bufferAddr % 32 ||
       reinterpret_cast<uintptr_t>(src.data) % sizeof(T) || bytes > dst.address_.dataLen ||
-      aiv_model::mte3.Reads(
-          reinterpret_cast<void*>(dst.address_.bufferAddr), bytes, aiv_model::mte2.peer_fence))
+      aiv_model::mte3.Reads(ub, bytes, aiv_model::mte2.peer_fence))
     std::abort();
-  aiv_model::mte2.Push({reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
+  aiv_model::mte2.Push({ub,
       reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)});
   ++aiv_model::mte2_copies;
 }
@@ -305,17 +321,17 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
                  const DataCopyExtParams& p, const DataCopyPadExtParams<T>& pad) {
   const uint32_t padded = (p.blockLen + 31) & ~31U;
   const uint64_t ub_bytes = uint64_t(p.blockCount) * padded;
+  auto* ub = dst.Data();
   if (!p.blockCount || p.blockCount > 4095 || !p.blockLen || p.srcStride || p.dstStride ||
       p.rsv || pad.isPad || pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
       ub_bytes > dst.address_.dataLen ||
-      aiv_model::mte3.Reads(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes,
-          aiv_model::mte2.peer_fence))
+      aiv_model::mte3.Reads(ub, ub_bytes, aiv_model::mte2.peer_fence))
     std::abort();
   for (uint32_t block = 0; block < p.blockCount; ++block) {
     const auto* source = reinterpret_cast<const uint8_t*>(src.data) + uint64_t(block) * p.blockLen;
     aiv_model::CheckMte2Source(source, p.blockLen);
     aiv_model::mte2.Push({
-        reinterpret_cast<uint8_t*>(dst.address_.bufferAddr) + uint64_t(block) * padded,
+        ub + uint64_t(block) * padded,
         source, p.blockLen, padded});
   }
   ++aiv_model::mte2_copies;
@@ -323,14 +339,13 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
                  const DataCopyExtParams& p) {
+  const auto* ub = src.Data();
   if (p.blockCount != 1 || !p.blockLen || p.srcStride || p.dstStride || p.rsv ||
       src.address_.bufferAddr % 32 || p.blockLen > src.address_.dataLen ||
-      aiv_model::mte2.Writes(reinterpret_cast<void*>(src.address_.bufferAddr), p.blockLen,
-          aiv_model::mte3.peer_fence) ||
+      aiv_model::mte2.Writes(ub, p.blockLen, aiv_model::mte3.peer_fence) ||
       aiv_model::mte3.Writes(dst.data, p.blockLen))
     std::abort();
-  aiv_model::mte3.Push({reinterpret_cast<uint8_t*>(dst.data),
-      reinterpret_cast<const uint8_t*>(src.address_.bufferAddr), p.blockLen, 0});
+  aiv_model::mte3.Push({reinterpret_cast<uint8_t*>(dst.data), ub, p.blockLen, 0});
   ++aiv_model::mte3_copies;
   const auto address = reinterpret_cast<uintptr_t>(dst.data);
   if (address >= aiv_model::descriptor_begin && address < aiv_model::descriptor_end) {

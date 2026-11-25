@@ -45,7 +45,7 @@ KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
 args.output = reinterpret_cast<uint64_t>(output_hbm);
 args.channel_entity = entity;
 args.jettys_per_core = jettys_per_core;
-args.batch_get_max_inflight_total = 2048; // 0 selects the baseline
+args.batch_get_max_inflight_total = 2048; // 0 uses SQ/CQ capacity
 // args.queue_state points to a zero-initialized
 // KvafBatchGetQueueState[aiv_cores * jettys_per_core] array.
 // launch and synchronize the stream
@@ -98,7 +98,11 @@ all AIV cores. Small batches retain the whole-slice path. Larger batches split
 that budget across cores and keep at most two groups pending per core. Every
 group signals its last READ on each participating Jetty; all those CQEs must
 succeed before reusing the group's credit. Jetty rotation continues across
-groups. Zero disables the limit. See [design, configuration and validation](../../../../../docs/batch_get_inflight_control.md).
+groups. Zero selects automatic SQ/CQ capacity windows: slices that fit are posted
+whole, larger slices use two bounded groups and drain before reusing queue slots.
+Ordinary AIV Direct Get has no configured total request limit; caller buffers,
+the int32 active count and the device ABI still bound each invocation.
+See [design, configuration and validation](../../../../../docs/batch_get_inflight_control.md).
 
 Capacity checks use the currently pending groups. Failed submissions poison
 the affected queues until transport rebuild, preventing stale completions from

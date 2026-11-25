@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "cpu_push_get_abi.h"
+#include "get_window.h"
 
 namespace kvaf::cpu_push {
 inline constexpr std::uint64_t Align64(std::uint64_t n) { return (n + 63) & ~std::uint64_t{63}; }
@@ -12,16 +13,29 @@ struct Layout {
   std::uint64_t descriptor{}, staging{}, bytes{};
 };
 inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out,
+                       std::uint32_t capacity = kDefaultGetWindow,
                        std::uint32_t jettys = kJettyCount) {
   if (!out || !token_bytes || !workers || workers > kMaxWorkers ||
       !jettys || jettys > kMaxJettyCount ||
-      std::uint64_t{token_bytes} * kMaxRequests > UINT32_MAX) return false;
+      !capacity || capacity > INT32_MAX || capacity % kGetWindowGranularity ||
+      std::uint64_t{token_bytes} * capacity > UINT32_MAX) return false;
   Layout l;
   l.descriptor = l.ready + workers * ReadyStride(jettys);
-  l.staging = Align64(l.descriptor + kMaxRequests * sizeof(std::uint64_t));
-  l.bytes = Align64(l.staging + std::uint64_t{token_bytes} * kMaxRequests);
+  l.staging = Align64(l.descriptor + std::uint64_t{capacity} * sizeof(std::uint64_t));
+  l.bytes = Align64(l.staging + std::uint64_t{token_bytes} * capacity);
   *out = l;
   return true;
+}
+inline std::uint32_t ScatterWindowCapacity(std::uint32_t token_bytes, std::uint32_t workers,
+                                         std::uint64_t budget) {
+  if (!budget) {
+    Layout layout;
+    return MakeLayout(token_bytes, workers, &layout) ? kDefaultGetWindow : 0U;
+  }
+  return LargestGetWindow([&](std::uint32_t capacity) {
+    Layout layout;
+    return MakeLayout(token_bytes, workers, &layout, capacity) && layout.bytes <= budget;
+  });
 }
 template <class Emit>
 void ForEachPipelineChunk(std::uint32_t count, std::uint32_t bytes,

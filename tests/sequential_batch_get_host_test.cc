@@ -124,7 +124,7 @@ extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, v
   assert(allocation != allocation_policies.end() && allocation->policy == ACL_MEM_MALLOC_HUGE_FIRST);
   kvaf::cpu_push::Layout layout;
   assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout,
-                                   kvaf::ScatterPayloadJettys(*a)));
+                                   kvaf::kDefaultGetWindow, kvaf::ScatterPayloadJettys(*a)));
   assert(a->descriptor_offset == layout.descriptor && a->staging_offset == layout.staging);
   assert(a->workspace_bytes == layout.bytes + sizeof(KvafScatterMailboxContext) +
          uint64_t(a->request.block_count + 1) * 64);

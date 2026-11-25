@@ -44,6 +44,8 @@ void CheckLinuxPageModes() {
     CpuMemoryPageMode mode{};
     Check(kvaf::ParseCpuMemoryPageMode(test.name, mode), "valid HugeTLB size rejected");
     Check(kvaf::CpuMemoryPageModeName(mode) == test.name, "incorrect HugeTLB mode name");
+    Check(kvaf::CpuDdrBackingAlignment(mode) == (std::size_t{1} << test.shift),
+          "workspace budgets must use the allocator's HugeTLB alignment");
     const auto expected = test.page_count * (std::size_t{1} << test.shift);
     Check(kvaf::AllocateCpuDdr(mode, kRequestBytes, memory, mapped_bytes).ok(), "HugeTLB allocation failed");
     Check(memory == page_calls.memory && mapped_bytes == expected && page_calls.allocated_bytes == expected,
@@ -87,10 +89,13 @@ void CheckLinuxPageModes() {
   Check(kvaf::ReleaseCpuDdr(memory, mapped_bytes).ok(), "failed prefault cleanup failed");
 #endif
   for (auto mode : {CpuMemoryPageMode::kDefault, CpuMemoryPageMode::kTransparentHugePage}) {
+    Check(kvaf::CpuDdrBackingAlignment(mode) == 1U, "heap/THP budgets use logical bytes");
     Check(kvaf::AllocateCpuDdr(mode, 4096, memory, mapped_bytes).ok() && memory && !mapped_bytes,
           "ordinary or transparent huge-page allocation failed");
     Check(kvaf::ReleaseCpuDdr(memory, mapped_bytes).ok() && !memory, "heap allocation release failed");
   }
+  Check(kvaf::CpuDdrBackingAlignment(static_cast<CpuMemoryPageMode>(2)) == 0U,
+        "invalid page modes must not produce an alignment");
 }
 
 }  // namespace

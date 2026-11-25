@@ -346,15 +346,19 @@ miss_count 为 NPU int32[1]；offsets 使用字节，只有 `[0, miss_count)` �
 表生命周期；直接传 addresses/valid Tensor 时，调用方承担该地址表的有效性。
 
 `cores=0` 使用下表对应算法的默认核数/worker 数。URMA AIV 的 `jettys=0` 表示按方向取默认值，Get 本机每核 2 个、远端 A+K 每核 1 个，Put 每核 2 个。
-`max_inflight_total=None` 使用默认 2048，显式 0 关闭限流。AIV/UBmem 的
+`max_inflight_total=None` 使用默认 2048，显式 0 按各 SQ/CQ 的容量自动分组并等待回收。AIV/UBmem 的
 `kernel_path=""` 使用构建时记录的默认绝对路径：Get 为
 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为
 `<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。`./build.sh npu` 默认构建到
 `build-npu`，自定义 `--build-dir` 自动生效；应用可从其他目录启动。
 非空 `kernel_path` 覆盖默认路径；移动构建产物后需重新构建或显式指定新路径。
 AICPU 不设置 `kernel_path`，首次准备时从 CANN 安装目录定位包。
-配置的 request_capacity 范围为 1..65536，是 provider 请求上限；Gather/Scatter 内部
-工作区仍按固定 ABI 最大容量准备。`cpu_threads=0` 使用服务默认值。Jetty 参数用于
+配置的 request_capacity 默认 65536。所有 Get 不以它限制调用总量，
+仅作为预热提示；每次调用仍校验输入张量、ABI 范围及图/输出绑定容量。
+Put 的 request_capacity 范围仍为 1..65536。Gather/Scatter 在一次 kernel launch 内循环窗口，
+分别由 `gather_ddr_bytes` / `scatter_hbm_bytes` 预算选择最大的 4096 倍数窗口，默认 0 保留
+65536 条的现有布局。见 [AICPU 有界窗口](aicpu_get_windows.md)。
+`cpu_threads=0` 使用服务默认值。Jetty 参数用于
 URMA AIV，in-flight 用于 URMA AIV Get，CPU 线程预算用于 AICPU Gather；其他后端拒绝
 无效调优字段。标准构建的同一方向 `.o` 含 URMA/UBMEM 入口，也可按配置覆盖 kernel_path。
 
@@ -930,7 +934,7 @@ CPU 服务进程。库名和 `build-npu/bin` 产物位置保留；AICPU 构建�
 |---|---|
 | AIV Get / Put | `KvafExecuteBatchGetAivKernelV3` / `KvafExecuteBatchPutAivKernelV2` |
 | AICPU Control | 新 Host 要求 `KvafAicpuUmdkControlSessionsV5`，支持 QueueProfile |
-| AICPU Gather / Scatter | `KvafAicpuGatherReadExecutionV3` / `KvafAicpuCpuPushScatterExecutionV3` |
+| AICPU Gather / Scatter | `KvafAicpuGatherReadExecutionV5` / `KvafAicpuCpuPushScatterExecutionV4` |
 | Control 兼容入口 | 旧 Control/V3/V4 保留原 Gather 队列布局；新 Host 不静默降级 |
 | CPU 服务 | 请求级能力协商拒绝不兼容服务；`--gather-affinity` 已移除，使用当前线程调度参数 |
 

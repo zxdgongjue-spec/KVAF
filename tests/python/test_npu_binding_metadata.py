@@ -37,6 +37,27 @@ class Tensor:
 
 
 class NpuBindingMetadata(unittest.TestCase):
+    def test_aicpu_workspace_resource_configuration(self):
+        default = binding.ExecutionResources()
+        self.assertEqual(default.gather_ddr_bytes, 0)  # Resolve the legacy layout after token/workers are known.
+        self.assertEqual(default.scatter_hbm_bytes, 0)
+        self.assertIsNone(default.gather_read_wave_wrs)
+        resource = binding.ExecutionResources(gather_ddr_bytes=64 << 20, scatter_hbm_bytes=128 << 20,
+                                              request_capacity=1000000)
+        self.assertEqual(resource.gather_ddr_bytes, 64 << 20)
+        self.assertEqual(resource.scatter_hbm_bytes, 128 << 20)
+        self.assertEqual(resource.request_capacity, 1000000)
+        for name in ("gather_ddr_bytes", "scatter_hbm_bytes"):
+            self.assertEqual(getattr(binding.ExecutionResources(**{name: (1 << 64) - 1}), name), (1 << 64) - 1)
+            for value in (-1, 1 << 64):
+                with self.assertRaises((TypeError, OverflowError)):
+                    binding.ExecutionResources(**{name: value})
+        for limit in (1, 64, 96, 256, 4096):
+            self.assertEqual(binding.ExecutionResources(gather_read_wave_wrs=limit).gather_read_wave_wrs, limit)
+        for invalid in (-1, 1 << 32):
+            with self.assertRaises((TypeError, OverflowError)):
+                binding.ExecutionResources(gather_read_wave_wrs=invalid)
+
     def test_retained_registration_owns_original_storage_after_tensor_rebind(self):
         class Storage:
             pass
