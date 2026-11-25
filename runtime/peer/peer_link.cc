@@ -301,7 +301,7 @@ bool CreateChannelAt(const PeerLink& endpoint, const PeerRegion& region,
                      uint64_t local_tp_handle, uint32_t local_psn,
                      std::array<uint8_t, kQpKeyBytes>* peer_qp_key, uint32_t* peer_qp_key_bytes,
                      uint64_t* peer_tp_handle, uint32_t* peer_psn, bool share_tp,
-                     std::string* error) {
+                     std::string* error, uint32_t route_selector = 0) {
   if (local_qp_key == nullptr || local_eid == nullptr || peer_qp_key == nullptr ||
       peer_qp_key_bytes == nullptr || peer_tp_handle == nullptr || peer_psn == nullptr ||
       local_qp_key_bytes == 0U || local_qp_key_bytes > kQpKeyBytes ||
@@ -318,7 +318,7 @@ bool CreateChannelAt(const PeerLink& endpoint, const PeerRegion& region,
   request.local_qp_key_bytes = local_qp_key_bytes;
   request.peer_token_value = peer_token_value;
   request.local_psn = local_psn;
-  request.reserved = share_tp ? kChannelSharedTp : 0U;
+  request.reserved = (route_selector << 1U) | (share_tp ? kChannelSharedTp : 0U);
   std::memcpy(request.local_eid, local_eid, sizeof(request.local_eid));
   std::memcpy(request.local_qp_key, local_qp_key, local_qp_key_bytes);
   CreateChannelResponse response{};
@@ -701,7 +701,7 @@ Status PeerLink::SelectCpuFes(const PeerCandidateTable& table, const std::string
     if (!status.ok()) return status;
   }
   // Slots preserve the caller's order even when the service enumerates in a different order.
-  result.direct_get.resize(devices.size());
+  result.read_fes.resize(devices.size());
   std::size_t found = 0;
   for (uint32_t index = 0; index < table.count; ++index) {
     PeerCandidateInfo info;
@@ -714,7 +714,7 @@ Status PeerLink::SelectCpuFes(const PeerCandidateTable& table, const std::string
       if (devices.size() > 1 && info.eid_index != 0) continue;
       const auto it = std::find(devices.begin(), devices.end(), info.device_name);
       if (it == devices.end()) continue;
-      auto& slot = result.direct_get[it - devices.begin()];
+      auto& slot = result.read_fes[it - devices.begin()];
       if (slot.device_name.empty()) {
         slot = std::move(info);
         ++found;
@@ -722,32 +722,32 @@ Status PeerLink::SelectCpuFes(const PeerCandidateTable& table, const std::string
       if (found == devices.size()) break;
     } else if (automatic_multi) {
       // Candidates are ordered by device and index by the CPU service.
-      if (info.eid_index == 0 && (result.direct_get.empty() ||
-                                  result.direct_get.back().device_id != info.device_id))
-        result.direct_get.push_back(info);
-      if (result.direct_get.size() == result.requested_count) break;
+      if (info.eid_index == 0 && (result.read_fes.empty() ||
+                                  result.read_fes.back().device_id != info.device_id))
+        result.read_fes.push_back(info);
+      if (result.read_fes.size() == result.requested_count) break;
     } else if (!match_pair || info.eid == *pair_cpu_eid) {
       result.primary = info;
       break;
     }
   }
   for (std::size_t i = 0; i < devices.size(); ++i)
-    if (result.direct_get[i].device_name.empty())
+    if (result.read_fes[i].device_name.empty())
       return Status::NotFound("CPU service did not advertise requested UB device " + devices[i] +
                               (devices.size() > 1 ? " with eid_index=0" : ""));
-  if (!automatic_multi && devices.empty()) result.direct_get.push_back(result.primary);
-  if (result.explicit_devices) result.primary = result.direct_get.front();
+  if (!automatic_multi && devices.empty()) result.read_fes.push_back(result.primary);
+  if (result.explicit_devices) result.primary = result.read_fes.front();
   *selected = std::move(result);
   return Status::OK();
 }
 
-Status CpuFeSelection::ForDirectGet(uint64_t workers, std::vector<PeerCandidateInfo>* active) const {
-  if (!active) return Status::InvalidArgument("missing Direct Get FE selection output");
-  if (direct_get.empty()) return Status::NotFound("no advertised CPU UB device with eid_index=0");
-  if (!workers || (explicit_devices && direct_get.size() > workers))
-    return Status::InvalidArgument("Direct Get has " + std::to_string(workers) +
-        " Jetty workers for " + std::to_string(direct_get.size()) + " peer UB devices");
-  active->assign(direct_get.begin(), direct_get.begin() + std::min<uint64_t>(workers, direct_get.size()));
+Status CpuFeSelection::ForWorkers(uint64_t workers, std::vector<PeerCandidateInfo>* active) const {
+  if (!active) return Status::InvalidArgument("missing Get FE selection output");
+  if (read_fes.empty()) return Status::NotFound("no advertised CPU UB device with eid_index=0");
+  if (!workers || (explicit_devices && read_fes.size() > workers))
+    return Status::InvalidArgument("Get has " + std::to_string(workers) +
+        " workers for " + std::to_string(read_fes.size()) + " peer UB devices");
+  active->assign(read_fes.begin(), read_fes.begin() + std::min<uint64_t>(workers, read_fes.size()));
   return Status::OK();
 }
 
@@ -901,6 +901,31 @@ Status PeerLink::PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes,
   return Status::OK();
 }
 
+Status PeerLink::PrepareGatherRoute(uint64_t workspace_base, uint32_t candidate, PeerRegion* route) {
+  auto status = LookupRegion(workspace_base, route);
+  if (!status.ok()) return status;
+  if (candidate >= 0x7fffffffU) return Status::InvalidArgument("Gather route candidate out of range");
+  PrepareGatherRouteRequest q{};
+  q.header = MakeHeader(Command::kPrepareGatherRoute, sizeof(q));
+  q.session_id = route->session_id;
+  q.candidate = candidate;
+  AllocateRegionResponse r{};
+  std::string error;
+  if (!Exchange(*this, q, &r, &error) ||
+      !IsValidResponseHeader(r.header, Command::kPrepareGatherRoute, sizeof(r)) ||
+      !ResultOk(static_cast<Result>(r.result), &error))
+    return ToStatus("CPU Gather route registration failed", std::move(error));
+  if (r.session_id != route->session_id || r.peer_length != route->length || !r.peer_base ||
+      !r.token_id || r.token_value != route->token_value || !r.segment_key_bytes || r.segment_key_bytes > kSegKeyBytes)
+    return Status::Internal("CPU returned an invalid Gather route registration");
+  route->base = r.peer_base;
+  route->token_id = r.token_id;
+  route->segment_key_bytes = r.segment_key_bytes;
+  std::copy_n(r.segment_key, r.segment_key_bytes, route->segment_key.begin());
+  std::copy_n(r.peer_eid, route->eid.size(), route->eid.begin());
+  return Status::OK();
+}
+
 Status PeerLink::PrepareGatherWindow(uint64_t region_base, uint64_t budget, uint32_t token_bytes,
                                     uint32_t workers, PeerRegion* workspace, uint32_t* capacity) {
   if (!workspace || !capacity || !token_bytes || !workers || workers > kGatherMaxWorkers)
@@ -957,12 +982,23 @@ Status PeerLink::CreateChannel(
     uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
     std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
     uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn, bool share_tp) {
+  return CreateChannel(region_base, local_qp_key, local_qp_key_bytes, local_eid, peer_token_value,
+                       local_tp_handle, local_psn, peer_qp_key, peer_qp_key_bytes, peer_tp_handle,
+                       peer_psn, share_tp, 0);
+}
+
+Status PeerLink::CreateChannel(
+    uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
+    uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
+    uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
+    std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
+    uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn, bool share_tp, uint32_t route_selector) {
   const auto found = regions_.find(region_base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
   return CreateChannelAt(*this, found->second, local_qp_key, local_qp_key_bytes, local_eid,
                          peer_token_value, local_tp_handle, local_psn, peer_qp_key,
-                         peer_qp_key_bytes, peer_tp_handle, peer_psn, share_tp, &error)
+                         peer_qp_key_bytes, peer_tp_handle, peer_psn, share_tp, &error, route_selector)
              ? Status::OK()
              : ToStatus("peer channel creation failed", std::move(error));
 }
@@ -985,6 +1021,12 @@ Status PeerLink::EnableDirectGather(uint64_t region_base) const {
 
 Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_address,
                                   uint32_t lanes) const {
+  uint32_t capabilities = 0U;
+  return EnableGatherLanesWithCapabilities(region_base, control_address, lanes, capabilities);
+}
+
+Status PeerLink::EnableGatherLanesWithCapabilities(uint64_t region_base, uint64_t control_address,
+                                                  uint32_t lanes, uint32_t& capabilities) const {
   const auto found = regions_.find(region_base);
   if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
   EnableGatherLanesRequest request{};
@@ -998,6 +1040,7 @@ Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_addres
       !IsValidResponseHeader(response.header, Command::kEnableGatherLanes, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), &error))
     return ToStatus("peer independent gather enable failed", std::move(error));
+  capabilities = response.reserved;
   return Status::OK();
 }
 

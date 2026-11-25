@@ -12,9 +12,11 @@ SUMMARY_FIELDS = (
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
     "payload_bytes_per_call", "aiv_cores", "aicpu_workers", "jettys_per_core", "max_inflight_total",
     "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs", "gather_read_wave_wrs_mode",
+        "jettys_per_worker",
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
+TIMELINE_FIELDS = ("execution", "sample", "worker", "start_us", "finish_us", "ready_wait_us", "last")
 
 
 def write_csv(path, fields, rows):
@@ -36,11 +38,14 @@ class BatchGetCsv:
         self.profile_path = directory / "profile.csv" if args.kernel_profile else None
         self.summary_rows = []
         self.profile_rows = []
+        self.timeline_rows = []
+        self.breakdown_rows = []
         self.config = {name: getattr(args, name) for name in (
             "backend", "transport", "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
             "aiv_cores", "aicpu_workers",
         )}
         self.config.update(
+            jettys_per_worker=args.jettys_per_worker if args.backend == "gather_read" else None,
             payload_bytes_per_call=args.miss_count * args.token_bytes,
             jettys_per_core=args.jettys_per_core if args.backend == "aiv" else None,
             max_inflight_total=args.max_inflight_total if args.backend == "aiv" else None,
@@ -64,3 +69,8 @@ class BatchGetCsv:
         write_csv(self.summary_path, SUMMARY_FIELDS, self.summary_rows)
         if self.profile_path is not None:
             write_csv(self.profile_path, PROFILE_FIELDS, self.profile_rows)
+        if self.timeline_rows:
+            write_csv(self.summary_path.with_name("worker_timeline.csv"), TIMELINE_FIELDS, self.timeline_rows)
+        if self.breakdown_rows:
+            write_csv(self.summary_path.with_name("kernel_breakdown.csv"), self.breakdown_rows[0].keys(),
+                      self.breakdown_rows)

@@ -54,7 +54,7 @@ for misses in 2048 4096 8192; do
       bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
         --backend "$backend" "${resources[@]}" \
         --execution both --get-timing async-drain \
-        --graph-api torch --graph-replays 5 \
+        --graph-replays 5 \
         --request-length 32768 --table-capacity 4096 --miss-count "$misses" \
         --token-bytes 656 --tokens-per-block 128 \
         --seed 20260903 --no-sort-input-indices \
@@ -115,7 +115,7 @@ BASH
 
 每个后端均应输出 `BATCH_GET_MULTI_GRAPH_PASS`、`BATCH_GET_GRAPH_RESOURCES_PASS`
 和 `BATCH_GET_GRAPH_PASS`。核数/worker 使用该后端默认值；需要对比性能时保持原配置一致。
-默认使用 torch 图接口；验证原生 ACL 图接口时追加 `--graph-api acl`。
+所有后端默认使用 ACL 图接口；验证 Torch 图接口时追加 `--graph-api torch`。
 
 ## Put 使用同步性能入口
 

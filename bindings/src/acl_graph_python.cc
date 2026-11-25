@@ -63,6 +63,7 @@ class AclGraph final {
   AclGraph& operator=(const AclGraph&) = delete;
 
   void CaptureBegin(const py::object& stream) {
+    Use use(in_use_);
     if (capturing_) {
       throw py::value_error("ACLGraph capture is already active");
     }
@@ -78,6 +79,7 @@ class AclGraph final {
   }
 
   void CaptureEnd() {
+    Use use(in_use_);
     if (!capturing_) {
       throw py::value_error("ACLGraph capture is not active");
     }
@@ -96,19 +98,36 @@ class AclGraph final {
   }
 
   void Replay(const py::object& stream) const {
-    if (capturing_ || graph_ == nullptr) {
-      throw py::value_error("ACLGraph has no completed capture to replay");
-    }
-    const aclrtStream replay_stream = acl_python::StreamFromPython(stream);
-    if (replay_stream != stream_) {
-      throw py::value_error(
-          "ACLGraph replay must use the same ACL stream as capture");
-    }
+    Use use(in_use_);
+    const aclrtStream replay_stream = ReplayStream(stream);
     ThrowIfAclError(aclmdlRIExecuteAsync(graph_, replay_stream),
                     "aclmdlRIExecuteAsync");
   }
 
+  float ReplayTimed(const py::object& stream) {
+    Use use(in_use_);
+    const aclrtStream replay_stream = ReplayStream(stream);
+    if (!start_event_)
+      ThrowIfAclError(aclrtCreateEventWithFlag(&start_event_, ACL_EVENT_TIME_LINE),
+                      "aclrtCreateEventWithFlag start");
+    if (!end_event_)
+      ThrowIfAclError(aclrtCreateEventWithFlag(&end_event_, ACL_EVENT_TIME_LINE),
+                      "aclrtCreateEventWithFlag end");
+    ThrowIfAclError(aclrtRecordEvent(start_event_, replay_stream), "aclrtRecordEvent start");
+    ThrowIfAclError(aclmdlRIExecuteAsync(graph_, replay_stream), "aclmdlRIExecuteAsync");
+    ThrowIfAclError(aclrtRecordEvent(end_event_, replay_stream), "aclrtRecordEvent end");
+    float milliseconds = 0;
+    {
+      py::gil_scoped_release release;
+      ThrowIfAclError(aclrtSynchronizeEvent(end_event_), "aclrtSynchronizeEvent");
+      ThrowIfAclError(aclrtEventElapsedTime(&milliseconds, start_event_, end_event_),
+                      "aclrtEventElapsedTime");
+    }
+    return milliseconds;
+  }
+
   void Synchronize(const py::object& stream) const {
+    Use use(in_use_);
     const aclrtStream target_stream = acl_python::StreamFromPython(stream);
     if (capturing_ || graph_ == nullptr || target_stream != stream_) {
       throw py::value_error(
@@ -122,6 +141,7 @@ class AclGraph final {
                              std::size_t destination_bytes,
                              const py::buffer& source,
                              const py::object& stream) const {
+    Use use(in_use_);
     if (capturing_ || graph_ == nullptr) {
       throw py::value_error(
           "ACLGraph async input copy requires a completed graph capture");
@@ -153,10 +173,12 @@ class AclGraph final {
   }
 
   void Reset() {
+    Use use(in_use_);
     if (capturing_) {
       throw py::value_error(
           "ACLGraph capture is active; call capture_end before reset");
     }
+    ThrowIfAclError(DestroyTimingEvents(), "aclrtDestroyEvent");
     if (graph_ != nullptr) {
       const aclError error = aclmdlRIDestroy(graph_);
       graph_ = nullptr;
@@ -169,7 +191,34 @@ class AclGraph final {
   bool Ready() const { return graph_ != nullptr; }
 
  private:
+  // Timed replay releases the GIL while waiting; prevent concurrent graph reuse.
+  struct Use {
+    explicit Use(bool& active) : active_(active) {
+      if (active_) throw py::value_error("ACLGraph is already in use");
+      active_ = true;
+    }
+    ~Use() { active_ = false; }
+    bool& active_;
+  };
+
+  aclrtStream ReplayStream(const py::object& stream) const {
+    if (capturing_ || graph_ == nullptr)
+      throw py::value_error("ACLGraph has no completed capture to replay");
+    const aclrtStream target = acl_python::StreamFromPython(stream);
+    if (target != stream_)
+      throw py::value_error("ACLGraph replay must use the same ACL stream as capture");
+    return target;
+  }
+
+  aclError DestroyTimingEvents() {
+    const auto start = start_event_ ? aclrtDestroyEvent(start_event_) : ACL_SUCCESS;
+    const auto end = end_event_ ? aclrtDestroyEvent(end_event_) : ACL_SUCCESS;
+    start_event_ = end_event_ = nullptr;
+    return start != ACL_SUCCESS ? start : end;
+  }
+
   void ResetNoThrow() {
+    (void)DestroyTimingEvents();
     if (capturing_) {
       aclmdlRI ignored_graph = nullptr;
       (void)aclmdlRICaptureEnd(stream_, &ignored_graph);
@@ -187,6 +236,8 @@ class AclGraph final {
 
   aclmdlRI graph_{nullptr};
   aclrtStream stream_{nullptr};
+  aclrtEvent start_event_{nullptr}, end_event_{nullptr};
+  mutable bool in_use_{false};
   bool capturing_{false};
 };
 
@@ -201,6 +252,8 @@ void BindAclGraph(py::module_& module) {
            "Finish capture and retain the resulting ACL graph.")
       .def("replay", &AclGraph::Replay, py::arg("stream"),
            "Submit the captured ACL graph to its capture stream.")
+      .def("replay_timed", &AclGraph::ReplayTimed, py::arg("stream"),
+           "Record/replay/record/wait in one native call; return Event elapsed milliseconds.")
       .def("synchronize", &AclGraph::Synchronize, py::arg("stream"),
            "Wait for graph work on its capture stream.")
       .def("copy_host_to_device_async", &AclGraph::CopyHostToDeviceAsync,

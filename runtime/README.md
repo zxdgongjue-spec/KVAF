@@ -157,30 +157,31 @@ Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 可同时省略，用于独立 Pull；
 普通缓存 Get 在 provider 首次准备时要求有效布局。显式布局必须同时为正数，
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
-为 URMA AIV Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+为 URMA AIV Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
 URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
 AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
 
-CPU Pull 每个 DDR region 绑定一个 CPU 端点。本机首次 `offload_region(source_physical_device_id=...)` 用指定源物理卡的 `pair_info.local_eid` 匹配候选，省略时采用 Runtime 所在卡。未命中或远端自动选择时取表中首项。单个 `peer_ub_device` 或服务端设备配置优先。逗号分隔的设备列表仅供远端 Direct BatchGet 使用。
+CPU Pull 每个 DDR region 绑定一个 CPU 端点。本机首次 `offload_region(source_physical_device_id=...)` 用指定源物理卡的 `pair_info.local_eid` 匹配候选，省略时采用 Runtime 所在卡。未命中或远端自动选择时取表中首项。单个 `peer_ub_device` 或服务端设备配置优先。逗号分隔的设备列表用于远端 AIV Direct 和 AICPU Gather BatchGet。
 
 ### 远端 A+K 的多 FE BatchGet
 
-远端 URMA AIV Direct Get 默认从 CPU service 公布的候选中，按顺序选择两个不同 UB device 的
-`eid_index=0`。在 NPU 进程设置 `KVAF_DEFAULT_PEER_FE_COUNT=1` 即可默认走单 FE，也可设置
-其他正整数。自动模式按可用设备数和总 Jetty 数收缩。服务端固定设备或 index 时尊重其选择。
+AIV Direct 和 AICPU Gather 共用 CPU FE 选择。远端默认选两个不同 UB device 的 `eid_index=0`；
+`KVAF_DEFAULT_PEER_FE_COUNT` 可设置自动选择数量，实际数量受可用设备和通信 worker 数约束。
+服务端固定设备或 index 时尊重其选择。
 
-通过 Python 的 `peer_ub_device="devC,devA,devB"` 或测试入口的
-`--peer-ub-device devC,devA,devB` 可显式指定有序 FE 列表，覆盖环境变量。各设备必须有
-index 0，总 Jetty 数必须覆盖整个列表。单设备参数仍取该设备的首个候选，兼容非零 index。
-显式列表首项供 Put 和 AICPU 使用。本机链路和显式多个 NPU EID 的配置分别使用一个 CPU FE，
-同时指定多个 CPU FE 会返回错误。
+通过 `peer_ub_device="devC,devA,devB"` 或 `--peer-ub-device devC,devA,devB` 指定有序 FE 列表，
+覆盖自动数量。多设备列表要求各设备有 index 0；单设备取其首个候选。
+显式 FE 数不得超过 AIV 的总 Jetty worker 数或 Gather 的 worker 数。
+本机链路和多个 NPU EID 的配置使用一个 CPU FE，同时指定多个 CPU FE 会报错。
+Put 和 AICPU Scatter 使用列表首项。
 
-每个 FE 注册同一块 DDR。各 Jetty 按 `(core * jettys_per_core + slot) % active_fes` 选路，
-一次 Get 只提交一个 kernel。小 batch 可能只用到部分 Jetty。初始化后首次使用或 warmup
-时查看 `DIRECT_GET_FE_SELECTION` 和 `DIRECT_GET_FE` 核对数量、设备和 EID，再按
-`DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty。部署时同步更新 NPU host 库
+建链时固定分配后端的通信资源。AIV 按 Jetty 分配 FE；Gather 按 `worker_id % FE数` 分配，
+同一 worker 的控制链和数据链绑定同一个 FE，运行中不换 FE。
+各 FE 注册同一块 DDR；Gather 额外 FE 共用一份 staging 和一组 CPU gather 线程。
+首次使用或 warmup 时通过 `GET_FE_SELECTION` 核对数量，通过 `GATHER_ROUTE` 核对 Gather 的 worker 绑定。
+AIV 还可通过 `DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty。部署时同步更新 NPU host 库
 和 Direct Get kernel。多 FE 复用当前 CPU service 的 execution session 协议。
 
 ### 固定 UB device 后测量

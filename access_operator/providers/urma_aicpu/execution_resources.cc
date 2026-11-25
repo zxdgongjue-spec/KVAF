@@ -14,11 +14,12 @@ struct AicpuExecutionResources::State {
       : default_invocation(owner), valid_mode(config.batch_get_mode == "gather_read" ||
                    config.batch_get_mode == "cpu_push_scatter"),
         get_session({config.kernel_json, config.workers,
-                 config.peer_link, config.local_eid}),
+                 config.peer_link, config.local_eid, aicpu_urma::UmdkQueueProfile::Gather,
+                 config.data_jettys, config.gather_candidates, config.chunks}),
         put_session({config.kernel_json, config.workers, config.peer_link, config.local_eid,
                      aicpu_urma::UmdkQueueProfile::Put}),
         get(get_session, config.token_bytes, false, config.gather_ddr_bytes,
-            config.gather_read_wave_wrs),
+            config.gather_read_wave_wrs, config.gather_address_groups_per_post),
         put(put_session), enable_get(config.enable_get) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
     if (config.batch_get_mode == "cpu_push_scatter")

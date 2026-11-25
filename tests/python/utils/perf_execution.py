@@ -18,7 +18,7 @@ class BenchmarkExecution:
                  algorithm="direct", put_capacity=128, get_capacity=65536,
                  get_cores=0, get_jettys=0, put_cores=0, put_jettys=0, get_kernel="", put_kernel="",
                  max_inflight_total=2048, gather_ddr_bytes=0, scatter_hbm_bytes=0,
-                 gather_read_wave_wrs=None):
+                 gather_read_wave_wrs=None, gather_data_jettys=1):
         if not 1 <= put_capacity <= 65536:
             raise ValueError("Put request capacity must be in [1, 65536]")
         get_max = (1 << 31) - 1
@@ -59,6 +59,8 @@ class BenchmarkExecution:
             get_budget["scatter_hbm_bytes"] = scatter_hbm_bytes
         if gather_read_wave_wrs is not None:
             get_budget["gather_read_wave_wrs"] = gather_read_wave_wrs
+        if executor == "aicpu" and algorithm == "gather":
+            get_budget["jettys"] = gather_data_jettys
         if executor == "aiv":
             put_budget["kernel_path"] = put_kernel
             get_budget["kernel_path"] = get_kernel

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <utility>
 
@@ -20,14 +21,15 @@ using kvaf::detail::PointerValue;
 }  // namespace
 struct BatchGetTransport::Impl {
   Impl(UmdkSession& shared, std::uint32_t token, bool direct, std::uint64_t budget,
-       std::uint32_t wave_wrs)
+       std::uint32_t wave_wrs, std::optional<std::uint32_t> address_groups)
       : session(shared), token_bytes(token), direct_addresses(direct), ddr_bytes(budget),
-        read_wave_wrs(wave_wrs) {}
+        read_wave_wrs(wave_wrs), address_groups_per_post(address_groups) {}
   UmdkSession& session;
   std::uint32_t token_bytes;
   bool direct_addresses;
   std::uint64_t ddr_bytes;
   std::uint32_t read_wave_wrs;
+  std::optional<std::uint32_t> address_groups_per_post;
   std::uint32_t window_capacity{};
   RemoteRegionDesc region;
   RemoteRegionDesc remote_workspace;
@@ -42,7 +44,9 @@ struct BatchGetTransport::Impl {
   Invocation default_invocation{this};
   Invocation* invocation{&default_invocation};
   bool profiling{false};
+  std::size_t ProfileBytes() const { return session.config().workers * sizeof(BatchGetWorkerProfile); }
   bool initialized{false}, cpu_enabled{false};
+  std::optional<std::uint32_t> peer_gather_capabilities;
   Status Drain(const char* stage = "drain", bool check_status = true);
 };
 static Status ValidateGather(const GatherLaunchView& view, AicpuGetInvocation& call) {
@@ -89,13 +93,17 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
   call.pending = nullptr;
   if (!check_status || !call.submitted) return Status::OK();
   if (!call.failure.ok()) return call.failure;
-  return ValidateGather(view, call);
+  auto checked = ValidateGather(view, call);
+  call.completion_checked = checked.ok();
+  return checked;
 }
 
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
                                      bool direct_addresses, std::uint64_t ddr_bytes,
-                                     std::uint32_t read_wave_wrs)
-    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses, ddr_bytes, read_wave_wrs)) {}
+                                     std::uint32_t read_wave_wrs,
+                                     std::optional<std::uint32_t> address_groups_per_post)
+    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses, ddr_bytes, read_wave_wrs,
+                                 address_groups_per_post)) {}
 BatchGetTransport::~BatchGetTransport() = default;
 std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
   return std::make_unique<Impl::Invocation>(impl_.get());
@@ -120,8 +128,8 @@ GatherLaunchView BatchGetTransport::View() const {
        status ? status->host : impl_->status_host, impl_->execution.status_bytes},
       {profile ? profile->device : impl_->profile_device,
        profile ? profile->host : impl_->profile_host,
-       impl_->session.config().workers * sizeof(BatchGetWorkerProfile)},
-      impl_->control, impl_->profiling};
+       impl_->ProfileBytes()},
+      impl_->control, impl_->profiling, impl_->cpu_enabled ? kGatherChunkedPullEnabled : 0U};
 }
 Status BatchGetTransport::Impl::Drain(const char* stage, bool check_status) {
   GatherLaunchView view;
@@ -138,6 +146,7 @@ Status BatchGetTransport::Check(aclrtStream stream) {
     return Status::InvalidState("no AICPU BatchGet has been submitted");
   if (stream != call.last_stream)
     return InvalidArgument("check_batch_get_status requires the BatchGet execution stream");
+  if (!call.captured_stream && call.completion_checked) return call.failure;
   call.pending = stream;
   return impl_->Drain("check");
 }
@@ -167,7 +176,7 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
     ready = call.graph_completion->Allocate(impl_->execution.status_bytes);
     if (ready.ok() && impl_->profiling) {
       call.graph_profile = std::make_unique<GetGraphReport>();
-      ready = call.graph_profile->Allocate(impl_->session.config().workers * sizeof(BatchGetWorkerProfile));
+      ready = call.graph_profile->Allocate(impl_->ProfileBytes());
     }
     if (!ready.ok()) return ready;
   }
@@ -176,7 +185,7 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
   call.graph_start_sequence = control.claimed / impl_->session.config().workers;
   call.graph_stream = static_cast<aclrtStream>(options.stream);
   call.graph_active = true;
-  call.submitted = call.profile_submitted = call.profile_complete = false;
+  call.submitted = call.profile_submitted = call.profile_complete = call.completion_checked = false;
   call.last_stream = nullptr;
   return Status::OK();
 }
@@ -225,6 +234,7 @@ Status BatchGetTransport::FinishGraph(void* stream, bool discard) {
   call.prepared_profile = nullptr;
   call.prepared_capturing = false;
   call.submitted = false;
+  call.completion_checked = false;
   call.profile_complete = call.profile_submitted && replay_completed;
   call.profile_submitted = call.profile_complete;
   return Status::OK();
@@ -235,7 +245,7 @@ Status BatchGetTransport::SetKernelProfiling(bool enabled) {
   if (!ready.ok()) return ready;
   if (enabled) {
     ready = kvaf::detail::AllocateAicpuProfiles(&impl_->profile_device, &impl_->profile_host,
-        impl_->session.config().workers * sizeof(BatchGetWorkerProfile));
+        impl_->ProfileBytes());
     if (!ready.ok()) return ready;
   }
   impl_->profiling = enabled;
@@ -252,8 +262,18 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
     if (!ready.ok()) return ready;
   }
   const auto view = View();
-  return kvaf::detail::CopyAicpuProfiles(view.profile.device, view.profile.host,
-      impl_->session.config().workers, profiles);
+  auto copied = kvaf::detail::CopyAicpuProfiles(view.profile.device, view.profile.host,
+                                                view.options.workers, profiles);
+  if (!copied.ok()) return copied;
+  if (aclrtMemcpy(view.completion.host, view.completion.bytes, view.completion.device,
+                  view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    return Internal("cannot read Gather ready progress counters");
+  const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
+  for (unsigned w = 0; w < view.options.workers; ++w) {
+    (*profiles)[w].gather_ready_progress = GatherReadyProgress(reports[w], (*profiles)[w].aicpu_profile);
+    (*profiles)[w].gather_pull_progress = GatherPullProgress(reports[w], (*profiles)[w].aicpu_profile);
+  }
+  return Status::OK();
 }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
@@ -263,6 +283,15 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (!impl_->session.config().peer_link || !impl_->token_bytes || !workers ||
       workers > kGatherMaxWorkers)
     return InvalidArgument("Gather requires a peer link, token size and valid worker count");
+  GatherExecutionControl initial{};
+  initial.chunks = impl_->session.config().chunks;
+  if (!ResolveGatherAddressGroupsPerPost(impl_->address_groups_per_post,
+          std::getenv("KVAF_GATHER_ADDRESS_GROUPS_PER_POST"), &initial.address_groups_per_post))
+    return InvalidArgument("gather_address_groups_per_post / KVAF_GATHER_ADDRESS_GROUPS_PER_POST "
+                           "must be a positive integer");
+  if (!initial.chunks.valid()) return InvalidArgument("Gather sized chunks require divisor >= 2 and 1..32 tails");
+  if (initial.chunks.enabled())
+    return InvalidArgument("GatherRead pipeline requires fixed windows");
   peer::PeerRegion workspace;
   auto found = impl_->session.config().peer_link->PrepareGatherWindow(
       region.base, impl_->ddr_bytes, impl_->token_bytes, workers, &workspace, &impl_->window_capacity);
@@ -273,12 +302,13 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
     return InvalidArgument("Gather received an invalid remote workspace");
   if (impl_->read_wave_wrs == kGatherDefaultReadWaveWrs)
     std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=auto "
-        "miss_count_threshold=8192 small_wave_wrs=512 large_wave_wrs=64 window_capacity=%u\n",
-        workers, impl_->window_capacity);
+        "miss_count_threshold=8192 small_wave_wrs=512 large_wave_wrs=64 window_capacity=%u "
+        "address_groups_per_post=%u\n",
+        workers, impl_->window_capacity, initial.address_groups_per_post);
   else
     std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=%u "
-        "read_wave_mode=fixed window_capacity=%u\n", workers, impl_->read_wave_wrs,
-        impl_->window_capacity);
+        "read_wave_mode=fixed window_capacity=%u address_groups_per_post=%u\n",
+        workers, impl_->read_wave_wrs, impl_->window_capacity, initial.address_groups_per_post);
   impl_->region = region;
   impl_->remote_workspace = {workspace.base, workspace.length, 0, DeviceKind::kCpu};
   auto& state = impl_->execution;
@@ -289,7 +319,7 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
           ACL_SUCCESS ||
       aclrtMallocHost(&impl_->status_host, state.status_bytes) != ACL_SUCCESS ||
       aclrtMalloc(&impl_->control, sizeof(GatherExecutionControl), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-      aclrtMemset(impl_->control, sizeof(GatherExecutionControl), 0, sizeof(GatherExecutionControl)) != ACL_SUCCESS ||
+      aclrtMemcpy(impl_->control, sizeof(initial), &initial, sizeof(initial), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
       aclrtMemset(state.status, state.status_bytes, 0, state.status_bytes) != ACL_SUCCESS) {
     (void)Shutdown();
     return Internal("failed to allocate UMDK execution buffers");
@@ -317,6 +347,7 @@ Status BatchGetTransport::Shutdown() {
   *impl_->invocation = Impl::Invocation{impl_.get()};
   impl_->profiling = false;
   impl_->initialized = impl_->cpu_enabled = false;
+  impl_->peer_gather_capabilities.reset();
   return Status::OK();
 }
 Status BatchGetTransport::Warmup() {
@@ -326,14 +357,21 @@ Status BatchGetTransport::Warmup() {
       impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace,
                             GatherWorkspaceBytes(workers, impl_->window_capacity));
   if (!s.ok()) return s;
-  if (!impl_->cpu_enabled) {
+  if (!impl_->peer_gather_capabilities) {
     const auto staging = impl_->remote_workspace.base;
     const auto controls = staging + GatherStagingBytes(impl_->token_bytes, workers, impl_->window_capacity) +
                           workers * GatherLaneDescriptorBytes(workers, impl_->window_capacity);
-    s = impl_->session.config().peer_link->EnableGatherLanes(impl_->region.base, controls, workers);
-    if (s.ok()) impl_->cpu_enabled = true;
+    std::uint32_t capabilities = 0U;
+    s = impl_->session.config().peer_link->EnableGatherLanesWithCapabilities(
+        impl_->region.base, controls, workers, capabilities);
+    if (!s.ok()) return s;
+    impl_->peer_gather_capabilities = capabilities;
   }
-  return s;
+  const auto capabilities = *impl_->peer_gather_capabilities;
+  if (!(capabilities & peer::kGatherLanesChunkedPullGroups))
+    return Status::InvalidState("GatherRead pipeline requires a CPU service with chunked address support");
+  impl_->cpu_enabled = true;
+  return Status::OK();
 }
 Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional<bool> expected_capture) {
   impl_->views.Prepare();
@@ -360,15 +398,14 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
     auto drained = impl_->Drain("previous_request");
     if (!drained.ok()) return drained;
   }
-  UmdkBatchGetArgs checked{};
-  auto valid = BuildBatchGetKernelArgs(exec, &checked.request);
+  auto valid = BuildBatchGetKernelArgs(exec, &call.prepared_input);
   if (!valid.ok()) return valid;
-  if (checked.request.token_bytes != impl_->token_bytes)
+  if (call.prepared_input.token_bytes != impl_->token_bytes)
     return InvalidArgument("UMDK BatchGet differs from configured token size");
   if (impl_->direct_addresses && (exec.request->access_table.opaque != 0U ||
-      checked.request.table_capacity < checked.request.request_capacity))
+      call.prepared_input.table_capacity < call.prepared_input.request_capacity))
     return InvalidArgument("invalid direct address request");
-  const auto profile_bytes = impl_->session.config().workers * sizeof(BatchGetWorkerProfile);
+  const auto profile_bytes = impl_->ProfileBytes();
   if (exec.execution.profile || impl_->profiling) {
     if (capturing && (!impl_->profile_device || !impl_->profile_host))
       return Status::InvalidState("enable kernel profiling before capture");
@@ -415,21 +452,12 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   call.prepared = nullptr;
   const auto begin = call.prepare_started;
   UmdkBatchGetArgs launch{};
-  auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
-  if (!valid.ok()) return valid;
+  launch.request = call.prepared_input;
   launch.request.canonical_base = view.common.region().canonical_base;
   launch.request.logical_bytes = view.common.region().logical_bytes;
-  if (launch.request.token_bytes != view.options.token_bytes)
-    return InvalidArgument("UMDK BatchGet differs from configured token size");
-  if (view.direct_addresses) {
-    if (exec.request->access_table.opaque != 0U)
-      return InvalidArgument("gather_read_direct requires the addresses Tensor overload");
-    if (launch.request.table_capacity < launch.request.request_capacity)
-      return InvalidArgument("direct addresses must cover the request capacity");
-    launch.request.indices = launch.request.offsets = 0U;
-  }
+  if (view.direct_addresses) launch.request.indices = launch.request.offsets = 0U;
   const auto workers = view.options.workers;
-  const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
+  const auto profile_bytes = view.profile.bytes;
   const auto staging = view.remote_workspace.base;
   const auto descriptors = staging + GatherStagingBytes(view.options.token_bytes, workers, view.options.window_capacity);
   const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers, view.options.window_capacity);
@@ -447,10 +475,12 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.remote_ack = args.remote_notify + 8U;
   args.remote_command = args.remote_notify + 16U;
   args.worker_count = view.options.workers;
+  args.pull_groups = view.pull_groups;
   args.window_capacity = view.options.window_capacity;
   args.read_wave_wrs = view.options.read_wave_wrs;
   args.profile = (profile || view.profiling) ? PointerValue(view.profile.device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  call.completion_checked = false;
   call.pending = stream;
   call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;
@@ -490,8 +520,13 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   if (!completed.ok()) return completed;
   if (profile) {
     profile->worker_count = workers;
-    std::copy_n(static_cast<const BatchGetWorkerProfile*>(view.profile.host), workers,
-                profile->workers.begin());
+    const auto* samples = static_cast<const BatchGetWorkerProfile*>(view.profile.host);
+    std::copy_n(samples, workers, profile->workers.begin());
+    const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
+    for (unsigned w = 0; w < workers; ++w) {
+      profile->gather_ready_progress[w] = GatherReadyProgress(reports[w], profile->workers[w]);
+      profile->gather_pull_progress[w] = GatherPullProgress(reports[w], profile->workers[w]);
+    }
     const auto end = BatchGetProfileNowNs();
     profile->finish_ns = end - stamp;
     profile->total_ns = end - begin;

@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 
 namespace kvaf {
 
@@ -14,7 +15,18 @@ struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t read_setup_ns{}, wr_build_ns{}, ready_wait_ns{}, post_ns{}, cq_wait_ns{};
   std::uint64_t bytes{}, spans{}, read_wqes{}, post_calls{}, ready_queries{};
   std::uint64_t scatter_ns{}, output_cache_ns{};
-  std::uint64_t scatter_copies{};
+  std::uint64_t scatter_copies{}, first_post_wrs{};
+  std::uint32_t first_chunk_bytes{}, tail_chunk_bytes{};
+};
+
+static_assert(sizeof(BatchGetWorkerProfile) == 192, "device worker profile stride changed");
+
+struct GatherReadyObservation {
+  std::uint32_t first_ready_bytes{}, ready_repeat_queries{};
+};
+
+struct GatherPullObservation {
+  std::uint32_t ready_advances{}, planned_groups{};
 };
 
 // Caller-owned result, valid after a successful synchronous AICPU BatchGet.
@@ -23,6 +35,9 @@ struct BatchGetProfile {
   std::uint64_t wait_ns{}, finish_ns{}, total_ns{};
   std::uint32_t worker_count{};
   std::array<BatchGetWorkerProfile, 8> workers{};
+  // Host-side diagnostics assembled from the matching Gather completion slots.
+  std::array<std::optional<GatherReadyObservation>, 8> gather_ready_progress{};
+  std::array<std::optional<GatherPullObservation>, 8> gather_pull_progress{};
 };
 
 // Host-only trace for one Python BatchGet call. RuntimeCore borrows this only

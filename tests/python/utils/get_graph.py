@@ -33,6 +33,9 @@ class GetGraph:
     def synchronize(self):
         self.stream.synchronize()
 
+    def replay_timed(self):
+        return self.graph.replay_timed(self.stream)
+
 
 @contextmanager
 def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit):
