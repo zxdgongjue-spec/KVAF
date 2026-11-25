@@ -120,8 +120,10 @@ Response CacheRegionService::CreateRecord(const Request& q) {
                                         PutExecutionConfig{q.transport, q.executor})
                     : ValidateExecution(parent->request.mode,
                                         GetExecutionConfig{q.transport, q.executor, q.algorithm});
+          const bool aicpu_scatter = !q.put && IsAicpuScatterGet({q.transport, q.executor, q.algorithm});
           if (status.ok() &&
-              (!q.workers || q.workers > (q.executor == Executor::Aicpu ? 8U : 48U) || !q.jettys ||
+              (!q.workers || (!aicpu_scatter && q.workers > (q.executor == Executor::Aicpu ? 8U : 48U)) ||
+               !q.jettys ||
                q.jettys > 64 || !q.request_capacity ||
                (q.request_capacity > 65536 &&
                 (q.put || !IsWindowedGet({q.transport, q.executor, q.algorithm}))) ||

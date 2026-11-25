@@ -217,7 +217,8 @@ struct NpuRuntime::Impl {
     }
     if (budget.gather_read_wave_wrs && !ValidGatherReadWaveWrs(*budget.gather_read_wave_wrs))
       throw std::invalid_argument("gather_read_wave_wrs must be in [1, 4096]");
-    if (!budget.cores || budget.cores > (e == Executor::Aicpu ? 8U : 48U) ||
+    const bool aicpu_scatter = get && IsAicpuScatterGet({t, e, algorithm});
+    if (!budget.cores || (!aicpu_scatter && budget.cores > (e == Executor::Aicpu ? 8U : 48U)) ||
         !budget.request_capacity ||
         (budget.request_capacity > 65536U &&
          !(get && IsWindowedGet({t, e, algorithm}))) || budget.cpu_threads > 64U ||

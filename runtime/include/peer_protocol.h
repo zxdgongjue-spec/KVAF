@@ -52,7 +52,8 @@ inline constexpr bool IsAivCpuPushCommand(Command command) {
 }
 
 inline constexpr bool IsSupportedProtocolVersion(Command command, uint16_t version) {
-  return (version == kProtocolVersion && command != Command::kOpenAivCpuGatherPushGet) ||
+  return (version == kProtocolVersion && command != Command::kOpenCpuPushGet &&
+          command != Command::kOpenAivCpuGatherPushGet) ||
          (version == kAivCpuPushProtocolVersion && IsAivCpuPushCommand(command)) ||
          (version == kAivCpuPushJettyProtocolVersion &&
           (command == Command::kOpenCpuPushGet || command == Command::kOpenAivCpuGatherPushGet));
@@ -222,7 +223,7 @@ struct CpuPushChannelKey {
   uint32_t bytes;
   uint8_t key[kQpKeyBytes];
 };
-struct OpenCpuPushGetRequest {
+struct OpenCpuPushMailboxRequest {
   MessageHeader header;
   uint64_t session_id, source_bytes, hbm_base, hbm_bytes, npu_tp;
   uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers, window_capacity;
@@ -237,15 +238,12 @@ struct OpenAivCpuPushGetRequest {
   uint8_t eid[kEidBytes], segment[kSegKeyBytes];
   CpuPushChannelKey channels[4];
 };
-struct OpenCpuPushGetResponse {
+struct OpenCpuPushMailboxResponse {
   MessageHeader header;
   int32_t result;
   uint64_t cpu_tp;
   uint32_t cpu_psn;
   CpuPushChannelKey channels[4];
-};
-struct OpenCpuPushMailboxResponse {
-  OpenCpuPushGetResponse base;
   AllocateRegionResponse mailbox;
 };
 struct OpenAivCpuPushGetResponse {
@@ -300,8 +298,8 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
-static_assert(sizeof(OpenCpuPushGetRequest) == 428U, "CPU push setup ABI changed");
-static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(OpenCpuPushMailboxRequest) == 428U, "CPU push mailbox setup ABI changed");
+static_assert(offsetof(OpenCpuPushMailboxResponse, mailbox) == 300U);
 static_assert(sizeof(OpenCpuPushMailboxResponse) == 432U, "CPU push mailbox response ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetRequest) == 424U, "AIV CPU push setup ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetResponse) == 392U, "AIV CPU push setup response ABI changed");

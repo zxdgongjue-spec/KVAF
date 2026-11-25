@@ -13,7 +13,7 @@ namespace kvaf::cpu_push {
 constexpr std::uint64_t kMagic = 0x4b56414650555333ULL;
 inline constexpr char kReferenceCommit[] = "a12bb16c120e885eb18ed61581739e1c212c32e8";
 // Legacy default workspace capacity, not a total BatchGet limit.
-constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
+constexpr std::uint32_t kMaxRequests = 65536, kMaxAivWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kMaxJettyCount = 32;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
 // Runtime additionally carries the opt-in profile bit with the request sequence.

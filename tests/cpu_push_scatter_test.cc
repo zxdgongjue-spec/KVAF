@@ -1,4 +1,4 @@
-#include "algorithms/get/scatter/urma_aicpu/kernel/cpu_push_scatter.h"
+#include "aicpu_scatter_mailbox_model.h"
 #include "algorithms/get/scatter/urma_aicpu/kernel/cpu_push_pipeline.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
 
@@ -47,6 +47,8 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   std::vector<std::uint8_t> output(expected.size(), 0xA5);
   const auto count = static_cast<std::int32_t>(active);
   KernelArgs args{};
+  test::Mailbox mailbox;
+  mailbox.Bind(args, layout);
   args.request = {Pointer(addresses.data()), Pointer(indices.data()), Pointer(offsets.data()),
                   Pointer(&count), Pointer(rows.data()), static_cast<std::uint32_t>(addresses.size()),
                   static_cast<std::uint32_t>(indices.size()), bytes};
@@ -61,13 +63,13 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   args.timeout_ms = 5000;
   std::vector<std::thread> threads;
   for (std::uint32_t w = 0; w < workers; ++w)
-    threads.emplace_back([&] { CHECK(ExecuteCpuPushScatter(&args) == 0); });
+    threads.emplace_back([&] { CHECK(ExecuteCpuPushScatter(&args, test::Mailbox::Write) == 0); });
   for (auto& thread : threads) thread.join();
   CHECK(output == expected);
-  const auto notify = reinterpret_cast<Word*>(memory + layout.notify)->value;
+  const auto notify = reinterpret_cast<Word*>(mailbox.data() + layout.notify)->value;
   CHECK((notify & ~kProfileNotify) == (active ? 1U : 0U));
   CHECK(((notify & kProfileNotify) != 0) == (active != 0));
-  const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
+  const auto* sources = reinterpret_cast<const std::uint64_t*>(mailbox.data() + layout.descriptor);
   for (std::uint32_t i = 0; i < active; ++i)
     CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
   std::uint64_t copies = 0;
@@ -215,6 +217,8 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
   const std::uint64_t address = 4096;
   const std::int32_t index = 0, count = 1;
   KernelArgs args{};
+  test::Mailbox mailbox;
+  mailbox.Bind(args, layout);
   args.request = {Pointer(&address), Pointer(&index), Pointer(&index), Pointer(&count),
                   Pointer(&index), 1, 1, 656};
   args.workspace = Pointer(memory);
@@ -225,7 +229,7 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
   args.profile = Pointer(&profile);
   args.sequence = args.workers = 1;
   args.timeout_ms = expected == Result::kTimeout ? 1 : 1000;
-  CHECK(ExecuteCpuPushScatter(&args) != 0);
+  CHECK(ExecuteCpuPushScatter(&args, test::Mailbox::Write) != 0);
   CHECK(status.result == static_cast<std::uint64_t>(expected));
   CHECK(profile.scatter_copies == 0);
   CHECK(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xA5; }));

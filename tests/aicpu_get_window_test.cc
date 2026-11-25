@@ -30,8 +30,9 @@ int main() {
         CHECK(GatherWindowCapacity(token, workers, bytes - 1U) == rows - 4096);
         cpu_push::Layout layout;
         CHECK(cpu_push::MakeLayout(token, workers, &layout, rows));
-        CHECK(cpu_push::ScatterWindowCapacity(token, workers, layout.bytes) == rows);
-        CHECK(cpu_push::ScatterWindowCapacity(token, workers, layout.bytes - 1U) == rows - 4096);
+        const auto scatter_bytes = layout.bytes + layout.staging;
+        CHECK(cpu_push::ScatterWindowCapacity(token, workers, scatter_bytes) == rows);
+        CHECK(cpu_push::ScatterWindowCapacity(token, workers, scatter_bytes - 1U) == rows - 4096);
       }
       for (uint64_t alignment : {1ULL, 1ULL << 16, 1ULL << 21, 1ULL << 24,
                                  1ULL << 25, 1ULL << 29, 1ULL << 30, 1ULL << 34}) {

@@ -97,7 +97,7 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--aiv-cores", **count_options,
                        help="AIV cores per device (1..48; defaults: local URMA 2, remote URMA 4, ubmem 16)")
     group.add_argument("--aicpu-workers", **count_options,
-                       help="AICPU workers per device; gather_read/cpu_push_scatter only (1..8)")
+                       help="AICPU workers per device; Gather 1..8, Scatter up to device AICPU core count")
     # Preserve old commands while keeping distinct hardware concepts in help.
     group.add_argument("--workers", dest="compat_workers", **count_options, help=argparse.SUPPRESS)
     group.add_argument("--jettys-per-core", type=int, default=None,
@@ -192,7 +192,7 @@ def validate_workload(args):
     error = validate_workload_shape(args)
     if error:
         return error
-    maximum = 8 if uses_aicpu(args) else 48
+    maximum = {"gather_read": 8, "cpu_push_scatter": 0xFFFFFFFF}.get(args.backend, 48)
     if args.parallelism is not None and not 1 <= args.parallelism <= maximum:
         return f"{parallelism_field(args.backend).replace('_', '-')} must be in [1, {maximum}]"
     if uses_aicpu(args) and args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:

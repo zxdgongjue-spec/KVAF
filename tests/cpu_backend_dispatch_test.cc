@@ -62,8 +62,9 @@ int main() {
       runtime, Command::kGetCandidateInfo, Result::kResourceError);
   Exchange<CreateChannelRequest, CreateChannelResponse>(
       runtime, Command::kCreateChannel, Result::kResourceError);
-  Exchange<OpenCpuPushGetRequest, OpenCpuPushGetResponse>(
-      runtime, Command::kOpenCpuPushGet, Result::kResourceError);
+  Exchange<OpenCpuPushMailboxRequest, OpenCpuPushMailboxResponse>(
+      runtime, Command::kOpenCpuPushMailbox, Result::kResourceError);
+  CHECK(!IsSupportedProtocolVersion(Command::kOpenCpuPushGet, kProtocolVersion));
   Exchange<OpenAivCpuPushGetRequest, OpenAivCpuPushGetResponse>(
       runtime, Command::kOpenCpuPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
   Exchange<OpenAivCpuPushGetRequest, OpenAivCpuPushGetResponse>(

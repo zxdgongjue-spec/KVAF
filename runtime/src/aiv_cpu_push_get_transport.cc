@@ -1,4 +1,5 @@
 #include "aiv_cpu_push_get_transport.h"
+#include "cpu_service/push/cpu_push_mailbox.h"
 #include "urma_device_abi.h"
 #include "batch_get_profile.h"
 
@@ -84,7 +85,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   const auto& setup = request.base;
   const auto jettys = request.payload_jettys;
   if (context_ || !context || !source || !query || !import || !result || !psn ||
-      !jettys || jettys > kMaxJettyCount ||
+      !jettys || jettys > kMaxJettyCount || setup.workers > kMaxAivWorkers ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, kDefaultGetWindow, jettys) ||
@@ -222,13 +223,7 @@ void Transport::PrepareCompletions() {
 }
 
 Status Transport::ReadRequest(std::uint64_t* sequence) {
-  // Strongly ordered remote WRITE publishes notify only after the request and
-  // descriptor list. Acquire also prevents compiler/CPU reordering of local
-  // mailbox loads; no URMA READ or CQ round trip is needed while idle.
-  const auto notify = __atomic_load_n(
-      reinterpret_cast<const std::uint64_t*>(memory_ + layout_.notify), __ATOMIC_ACQUIRE);
-  *sequence = notify & ~kProfileNotify;
-  profile_.enabled = (notify & kProfileNotify) != 0;
+  *sequence = LoadMailboxSequence(memory_ + layout_.notify, profile_.enabled);
   return Status::OK();
 }
 Status Transport::ReadDescriptor(std::uint64_t sequence) {

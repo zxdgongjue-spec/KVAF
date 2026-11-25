@@ -15,19 +15,19 @@ struct Layout {
 inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out,
                        std::uint32_t capacity = kDefaultGetWindow,
                        std::uint32_t jettys = kJettyCount) {
-  if (!out || !token_bytes || !workers || workers > kMaxWorkers ||
+  if (!out || !token_bytes || !workers ||
       !jettys || jettys > kMaxJettyCount ||
       !capacity || capacity > INT32_MAX || capacity % kGetWindowGranularity ||
       std::uint64_t{token_bytes} * capacity > UINT32_MAX) return false;
   Layout l;
-  l.descriptor = l.ready + workers * ReadyStride(jettys);
+  l.descriptor = l.ready + std::uint64_t{workers} * ReadyStride(jettys);
   l.staging = Align64(l.descriptor + std::uint64_t{capacity} * sizeof(std::uint64_t));
   l.bytes = Align64(l.staging + std::uint64_t{token_bytes} * capacity);
   *out = l;
   return true;
 }
 inline std::uint32_t ScatterWindowCapacity(std::uint32_t token_bytes, std::uint32_t workers,
-                                         std::uint64_t budget, bool mailbox = false) {
+                                         std::uint64_t budget) {
   if (!budget) {
     Layout layout;
     return MakeLayout(token_bytes, workers, &layout) ? kDefaultGetWindow : 0U;
@@ -35,7 +35,7 @@ inline std::uint32_t ScatterWindowCapacity(std::uint32_t token_bytes, std::uint3
   return LargestGetWindow([&](std::uint32_t capacity) {
     Layout layout;
     return MakeLayout(token_bytes, workers, &layout, capacity) &&
-        layout.bytes + (mailbox ? layout.staging : 0U) <= budget;
+        layout.bytes + layout.staging <= budget;
   });
 }
 template <class Emit>

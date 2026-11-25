@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <urma_api.h>
@@ -268,22 +267,30 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
 Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   auto& s = *impl_;
   if (s.context || s.memory || s.initialized) return Status::InvalidState("CPU push already initialized");
-  const auto* mode = std::getenv("KVAF_AICPU_SCATTER_MAILBOX");
-  const bool mailbox_enabled = mode && std::strcmp(mode, "1") == 0;
-  if (mode && !mailbox_enabled && std::strcmp(mode, "0") != 0)
-    return Status::InvalidArgument("KVAF_AICPU_SCATTER_MAILBOX must be 0 or 1");
-  s.window_capacity = ScatterWindowCapacity(s.config.token_bytes, s.config.workers,
-                                             s.config.hbm_bytes, mailbox_enabled);
+  std::int32_t device = -1;
+  std::int64_t device_workers = 0;
+  const bool known_worker_limit = aclrtGetDevice(&device) == ACL_SUCCESS && device >= 0 &&
+      aclrtGetDeviceInfo(static_cast<std::uint32_t>(device), ACL_DEV_ATTR_AICPU_CORE_NUM, &device_workers) ==
+          ACL_SUCCESS && device_workers > 0;
+  // A Scatter launch waits for all its blocks at the per-window barriers.
+  const auto worker_limit = known_worker_limit ? device_workers : 8;
+  if (!s.config.workers || std::int64_t{s.config.workers} > worker_limit) {
+    return Status::InvalidArgument("AICPU Scatter workers=" + std::to_string(s.config.workers) +
+        " is outside the supported range 1.." + std::to_string(worker_limit) +
+        (known_worker_limit ? "" : " (device AICPU core count unavailable)"));
+  }
+  s.window_capacity = ScatterWindowCapacity(s.config.token_bytes, s.config.workers, s.config.hbm_bytes);
   if (!s.window_capacity)
     return Status::InvalidArgument("Scatter HBM budget cannot fit a window (minimum 4096 rows)");
   if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.window_capacity) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
       !aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str()))
     return Status::InvalidArgument("CPU push requires kernel JSON, PeerLink, local EID and valid shape");
-  std::fprintf(stderr, "[KVAF] SCATTER_WINDOW capacity=%u budget=%llu bytes=%llu request_control=%s\n",
+  std::fprintf(stderr, "[KVAF] SCATTER_WINDOW capacity=%u budget=%llu bytes=%llu request_control=mailbox_write"
+      " workers=%u worker_limit=%lld device_aicpu_cores_known=%u\n",
       s.window_capacity, static_cast<unsigned long long>(s.config.hbm_bytes),
-      static_cast<unsigned long long>(s.layout.bytes + (mailbox_enabled ? s.layout.staging : 0U)),
-      mailbox_enabled ? "mailbox_write" : "cpu_read");
+      static_cast<unsigned long long>(s.layout.bytes + s.layout.staging), s.config.workers,
+      static_cast<long long>(worker_limit), unsigned(known_worker_limit));
   s.source = source;
   peer::PeerRegion region;
   auto result = s.config.peer_link->LookupRegion(source.base, &region);
@@ -323,7 +330,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     return Error("unexpected HBM segment ABI");
   urma_seg_t segment{};
   std::memcpy(&segment, mr.out.key.value, sizeof(segment));
-  peer::OpenCpuPushGetRequest open{};
+  peer::OpenCpuPushMailboxRequest open{};
   open.source_bytes = source.length;
   open.hbm_base = segment.ubva.va;
   open.hbm_bytes = s.layout.bytes;
@@ -347,12 +354,11 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     open.channels[q].bytes = key.size;
     std::memcpy(open.channels[q].key, key.value, key.size);
   }
-  peer::OpenCpuPushGetResponse reply{};
+  peer::OpenCpuPushMailboxResponse reply{};
   peer::PeerRegion mailbox;
   // Even a failed/lost response may have created CPU resources. STOP is idempotent.
   s.peer_open = true;
-  result = mailbox_enabled ? s.config.peer_link->OpenCpuPushMailbox(source.base, open, &reply, &mailbox)
-                           : s.config.peer_link->OpenCpuPushGet(source.base, open, &reply);
+  result = s.config.peer_link->OpenCpuPushMailbox(source.base, open, &reply, &mailbox);
   if (!result.ok()) return result;
   s.mailbox_remote = mailbox.base;
   for (std::uint32_t q = 0; q < kJettyCount; ++q) {
@@ -361,19 +367,15 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
         token_value, open.npu_tp, reply.cpu_tp, open.npu_psn, reply.cpu_psn, "cpu_push_get",
         &info, s.channels[q]->peer_jetty_output())) return Error("import CPU Jetty");
   }
-  if (mailbox_enabled) {
-    // Keep the UMDK DMA source MR separate from the payload workspace's RA MR.
-    if (mailbox.length < s.layout.staging)
-      return Error("mailbox too small for the request window");
-    if (aclrtMalloc(&s.mailbox_source, s.layout.staging, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
-      return Error("allocate mailbox source");
-    // Reuse the control-only queue topology used for UMDK Put.
-    s.mailbox_session = std::make_unique<aicpu_urma::UmdkSession>(aicpu_urma::UmdkSessionConfig{
-        s.config.kernel_json, 1U, s.config.peer_link, s.config.local_eid, aicpu_urma::UmdkQueueProfile::Put});
-    result = s.mailbox_session->Load();
-    if (result.ok()) result = s.mailbox_session->Ensure(mailbox.base, s.mailbox_source, s.layout.staging);
-    if (!result.ok()) return result;
-  }
+  if (mailbox.length < s.layout.staging) return Error("mailbox too small for the request window");
+  // Keep the UMDK DMA source MR separate from the payload workspace's RA MR.
+  if (aclrtMalloc(&s.mailbox_source, s.layout.staging, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+    return Error("allocate mailbox source");
+  s.mailbox_session = std::make_unique<aicpu_urma::UmdkSession>(aicpu_urma::UmdkSessionConfig{
+      s.config.kernel_json, 1U, s.config.peer_link, s.config.local_eid, aicpu_urma::UmdkQueueProfile::Put});
+  result = s.mailbox_session->Load();
+  if (result.ok()) result = s.mailbox_session->Ensure(mailbox.base, s.mailbox_source, s.layout.staging);
+  if (!result.ok()) return result;
   result = s.config.peer_link->StartCpuPushGet(source.base);
   if (!result.ok()) return result;
   s.initialized = true;
@@ -424,6 +426,7 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec, std::optional<
     ready = detail::AllocateAicpuProfiles(&s.profile_device, &s.profile_host, bytes);
     if (!ready.ok()) return ready;
   }
+  if (exec.execution.profile) exec.execution.profile->workers.resize(s.config.workers);
   call.prepared_capturing = capturing;
   call.prepared = exec.request;
   call.prepared_stream = exec.execution.stream;
@@ -513,15 +516,14 @@ Status CpuPushTransport::Shutdown() {
     auto allowed = detail::BatchGetCapture(stream, true, false, &capturing);
     if (!allowed.ok()) return allowed;
   }
-  // A healthy enqueued request still needs the CPU producer. Drain it before
-  // STOP; after an execution failure, STOP must run even if draining failed.
+  // Keep the CPU producer available until pending Scatter work is fenced.
   const auto drained = s.health.failed ? Status::OK() : s.Drain();
   const auto remaining = s.invocation->pending ? s.invocation->pending : s.invocation->captured_stream;
-  const bool mailbox = s.mailbox_session != nullptr;
-  if (mailbox) {
-    // The device may still have a WRITE targeting the CPU mailbox registration.
-    if (remaining && aclrtSynchronizeStream(remaining) != ACL_SUCCESS)
-      return Error("stream still failed/pending; mailbox retained");
+  if (remaining && aclrtSynchronizeStream(remaining) != ACL_SUCCESS)
+    return Error("stream still failed/pending; mailbox retained");
+  s.invocation->pending = nullptr;
+  // Retire the mailbox initiator before STOP frees the remote registration.
+  if (s.mailbox_session) {
     auto closed = s.mailbox_session->Shutdown();
     if (!closed.ok()) return closed;
     s.mailbox_session.reset();
@@ -533,9 +535,6 @@ Status CpuPushTransport::Shutdown() {
     s.peer_open = false;
     s.mailbox_remote = 0;
   }
-  if (!mailbox && remaining && aclrtSynchronizeStream(remaining) != ACL_SUCCESS)
-    return Error("stream still failed/pending; HBM retained");
-  s.invocation->pending = nullptr;
   for (auto& channel : s.channels) if (channel) {
     auto closed = channel->Shutdown();
     if (!closed.ok()) return closed;

@@ -1,6 +1,6 @@
 // Run the production AICPU entry with concurrent workers and a CPU producer.
 // DMA is modeled as memcpy; real device cache behavior still requires A5 tests.
-#include "get/scatter/urma_aicpu/kernel/cpu_push_scatter.h"
+#include "aicpu_scatter_mailbox_model.h"
 #include "get/scatter/urma_aicpu/kernel/cpu_push_pipeline.h"
 #include <atomic>
 #include <cstdlib>
@@ -17,6 +17,7 @@ struct Fixture {
   uint32_t capacity, workers, window, token;
   Layout layout;
   std::vector<Word> memory;
+  test::Mailbox mailbox;
   Coordination coordination{};
   std::vector<WorkerStatus> reports;
   std::vector<BatchGetWorkerProfile> profiles;
@@ -34,6 +35,7 @@ struct Fixture {
         source(std::size_t(n) * bytes), output(source.size()), addresses(n), indices(n), offsets(n), rows(n) {
     CHECK(MakeLayout(token, workers, &layout, window));
     memory.resize(layout.bytes / sizeof(Word));
+    mailbox.Bind(args, layout);
     for (uint32_t i = 0; i < n; ++i) {
       indices[i] = i; rows[i] = n - 1 - i;
       addresses[i] = reinterpret_cast<uint64_t>(source.data() + std::size_t(i) * token);
@@ -56,19 +58,19 @@ struct Fixture {
   uint8_t* Bytes() { return reinterpret_cast<uint8_t*>(memory.data()); }
   void Produce() {
     uint64_t last = 0;
-    auto* notify = reinterpret_cast<Word*>(Bytes() + layout.notify);
+    auto* notify = reinterpret_cast<Word*>(mailbox.data() + layout.notify);
     auto* done = reinterpret_cast<Completion*>(Bytes() + layout.done);
     while (!stop.load()) {
       const auto sequence = __atomic_load_n(&notify->value, __ATOMIC_ACQUIRE) & ~kProfileNotify;
       if (!sequence || sequence == last) { std::this_thread::yield(); continue; }
       CHECK(sequence > last); last = sequence; ++seen;
-      const auto header = *reinterpret_cast<const Request*>(Bytes() + layout.request);
+      const auto header = *reinterpret_cast<const Request*>(mailbox.data() + layout.request);
       CHECK(header.magic == kMagic && header.sequence == sequence && header.count <= window);
       if (fail_at && seen == fail_at) {
         if (!timeout) __atomic_store_n(&done->token, Progress(sequence, uint32_t(Result::kTransportError)), __ATOMIC_RELEASE);
         continue;
       }
-      const auto* sources = reinterpret_cast<const uint64_t*>(Bytes() + layout.descriptor);
+      const auto* sources = reinterpret_cast<const uint64_t*>(mailbox.data() + layout.descriptor);
       ForEachPipelineChunk(header.count, token, workers, [&](uint32_t worker, uint32_t chunk, Range range) {
         for (uint32_t q = 0; q < kJettyCount; ++q) {
           const auto shard = JettyRange(range, q);
@@ -88,7 +90,8 @@ struct Fixture {
     count = n; ++launches;
     std::fill(output.begin(), output.end(), 0xa5);
     std::vector<std::thread> tasks;
-    for (uint32_t w = 0; w < workers; ++w) tasks.emplace_back([&] { (void)ExecuteCpuPushScatter(&args); });
+    for (uint32_t w = 0; w < workers; ++w)
+      tasks.emplace_back([&] { (void)ExecuteCpuPushScatter(&args, test::Mailbox::Write); });
     for (auto& t : tasks) t.join();
     if (!success) { CHECK(coordination.result.value != 0); return; }
     CHECK(coordination.result.value == 0);
@@ -114,6 +117,7 @@ int main() {
   }
   { Fixture f(1000000, 5, 4096); f.Run(1000000); }
   { Fixture f(8193, 5, 4096, 656); f.Run(8193); }
+  { Fixture f(8193, 12, 4096, 656); f.Run(8193); f.Run(1); f.Run(0); }
   { Fixture f(8193, 5, 4096, 4096); f.Run(8193); }
   { Fixture f(20000, 5, 4096); f.fail_at = 3; f.Run(20000, false);
     auto before = f.coordination.claimed.value; f.Run(1, false); CHECK(f.coordination.claimed.value == before); }

@@ -1002,35 +1002,20 @@ Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_addres
   return Status::OK();
 }
 
-Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
-                                OpenCpuPushGetResponse* response) const {
-  const auto found = regions_.find(base);
-  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
-  request.header = MakeHeader(Command::kOpenCpuPushGet, sizeof(request));
-  request.session_id = found->second.session_id;
-  std::string error;
-  if (!Exchange(*this, request, response, &error) ||
-      !IsValidResponseHeader(response->header, Command::kOpenCpuPushGet, sizeof(*response)) ||
-      !ResultOk(static_cast<Result>(response->result), &error))
-    return ToStatus("CPU push setup failed", std::move(error));
-  return Status::OK();
-}
-
-Status PeerLink::OpenCpuPushMailbox(uint64_t base, OpenCpuPushGetRequest request,
-                                  OpenCpuPushGetResponse* response, PeerRegion* mailbox) {
+Status PeerLink::OpenCpuPushMailbox(uint64_t base, OpenCpuPushMailboxRequest request,
+                                  OpenCpuPushMailboxResponse* response, PeerRegion* mailbox) {
   PeerRegion source;
   auto status = LookupRegion(base, &source);
   if (!status.ok()) return status;
   constexpr auto command = Command::kOpenCpuPushMailbox;
   request.header = MakeHeader(command, sizeof(request));
   request.session_id = source.session_id;
-  OpenCpuPushMailboxResponse reply{};
   std::string error;
-  if (!Exchange(*this, request, &reply, &error) ||
-      !IsValidResponseHeader(reply.base.header, command, sizeof(reply)) ||
-      !ResultOk(static_cast<Result>(reply.base.result), &error))
+  if (!Exchange(*this, request, response, &error) ||
+      !IsValidResponseHeader(response->header, command, sizeof(*response)) ||
+      !ResultOk(static_cast<Result>(response->result), &error))
     return ToStatus("CPU push mailbox setup failed", std::move(error));
-  const auto& mr = reply.mailbox;
+  const auto& mr = response->mailbox;
   const uint64_t mailbox_base = mr.peer_base;
   if (mr.session_id != source.session_id || !mailbox_base || mailbox_base % 64U ||
       !mr.peer_length || mailbox_base > UINT64_MAX - mr.peer_length ||
@@ -1050,7 +1035,6 @@ Status PeerLink::OpenCpuPushMailbox(uint64_t base, OpenCpuPushGetRequest request
   std::memcpy(binding.eid.data(), mr.peer_eid, binding.eid.size());
   std::memcpy(binding.segment_key.data(), mr.segment_key, binding.segment_key_bytes);
   regions_.emplace(mailbox_base, binding);
-  *response = reply.base;
   *mailbox = binding;
   return Status::OK();
 }

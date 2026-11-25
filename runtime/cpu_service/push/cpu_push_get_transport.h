@@ -16,12 +16,11 @@ namespace kvaf::cpu_push {
 class Transport {
  public:
   ~Transport();
-  Status Initialize(urma_context_t*, urma_target_seg_t* source, const peer::OpenCpuPushGetRequest&,
+  Status Initialize(urma_context_t*, urma_target_seg_t* source, const peer::OpenCpuPushMailboxRequest&,
                     urma::GetTpList, urma::ImportJettyEx, std::uint32_t psn,
-                    peer::OpenCpuPushGetResponse*, std::uint64_t canonical_base = 0,
-                    peer::AllocateRegionResponse* mailbox = nullptr);
-  Status ReadRequest(std::uint64_t* sequence);
-  Status ReadDescriptor(std::uint64_t sequence);
+                    peer::OpenCpuPushMailboxResponse*, std::uint64_t canonical_base);
+  std::uint64_t MailboxSequence();
+  Status ValidateRequest(std::uint64_t sequence);
   Status WriteBatch();
   Status Complete(std::uint64_t sequence, Result result);
   void PrintProfile() const;
@@ -31,16 +30,13 @@ class Transport {
  private:
   struct Profile {
     bool enabled{};
-    std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
+    std::uint64_t address_validate_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
     std::uint64_t first_post_ns{}, last_cqe_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
   } profile_;
   struct Queue {
     cpu_runtime_detail::UrmaChannel channel;
-    std::vector<urma::Sge> local, remote;
-    std::vector<urma_jfs_wr_t> wrs;
-    std::uint64_t sequence{}, pending{};
     bool poisoned{};
   };
   using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
@@ -70,12 +66,6 @@ class Transport {
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
-  Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
-  Status Post(Queue&);
-  Status Wait(Queue&);
-  void Add(Queue&, urma_opcode_t, std::uint64_t remote, std::uint32_t bytes,
-           std::uint32_t first_sge, std::uint32_t sges);
-  void ResetRequests(Queue&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
   PreparedWrite done_;
@@ -87,7 +77,6 @@ class Transport {
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
-  bool mailbox_{};
   std::uint64_t hbm_base_{}, source_base_{}, source_bytes_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{}, window_capacity_{}, max_chunks_{};
   Layout layout_;

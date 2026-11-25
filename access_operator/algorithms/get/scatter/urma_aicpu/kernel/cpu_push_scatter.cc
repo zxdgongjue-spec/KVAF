@@ -46,7 +46,7 @@ struct Execution {
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   std::uint8_t* RequestMemory() const {
-    return args.mailbox_source ? reinterpret_cast<std::uint8_t*>(args.mailbox_source) : Memory();
+    return reinterpret_cast<std::uint8_t*>(args.mailbox_source);
   }
   void FlushMemory(const void* address, std::uint64_t bytes) {
     BatchGetProfileScope timer(profile ? &profile->input_cache_ns : nullptr);
@@ -145,10 +145,7 @@ struct Execution {
       auto* header = reinterpret_cast<Request*>(RequestMemory() + layout.request);
       *header = {kMagic, args.sequence, count, r.token_bytes, args.workers, 0, {}};
     }
-    if (args.mailbox_source)
-      FlushMemory(sources + range->begin, std::uint64_t{range->end - range->begin} * sizeof(*sources));
-    else
-      Barrier();
+    FlushMemory(sources + range->begin, std::uint64_t{range->end - range->begin} * sizeof(*sources));
     return true;
   }
   void Notify() {
@@ -156,28 +153,17 @@ struct Execution {
     const auto count = reinterpret_cast<const Request*>(RequestMemory() + layout.request)->count;
     const auto descriptor_bytes = std::uint64_t{count} * sizeof(std::uint64_t);
     auto* notify = reinterpret_cast<Word*>(RequestMemory() + layout.notify);
-    const auto value = args.sequence | (profile ? kProfileNotify : 0);
-    if (args.mailbox_remote) {
-      Store(*notify, value);
-      FlushMemory(RequestMemory(), layout.notify + sizeof(notify->value));
-      // All writers have flushed their descriptor rows and crossed built.
-      // UMDK strongly orders the trailing notify WRITE after head and list.
-      const aicpu_urma::UmdkTransfer writes[] = {
-          {args.mailbox_remote + layout.request, args.mailbox_source + layout.request, sizeof(Request)},
-          {args.mailbox_remote + layout.descriptor, args.mailbox_source + layout.descriptor, descriptor_bytes},
-          {args.mailbox_remote + layout.notify, args.mailbox_source + layout.notify, sizeof(notify->value)},
-      };
-      if (mailbox_transfer(&args.mailbox_context, true, writes, 3, 0))
-        Fail(coordination, Result::kTransportError);
-      return;
-    }
-    // All descriptor writers have crossed built. Publish their stores before
-    // the CPU can observe notify; avoid sweeping caller input/output tensors.
-    RefreshWindowMemory(Memory() + layout.request, sizeof(Request));
-    RefreshWindowMemory(Memory() + layout.descriptor, descriptor_bytes);
-    Store(*notify, value);
-    RefreshWindowMemory(notify, sizeof(Word));
-    Barrier();
+    Store(*notify, args.sequence | (profile ? kProfileNotify : 0));
+    FlushMemory(RequestMemory(), layout.notify + sizeof(notify->value));
+    // All writers have flushed their descriptor rows and crossed built.
+    // UMDK orders the trailing notify WRITE after the header and list.
+    const aicpu_urma::UmdkTransfer writes[] = {
+        {args.mailbox_remote + layout.request, args.mailbox_source + layout.request, sizeof(Request)},
+        {args.mailbox_remote + layout.descriptor, args.mailbox_source + layout.descriptor, descriptor_bytes},
+        {args.mailbox_remote + layout.notify, args.mailbox_source + layout.notify, sizeof(notify->value)},
+    };
+    if (mailbox_transfer(&args.mailbox_context, true, writes, 3, 0))
+      Fail(coordination, Result::kTransportError);
   }
 };
 }  // namespace
@@ -186,7 +172,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, MailboxTransfer mailbox_tr
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !args->request.miss_count ||
-      (args->mailbox_remote && (!args->mailbox_source || !args->mailbox_context.session || !mailbox_transfer)) ||
+      !args->mailbox_remote || !args->mailbox_source || !args->mailbox_context.session || !mailbox_transfer ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, args->window_capacity)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.

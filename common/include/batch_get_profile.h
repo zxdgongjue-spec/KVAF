@@ -1,8 +1,8 @@
 #pragma once
 
-#include <array>
 #include <chrono>
 #include <cstdint>
+#include <vector>
 
 #include "get_provider_timing.h"
 
@@ -24,7 +24,7 @@ struct BatchGetProfile {
   std::uint64_t prepare_ns{}, launch_ns{}, status_enqueue_ns{};
   std::uint64_t wait_ns{}, finish_ns{}, total_ns{};
   std::uint32_t worker_count{};
-  std::array<BatchGetWorkerProfile, 8> workers{};
+  std::vector<BatchGetWorkerProfile> workers;
 };
 
 // Host-only trace for one Python BatchGet call. RuntimeCore borrows this only

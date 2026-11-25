@@ -82,7 +82,8 @@ Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状
 每核 192 B 区域。默认四条 payload Jetty 的 AIV Scatter mailbox 使用 V8 打开，握手响应为
 392 B；显式配置非四 Jetty 数量时使用 V9 扩展打开，响应为 2296 B。启动和停止命令使用 V8。
 V8 由 AIV 把地址清单和通知 WRITE 到 CPU DDR mailbox，CPU 从本地读取。
-AICPU Scatter 使用 V6，握手响应为 300 B，CPU 从 NPU HBM READ 通知、请求头和地址清单。
+AICPU Scatter 通过 V6 交换 mailbox 和回写队列信息，握手响应为 432 B。AICPU 经 UMDK
+WRITE 请求头和地址清单，K 端同样从本地 mailbox 读取通知。
 两条路径分别通过 `aiv_batch_get_mode` 和 `aicpu_batch_get_mode` 选择。Gather 和公共控制命令
 使用 V6。部署 Scatter 时同步重编 CPU 服务、NPU Host 和 Scatter kernel。
 

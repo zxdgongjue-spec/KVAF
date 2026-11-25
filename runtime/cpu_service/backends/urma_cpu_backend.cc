@@ -1052,21 +1052,12 @@ class CpuService {
           return Result::kResourceError;
         }
       }
+    } else if (setup.token_value != region.registration->token_value()) {
+      return Result::kInvalidRequest;
     }
-    const auto status = [&] {
-      const auto psn = NextPsn();
-      if constexpr (std::is_same_v<Response, peer::OpenCpuPushMailboxResponse>) {
-        if (setup.token_value != region.registration->token_value())
-          return Status::InvalidArgument("CPU push mailbox token differs from region token");
-        return transport->Initialize(region.resources->context(), region.registration->segment(),
-            request, region.resources->tp_query(), region.resources->jetty_import(),
-            psn, &response->base, region.base, &response->mailbox);
-      } else {
-        return transport->Initialize(region.resources->context(), region.registration->segment(),
-            request, region.resources->tp_query(), region.resources->jetty_import(),
-            psn, response, region.base);
-      }
-    }();
+    const auto status = transport->Initialize(region.resources->context(), region.registration->segment(),
+        request, region.resources->tp_query(), region.resources->jetty_import(),
+        NextPsn(), response, region.base);
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
       const auto stopped = transport->Shutdown();
@@ -1442,14 +1433,14 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
     }
 
     case Command::kOpenCpuPushMailbox: {
-      peer::OpenCpuPushGetRequest request{};
+      peer::OpenCpuPushMailboxRequest request{};
       request.header = header;
       const bool valid = IsValidHeader(header, command, sizeof(request)) &&
           ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
       peer::OpenCpuPushMailboxResponse response{};
-      response.base.header = MakeHeader(command, sizeof(response));
-      response.base.header.command = ResponseCommand(command);
-      response.base.result = static_cast<int32_t>(valid ?
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(valid ?
           service->OpenCpuPushGet<cpu_push::Transport>(request, &response, &Region::push) :
           Result::kInvalidRequest);
       (void)WriteAll(fd, &response, sizeof(response));
@@ -1457,37 +1448,21 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
     }
     case Command::kOpenCpuPushGet:
     case Command::kOpenAivCpuGatherPushGet: {
-      if (header.version != peer::kProtocolVersion) {
-        const bool extended = header.version == peer::kAivCpuPushJettyProtocolVersion;
-        peer::OpenAivCpuPushJettyRequest request{};
-        request.base.header = header;
-        const auto request_bytes = extended ? sizeof(request) : sizeof(request.base);
-        const bool valid = IsValidHeader(header, command, request_bytes, header.version) &&
-            ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), request_bytes - sizeof(header));
-        if (!extended) request.payload_jettys = cpu_push::kJettyCount;
-        peer::OpenAivCpuPushJettyResponse response{};
-        const auto response_bytes = extended ? sizeof(response) : sizeof(response.base);
-        response.base.header = MakeHeader(command, response_bytes, header.version);
-        response.base.header.command = ResponseCommand(command);
-        response.base.result = static_cast<int32_t>(valid ?
-            service->OpenCpuPushGet<cpu_push::aiv::Transport>(request, &response, &Region::aiv_push) :
-            Result::kInvalidRequest);
-        (void)WriteAll(fd, &response, response_bytes);
-        return;
-      }
-      peer::OpenCpuPushGetRequest request{};
-      request.header = header;
-      if (!IsValidHeader(header, command, sizeof(request)) ||
-          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
-        SendStatus(fd, command, Result::kInvalidRequest);
-        return;
-      }
-      peer::OpenCpuPushGetResponse response{};
-      response.header = MakeHeader(command, sizeof(response));
-      response.header.command = ResponseCommand(command);
-      response.result = static_cast<int32_t>(
-          service->OpenCpuPushGet<cpu_push::Transport>(request, &response, &Region::push));
-      (void)WriteAll(fd, &response, sizeof(response));
+      const bool extended = header.version == peer::kAivCpuPushJettyProtocolVersion;
+      peer::OpenAivCpuPushJettyRequest request{};
+      request.base.header = header;
+      const auto request_bytes = extended ? sizeof(request) : sizeof(request.base);
+      const bool valid = IsValidHeader(header, command, request_bytes, header.version) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), request_bytes - sizeof(header));
+      if (!extended) request.payload_jettys = cpu_push::kJettyCount;
+      peer::OpenAivCpuPushJettyResponse response{};
+      const auto response_bytes = extended ? sizeof(response) : sizeof(response.base);
+      response.base.header = MakeHeader(command, response_bytes, header.version);
+      response.base.header.command = ResponseCommand(command);
+      response.base.result = static_cast<int32_t>(valid ?
+          service->OpenCpuPushGet<cpu_push::aiv::Transport>(request, &response, &Region::aiv_push) :
+          Result::kInvalidRequest);
+      (void)WriteAll(fd, &response, response_bytes);
       return;
     }
     case Command::kStartCpuPushGet:

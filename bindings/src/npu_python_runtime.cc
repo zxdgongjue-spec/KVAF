@@ -981,7 +981,7 @@ class NpuPythonRuntime final {
         item["device_finish_ns"] = profile.device_finish_ns;
         BatchGetProfile detailed{};
         detailed.worker_count = 1;
-        detailed.workers[0] = profile.aicpu_profile;
+        detailed.workers.push_back(profile.aicpu_profile);
         auto fields = BatchGetProfileDict(detailed);
         auto workers = fields["workers"].cast<py::list>();
         auto stages = workers[0].cast<py::dict>();

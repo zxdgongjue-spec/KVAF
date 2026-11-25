@@ -24,6 +24,10 @@ struct GetExecutionConfig {
 inline bool IsAivDirectGet(GetExecutionConfig config) {
   return config.executor == Executor::Aiv && config.algorithm == GetAlgorithm::Direct;
 }
+inline bool IsAicpuScatterGet(GetExecutionConfig config) {
+  return config.transport == Transport::Urma && config.executor == Executor::Aicpu &&
+      config.algorithm == GetAlgorithm::Scatter;
+}
 inline bool IsWindowedGet(GetExecutionConfig config) {
   return IsAivDirectGet(config) ||
       (config.transport == Transport::Urma && config.executor == Executor::Aicpu &&

@@ -1,4 +1,5 @@
 #include "cpu_service/push/cpu_push_get_transport.h"
+#include "cpu_service/push/cpu_push_mailbox.h"
 #include "urma_device_abi.h"
 #include "batch_get_profile.h"
 
@@ -35,10 +36,9 @@ Transport::~Transport() {
 }
 
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
-                             const peer::OpenCpuPushGetRequest& setup, urma::GetTpList query,
+                             const peer::OpenCpuPushMailboxRequest& setup, urma::GetTpList query,
                              urma::ImportJettyEx import, std::uint32_t psn,
-                             peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base,
-                             peer::AllocateRegionResponse* mailbox) {
+                             peer::OpenCpuPushMailboxResponse* response, std::uint64_t canonical_base) {
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
@@ -54,7 +54,12 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
   window_capacity_ = setup.window_capacity;
-  max_chunks_ = window_capacity_ / kChunkRows + (window_capacity_ % kChunkRows != 0U);
+  const auto rows_per_group = RowsPerCacheGroup(token_bytes_);
+  const auto groups = (window_capacity_ + rows_per_group - 1U) / rows_per_group;
+  const auto active_workers = std::min(groups, workers_);
+  // Any smaller prefix fits within this maximum per-worker chunk count.
+  const auto max_worker_rows = ((groups + active_workers - 1U) / active_workers) * rows_per_group;
+  max_chunks_ = (max_worker_rows + kChunkRows - 1U) / kChunkRows;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
@@ -80,7 +85,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (!remote_) return Error("import HBM segment");
   void* buffer = nullptr;
   // Each in-flight ready WRITE has its own immutable registered source word.
-  const auto marker_bytes = std::uint64_t{workers_} * max_chunks_ * kJettyCount * sizeof(std::uint64_t);
+  const auto marker_bytes = std::uint64_t{active_workers} * max_chunks_ * kJettyCount * sizeof(std::uint64_t);
   const auto bytes = (layout_.staging + marker_bytes + 4095) & ~std::uint64_t{4095};
   Stage("allocate_control");
   if (posix_memalign(&buffer, 4096, bytes)) return Error("allocate control buffer");
@@ -94,27 +99,25 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   cfg.len = bytes;
   cfg.token_id = control_token_;
   cfg.token_value.token = setup.token_value;
-  // It supplies the same local Ready/Done words in both modes. The mailbox
-  // also receives WRITE from AICPU and requires remote READ and WRITE access.
+  // Like AIV Scatter, the registered mailbox receives the ordered request
+  // WRITEs and supplies immutable local Ready/Done words.
   cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-  mailbox_ = mailbox != nullptr;
-  cfg.flag.bs.access = mailbox_ ? ((1U << 1U) | (1U << 2U)) : 1U;
+  cfg.flag.bs.access = (1U << 1U) | (1U << 2U);
   cfg.flag.bs.non_pin = 0;
   cfg.flag.bs.token_id_valid = 1;
   Stage("register_control");
   control_ = urma_register_seg(context_, &cfg);
   if (!control_) return Error("register control buffer");
-  if (mailbox) {
-    static_assert(sizeof(urma_seg_t) <= peer::kSegKeyBytes);
-    mailbox->session_id = setup.session_id;
-    mailbox->peer_base = control_->seg.ubva.va;
-    mailbox->peer_length = control_->seg.len;
-    mailbox->token_id = control_token_->token_id;
-    mailbox->token_value = setup.token_value;
-    mailbox->segment_key_bytes = sizeof(urma_seg_t);
-    std::memcpy(mailbox->peer_eid, control_->seg.ubva.eid.raw, sizeof(mailbox->peer_eid));
-    std::memcpy(mailbox->segment_key, &control_->seg, sizeof(urma_seg_t));
-  }
+  static_assert(sizeof(urma_seg_t) <= peer::kSegKeyBytes);
+  auto& mailbox = response->mailbox;
+  mailbox.session_id = setup.session_id;
+  mailbox.peer_base = control_->seg.ubva.va;
+  mailbox.peer_length = control_->seg.len;
+  mailbox.token_id = control_token_->token_id;
+  mailbox.token_value = setup.token_value;
+  mailbox.segment_key_bytes = sizeof(urma_seg_t);
+  std::memcpy(mailbox.peer_eid, control_->seg.ubva.eid.raw, sizeof(mailbox.peer_eid));
+  std::memcpy(mailbox.segment_key, &control_->seg, sizeof(urma_seg_t));
   std::uint64_t cpu_tp = 0;
   Stage("query_ctp");
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
@@ -129,10 +132,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
         {16384, kJettyDepth, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
     if (error) return Error(error);
-    // Control READs use one SGE. Data and done use reusable prepared chains.
-    queue.local.reserve(1);
-    queue.remote.reserve(1);
-    queue.wrs.reserve(1);
     Stage("import_jetty", q);
     c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
@@ -148,114 +147,23 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                         sizeof(Completion), control_, nullptr});
   AppendPrepared(done, 0, hbm_base_ + layout_.done, sizeof(Completion), 1, true);
   SealPrepared(done_);
-  Stage(mailbox_ ? "ready_mailbox" : "ready");
+  Stage("ready_mailbox");
   return Status::OK();
 }
 
-void Transport::ResetRequests(Queue& q) { q.local.clear(); q.remote.clear(); q.wrs.clear(); }
-void Transport::Add(Queue& q, urma_opcode_t opcode, std::uint64_t remote,
-                    std::uint32_t bytes, std::uint32_t first, std::uint32_t sges) {
-  q.remote.push_back({remote, bytes, remote_, nullptr});
-  urma_jfs_wr_t wr{};
-  wr.opcode = opcode;
-  wr.flag.bs.comp_order = 1;
-  wr.flag.bs.place_order = URMA_RELAX_ORDER;
-  wr.tjetty = q.channel.remote_jetty;
-  wr.user_ctx = ++q.sequence;
-  if (opcode == URMA_OPC_WRITE) {
-    wr.rw.src = {reinterpret_cast<urma_sge_t*>(q.local.data() + first), sges};
-    wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
-  } else {
-    wr.rw.src = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
-    wr.rw.dst = {reinterpret_cast<urma_sge_t*>(q.local.data() + first), sges};
-  }
-  q.wrs.push_back(wr);
+std::uint64_t Transport::MailboxSequence() {
+  return LoadMailboxSequence(memory_ + layout_.notify, profile_.enabled);
 }
-Status Transport::Post(Queue& q) {
-  if (q.poisoned || q.pending || q.wrs.empty()) return Error("queue unavailable");
-  auto& tail = q.wrs.back();
-  tail.flag.bs.complete_enable = 1;
-  tail.flag.bs.place_order = URMA_STRONG_ORDER;
-  q.pending = tail.user_ctx;
-  for (std::size_t first = 0; first < q.wrs.size(); first += 32) {
-    const auto end = std::min(first + 32, q.wrs.size());
-    for (auto i = first; i < end; ++i) q.wrs[i].next = i + 1 < end ? &q.wrs[i + 1] : nullptr;
-    urma_jfs_wr_t* bad = nullptr;
-    if (urma_post_jetty_send_wr(q.channel.local_jetty, &q.wrs[first], &bad)) {
-      q.poisoned = true;
-      return Error("post WRITE/READ chain");
-    }
-  }
-  return Status::OK();
-}
-Status Transport::Wait(Queue& q) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
-  std::uint32_t polls = 0;
-  while (q.pending) {
-    urma_cr_t crs[8]{};
-    const auto count = urma_poll_jfc(q.channel.local_jfc, 8, crs);
-    if (count < 0) { q.poisoned = true; return Error("poll CQ"); }
-    for (int i = 0; i < count; ++i) {
-      if (crs[i].status != URMA_CR_SUCCESS || crs[i].user_ctx != q.pending) {
-        q.poisoned = true; return Error("CQ status/context mismatch");
-      }
-      q.pending = 0;
-    }
-    if ((++polls & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
-      q.poisoned = true; return Error("CQ timeout; resources retained");
-    }
-  }
-  return Status::OK();
-}
-
-Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes) {
-  auto& q = queues_[0];
-  if (q.poisoned || q.pending || offset > layout_.staging || bytes > layout_.staging - offset)
-    return Error("invalid control transfer");
-  while (bytes) {
-    ResetRequests(q);
-    const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, max_bytes_));
-    q.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset), length, control_, nullptr});
-    Add(q, write ? URMA_OPC_WRITE : URMA_OPC_READ, hbm_base_ + offset, length, 0, 1);
-    auto result = Post(q);
-    if (result.ok()) result = Wait(q);
-    if (!result.ok()) return result;
-    offset += length;
-    bytes -= length;
-  }
-  return Status::OK();
-}
-Status Transport::ReadRequest(std::uint64_t* sequence) {
-  if (!mailbox_) {
-    auto read = Transfer(false, layout_.notify, sizeof(Word));
-    if (!read.ok()) return read;
-  }
-  // AICPU's ordered notify WRITE publishes the request and its descriptor list.
-  const auto notify = __atomic_load_n(
-      reinterpret_cast<const std::uint64_t*>(memory_ + layout_.notify), __ATOMIC_ACQUIRE);
-  *sequence = notify & ~kProfileNotify;
-  profile_.enabled = (notify & kProfileNotify) != 0;
-  return Status::OK();
-}
-Status Transport::ReadDescriptor(std::uint64_t sequence) {
+Status Transport::ValidateRequest(std::uint64_t sequence) {
   if (profile_.enabled) {
     profile_ = {};
     profile_.enabled = true;
   }
-  if (!mailbox_) {
-    BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
-    auto read = Transfer(false, layout_.request, sizeof(Request));
-    if (!read.ok()) return read;
-  }
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
-      r.count > window_capacity_ || r.token_bytes != token_bytes_ || r.workers != workers_)
+      !r.count || r.count > window_capacity_ || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
-  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  if (!mailbox_) {
-    auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
-    if (!read.ok()) return read;
-  }
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_validate_ns : nullptr);
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   for (std::uint32_t i = 0; i < r.count; ++i)
     if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
@@ -352,7 +260,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
-            (worker * max_chunks_ + chunk) * kJettyCount + queue;
+            (std::uint64_t{worker} * max_chunks_ + chunk) * kJettyCount + queue;
         q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
@@ -398,7 +306,7 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
 }
 Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   for (const auto& q : queues_)
-    if (q.poisoned || q.pending) return Error("queue unavailable");
+    if (q.poisoned) return Error("queue unavailable");
   bool submitted = false;
   auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
   if (!status.ok()) return status;
@@ -524,11 +432,11 @@ void Transport::PrintProfile() const {
   const auto submit_ns = p.first_post_ns ? p.last_cqe_ns - p.first_post_ns : 0;
   std::fprintf(stderr,
       "CPU_PUSH_PROFILE sequence=%" PRIu64 " workers=%u rows=%u bytes=%" PRIu64
-      " header_read_us=%.1f address_read_us=%.1f build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
+      " address_validate_us=%.1f build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
       " write_us=%.1f submit_to_cqe_us=%.1f done_us=%.1f"
       " data_wrs=%u ready_wrs=%u post_calls=%u waves=%u tail_cqes=%u cpu_threads=%u plan_reused=%u optimized=%u\n",
       r.sequence, r.workers, r.count, std::uint64_t{r.count} * token_bytes_,
-      p.header_read_ns / 1000.0, p.address_read_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
+      p.address_validate_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
       p.cq_wait_ns / 1000.0, p.write_ns / 1000.0, submit_ns / 1000.0, p.done_ns / 1000.0,
       p.data_wrs, p.ready_wrs, p.post_calls, p.waves, p.tail_cqes, p.cpu_threads,
       unsigned(p.plan_reused), optimized);
@@ -543,7 +451,6 @@ Status Transport::Shutdown() {
       if (urma_delete_jetty(c.local_jetty)) return Error("delete Jetty; DMA resources retained");
       c.local_jetty = nullptr;
     }
-    q.pending = 0;
     if (c.remote_jetty) {
       if (urma_unimport_jetty(c.remote_jetty)) return Error("unimport Jetty");
       c.remote_jetty = nullptr;
@@ -565,7 +472,7 @@ Status Transport::Shutdown() {
   done_ = {};
   prepared_count_ = UINT32_MAX;
   next_poll_queue_ = 0;
-  for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
+  for (auto& q : queues_) q.poisoned = false;
   std::free(memory_); memory_ = nullptr;
   context_ = nullptr;
   return Status::OK();

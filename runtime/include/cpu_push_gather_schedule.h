@@ -18,7 +18,7 @@ inline std::vector<GatherWave> InterleavedGatherWaves(std::uint32_t count,
     Range rows;
     std::uint32_t queue;
   };
-  std::array<std::vector<Shard>, kMaxWorkers> pending;
+  std::array<std::vector<Shard>, kMaxAivWorkers> pending;
   const auto active = ActiveWorkers(count, bytes, workers);
   if (active < 2U) return {};
   const auto quantum = RowsPerCacheGroup(bytes);
@@ -41,7 +41,7 @@ inline std::vector<GatherWave> InterleavedGatherWaves(std::uint32_t count,
   if (!aligned) return {};
 
   std::vector<GatherWave> waves;
-  std::array<std::size_t, kMaxWorkers> next{};
+  std::array<std::size_t, kMaxAivWorkers> next{};
   std::uint32_t first_lane = 0;
   for (;;) {
     GatherWave wave{};

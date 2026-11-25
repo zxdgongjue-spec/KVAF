@@ -184,9 +184,7 @@ Status CpuRuntime::ServeConnection(int fd) {
     case peer::Command::kOpenAivCpuGatherPushGet:
       if (header.version == peer::kAivCpuPushJettyProtocolVersion)
         return Reply<peer::OpenAivCpuPushJettyResponse>(fd, command, peer::Result::kResourceError, header.version);
-      if (header.version == peer::kAivCpuPushProtocolVersion)
-        return Reply<peer::OpenAivCpuPushGetResponse>(fd, command, peer::Result::kResourceError, header.version);
-      return Reply<peer::OpenCpuPushGetResponse>(fd, command, peer::Result::kResourceError);
+      return Reply<peer::OpenAivCpuPushGetResponse>(fd, command, peer::Result::kResourceError, header.version);
     case peer::Command::kPrepareGatherWindow:
       return Reply<peer::PrepareGatherWindowResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kEnableDirectGather:

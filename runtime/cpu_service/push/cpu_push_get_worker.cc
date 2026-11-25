@@ -12,13 +12,10 @@ Worker::~Worker() {
 }
 Status Worker::Start() {
   if (thread_.joinable() || stop_.load()) return Status::InvalidState("CPU push worker cannot restart");
-  // Both peers have imported their Jettys before START. Check the actual
-  // READ/WRITE path here so initialization can reject a disconnected EID pair.
-  std::uint64_t sequence = 0;
-  auto linked = transport_->ReadRequest(&sequence);
-  if (!linked.ok()) return linked;
-  if (sequence != 0) return Status::InvalidState("CPU push target is not idle at startup");
-  linked = transport_->Complete(0, Result::kPending);
+  if (transport_->MailboxSequence() != 0)
+    return Status::InvalidState("CPU push mailbox is not idle at startup");
+  // Probe the payload connection before starting the worker.
+  auto linked = transport_->Complete(0, Result::kPending);
   if (!linked.ok()) return linked;
   try { thread_ = std::thread(&Worker::Run, this); }
   catch (const std::exception& e) { return Status::Internal(e.what()); }
@@ -32,17 +29,16 @@ Status Worker::Stop() {
 void Worker::Run() {
   std::uint64_t last = 0;
   while (!stop_.load(std::memory_order_acquire)) {
-    std::uint64_t sequence = 0;
-    auto status = transport_->ReadRequest(&sequence);
-    if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    const auto sequence = transport_->MailboxSequence();
     if (!sequence || sequence == last) continue;
     if (sequence <= last || sequence > UINT32_MAX) {
       (void)transport_->Complete(sequence, Result::kSequenceError);
       return;
     }
     last = sequence;
+    Status status;
     try {
-      status = transport_->ReadDescriptor(sequence);
+      status = transport_->ValidateRequest(sequence);
       if (!status.ok()) {
         // Header errors occur before data WRITE. Complete itself refuses any
         // poisoned/in-flight queue, so an unsafe transport cannot reuse slots.

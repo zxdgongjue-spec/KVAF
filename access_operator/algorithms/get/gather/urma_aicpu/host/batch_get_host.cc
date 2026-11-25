@@ -375,6 +375,7 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
     auto allocated = kvaf::detail::AllocateAicpuProfiles(&impl_->profile_device, &impl_->profile_host, profile_bytes);
     if (!allocated.ok()) return allocated;
   }
+  if (exec.execution.profile) exec.execution.profile->workers.resize(impl_->session.config().workers);
   auto ready = impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace,
       GatherWorkspaceBytes(impl_->session.config().workers, impl_->window_capacity), capturing);
   if (!ready.ok()) return ready;

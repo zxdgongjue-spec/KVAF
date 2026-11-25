@@ -36,17 +36,18 @@ AICPU 仅支持 URMA；Runtime 的 transport 模式须允许 URMA。AICPU 资源
 路径，设备包在首次准备时解析；`gather_read_direct` 不对外开放。
 CPU push 使用首个自动发现候选，也可通过严格的 `npu_eids=[eid1, eid2]` 指定列表并使用首项；
 不执行启动探测、候选自动切换、多 EID 条带或自适应调优。
-Get 使用 Host direct HCCP/RA；Put 使用 AICPU UMDK session，两者使用同一个 Host 选定 EID。
+Scatter 的 payload 使用 Host direct HCCP/RA 建链，mailbox 控制和 Put 使用 AICPU UMDK session。
+这些通道使用同一个 Host 选定 EID。
 UMDK 根据选定 EID 匹配 device/index，匹配或准备失败会报错，不再提供独立过滤参数。
 控制参数有更新，Host 库和设备包必须一起重建；仍保留单一 UMDK 控制入口。
-CPU push 的 V3 数据/请求协议及 TP 管理保持本分支原有实现。
+Ready/Done 和 payload 沿用 V3 数据布局，请求使用 K 端 mailbox。
 CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
 资源项 `cores` / `--aicpu-workers` 控制 AICPU worker 数。
 
 ## 构建并验证
 
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
-当前 push 协议为 V3，逐行复制源于 `codex/aicpu-ordered-write` 的
+逐行复制源于 `codex/aicpu-ordered-write` 的
 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24），Ready 由 AICPU 按 Jetty 分片消费。
 当前设备入口为 `KvafAicpuCpuPushScatterExecutionV5`。主机库和设备 SO 必须一起更新，
 包括移除废弃排序字段后的 profile 布局。以下命令从各自仓库根目录执行。
@@ -103,9 +104,10 @@ CPU 端启动同一个服务：
 CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first
 ```
 
-性能测试使用下一节的统一入口；通过 `--backend` 选择 Gather 或 Scatter，
-通过 `--aicpu-workers` 设置 worker 数。实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，
-示例使用 5 个 worker。
+性能测试使用下一节的统一入口。Scatter 默认使用 5 个 AICPU worker。
+`--aicpu-workers` 可以设到设备报告的 AICPU 核数。若查询不可用，沿用 8 的兼容上限。
+`SCATTER_WINDOW` 日志会打印实际的 `workers` 和 `worker_limit`。
+算子需要所有 worker 在单次 launch 内汇合，因此较高 worker 数的有效并发与性能需在目标设备上验证。
 
 ## 使用统一性能入口
 
@@ -132,11 +134,7 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 源池大小由 `--table-capacity` 和块布局显式决定，不再由独立后端脚本分配 100 GiB。
 扫描不同 miss 数、token 大小或 worker 数时，循环调用同一个入口。
 
-设置 `KVAF_AICPU_SCATTER_MAILBOX=1` 后，AICPU 通过独立的 UMDK 控制队列依次
-WRITE 请求头、源地址清单和通知序号。K 端轮询本地通知序号，沿用同一套 SGL payload
-WRITE 和 Ready/Done 发布逻辑。默认值 `0` 下，K 端通过 READ 获取请求。
-A/B 时只切换该变量，两端使用同一次构建的代码。启动日志中的 `request_control`
-显示实际选择，`CPU_PUSH_PROFILE` 的 `address_read_us` 在 mailbox 模式下仍包含源地址范围校验。
+启动日志中的 `request_control=mailbox_write` 表示请求使用 K 端 mailbox。
 详细口径及其他后端参数见 [统一 Get 性能测试](batch_get_performance.md)。
 
 ## 请求与数据流
@@ -150,18 +148,19 @@ A/B 时只切换该变量，两端使用同一次构建的代码。启动日志�
 初始化时，Host 用 `ACL_MEM_MALLOC_HUGE_FIRST` 申请 HBM workspace，再通过 RA 注册并创建四个 TargetChannel，
 将 segment、Jetty key 和 TP 信息发给源 DDR 所属 CPU Runtime。
 `workspace_policy=huge_first` 记录申请策略；大页不足时可回退普通页。
-CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激活驻留 CPU worker。
-激活时先同步 READ 请求控制字并 WRITE 初始完成字，确认实际双向 RMA 路径可用。
+CPU 建立专用回写队列，返回队列及已注册 mailbox 信息。Host 导入回写队列并为
+AICPU 建立 UMDK 控制队列后才激活驻留 CPU worker。
+激活时检查本地 mailbox 为空，并 WRITE 初始完成字探测回写通道。
 这套控制协商通过现有 PeerLink 完成，无需新增 NPU listener。
 
 每轮过程如下：
 
 1. Host 在调用方 stream 启动配置数量的实例；设备通过常驻 coordination 的 ticket
    取得本轮 worker 编号和 sequence，不在每次提交前由 Host 清零 coordination。
-2. 各 worker 并行查表，将本核分片的源地址写入原请求位置；worker 0 填写请求头。
-3. 所有非空分片可见后，worker 0 发布一次 notify，携带 sequence 和可选 profile 位。
-   CPU READ 请求头，验证后 READ 有效源地址前缀，
-   由所属线程更新预构建 SGL 的源地址。
+2. 各 worker 并行查表，将本核分片的源地址写入 HBM 控制缓冲区。Worker 0 填写请求头。
+3. 所有非空分片可见后，worker 0 将请求头和源地址清单 WRITE 到 K 端 mailbox，
+   最后用强序 WRITE 发送带 sequence 和可选 profile 位的 notify。K 端轮询本地 notify，
+   看到新序号后校验请求头、源地址范围并更新预构建 SGL。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
 6. AICPU 读取四个 Ready 字，独立推进各 Jetty 的消费进度。将本次新就绪的连续 staging
@@ -200,7 +199,7 @@ ready 热循环与 V24 一样只读 worker 协调状态；Runtime 的远端错�
 | 项目 | a12bb16 V24 独立测试 | 当前 Runtime |
 | --- | --- | --- |
 | 执行 | 一次 launch，设备内循环所有轮次 | 每次 BatchGet 独立 launch；统一性能入口支持异步入队和同步调用 |
-| 源 SGL | CPU 预先构建，逐轮修改 ready 序号和源数据标签 | 每轮从动态 Tensor 解析源地址，CPU READ 地址清单并更新 SGL |
+| 源 SGL | CPU 预先构建，逐轮修改 ready 序号和源数据标签 | 每轮从动态 Tensor 解析源地址，K 端读取本地 mailbox 并更新 SGL |
 | 输出 | 预先安排顺序输出，656 B 行使用 768 B stride | 按动态 `output_indices` 写入 656 B slot，默认测试随机排列 |
 | 校验 | 源标签每轮变化，末轮完整读回输出 | 请求生成与输出校验在性能计时之外 |
 | 带宽计时 | 驻留 kernel 内 request 到 scatter/done | Host 端到端时间；启用 profile 后另报设备时间 |
@@ -224,8 +223,8 @@ workspace 在初始化时分配，窗口间复用，每个窗口 payload 必须�
 
 一次执行完成前不复用 staging。异步返回表示已经入队；同一 Get 方向的下次普通调用会先 Drain，
 检查前一轮执行状态。`synchronize=True` 在本次调用内完成等待和状态检查。
-Shutdown 停止 CPU worker 并销毁其 DMA 队列后释放 HBM。Mailbox 模式先同步 Scatter
-stream 并关闭 AICPU 控制队列，再停止 CPU worker。
+Shutdown 先同步 Scatter stream 并关闭 AICPU 控制队列，再停止 CPU worker、销毁其 DMA
+队列并释放 HBM。
 传输或 stream 失败会阻止执行资源复用；关闭失败时保留资源以便重试。
 
 ## Profile
@@ -235,13 +234,12 @@ stream 并关闭 AICPU 控制队列，再停止 CPU worker。
 `scatter_copies` 为实际逐行 memcpy 次数。4096 × 656 B、完整前缀、4 worker 时，
 每个 worker 为 1024 次，总计 4096 次。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
-`notify_us` 记录 AICPU 发布请求的时间。Mailbox 模式下包含 UMDK WRITE 提交和 CQ 等待，
+`notify_us` 记录 AICPU 发布请求的时间，包含 UMDK WRITE 提交和 CQ 等待。
 源地址分片的 cache flush 也计入 `request_us`。设备 worker 的区间重叠，不能相加作为端到端时长。
 
 启用 CPU Push profiling 时，CPU 服务在采样请求完成后输出
 `CPU_PUSH_PROFILE`。统一性能入口的 `--kernel-profile` 控制测试端的分段明细输出。
-`header_read_us` 记录请求头 READ，`address_read_us` 记录源地址数组 READ 和范围校验。
-`header_read_us` 在 mailbox 模式下为零。
+`address_validate_us` 记录 K 端对本地 mailbox 源地址清单的范围校验。
 `write_us` 包含 `build_us`、`post_us`
 和 `cq_wait_us`，分别表示计划构建/源地址更新、URMA post 调用、提交后的 CQ 等待。
 `submit_to_cqe_us` 从首次 payload post 到最后一个数据链尾 CQE，包含提交与 DMA 的重叠；
