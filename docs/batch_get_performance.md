@@ -19,12 +19,12 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 |---|---|---:|
 | `aiv` | URMA AIV Direct | 本机 `--aiv-cores 2 --jettys-per-core 2`，远端 A+K `--aiv-cores 4 --jettys-per-core 1` |
 | `ubmem` | UBMEM AIV Direct | `--aiv-cores 16` |
-| `gather_read` | URMA AICPU Gather | `--aicpu-workers 5` |
-| `cpu_push_scatter` | URMA AICPU Scatter | `--aicpu-workers 5` |
+| `gather_read` | URMA AICPU Gather | `--aicpu-workers 6` |
+| `cpu_push_scatter` | URMA AICPU Scatter | `--aicpu-workers 6` |
 
 四种后端共用请求生成、建表、预检、预热、输出校验、eager/graph 测量和结果格式。
 未显式设置并行度时，URMA AIV Direct 根据已连接的 CPU service 选默认值。本机每卡 2 核、每核 2 个 Jetty，远端 A+K 每卡 4 核、每核 1 个 Jetty，两种场景均为 4 个 Jetty。UBMEM 使用 16 核，Gather/Scatter 使用
-5 个 worker，与 Runtime 的算法默认值一致；命令行参数或环境变量可覆盖。
+6 个 worker，与 Runtime 的算法默认值一致；命令行参数或环境变量可覆盖。
 `--aiv-cores` 表示 AIV 核数，`--aicpu-workers` 表示 AICPU worker 数（1..8）；
 旧 `--workers` 写法仍接受以兼容已有命令。
 UBMEM 不使用 Jetty 参数。`--table-capacity` 是源块数量，
@@ -41,6 +41,10 @@ UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 
 Graph 的 E2E 使用同一 stream 上 replay 前后两个 NPU Event 的间隔，
 资源准备、输入更新及同步、输出校验和 profile 读取均在计时外。
+所有后端的图模式默认使用 ACL native：一次 C++ 调用完成 Event 记录、图提交、
+完成等待和 Event 耗时读取，复用两个 Event，等待期间释放 GIL。
+每张计时图只捕获一个 Get；`--graph-replays` 控制计时前的正确性回放次数。
+`--graph-api torch` 可显式选择 Torch 图。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
 Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-profile` 还验证
@@ -55,6 +59,30 @@ Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-
 时间单位为微秒，带宽使用有效载荷一次除以对应耗时；`p50_GBps` 对应 P50 延迟。
 两种模式的测得时间都包含算子内打点的开销，profile 回读和结果打印在计时外。
 阶段可嵌套或重叠，各段 P50 不能相加得到总 P50。
+
+稳态绑定直接读取 Tensor 属性，只保存维数和首维长度，不复制完整 shape。
+Tensor 元数据使用缓存的方法名调用；stream getter 每次只读取一次，保留 Torch 队列刷新。
+Gather/Scatter 在 Prepare 中构建并校验一次本轮输入，Launch 复用该结果；两阶段间请求元数据须保持不变。
+AICPU 函数句柄首次解析时加锁，后续通过原子读复用；已加载设备包在进程内不卸载。
+普通 Get 完成并验证状态后，重复 Check 复用本轮结果，下一次 launch 清除该标记；
+graph 的每次 Check 仍重新读取报告。首次完成等待、状态回读和错误检查保留在 eager E2E 中。
+保护并发提交、表引用、执行资源及 session 生命周期的锁仍保留。
+
+例如测试 Gather 的 ACL native 单 Get 图模式：
+
+```bash
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --peer 127.0.0.1:28990 --device-id 1 \
+  --backend gather_read --aicpu-workers 6 --execution graph \
+  --request-length 32768 --table-capacity 16384 --miss-count 8192 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --graph-replays 8 --warmup 100 --iterations 1000 --kernel-profile \
+  --output-dir results/gather-native
+```
+
+收敛后不再提供 `--graph-submit`、`--graph-get-count`、`--get-binding` 实验参数。
+基础 kernel/阶段 profile 保留；Host 细分打点、入口边界与时钟对齐诊断已删除。
+重新构建 NPU 产物并安装匹配的 AICPU 包后再运行，避免混用旧绑定和旧 kernel。
 
 ## 导出 CSV
 

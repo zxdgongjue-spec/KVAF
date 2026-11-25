@@ -31,7 +31,9 @@ static std::uint32_t DispatchControl(UmdkControlArgs* args, bool queue_profiles)
     if (!args->worker_count || args->worker_count > 8 || !args->local_buffer ||
         !args->buffer_bytes || args->local_buffer > UINT64_MAX - args->buffer_bytes ||
         args->library[255] || (args->queue_profile != UmdkQueueProfile::Gather &&
-                              args->queue_profile != UmdkQueueProfile::Put)) {
+                              args->queue_profile != UmdkQueueProfile::Put &&
+                              !(args->queue_profile == UmdkQueueProfile::GatherStriped && args->data_jettys >= 1 &&
+                                args->data_jettys <= kUmdkMaxDataJettys))) {
       Fail(status, "invalid UMDK session arguments");
       CurrentState().session = 0;
       status.session = 0;

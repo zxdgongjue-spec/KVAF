@@ -24,7 +24,8 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
       .def(py::init([](std::uint32_t cores, std::uint32_t jettys, std::uint32_t capacity,
                        std::optional<std::uint32_t> inflight, std::string kernel,
                        std::uint32_t cpu_threads, std::uint64_t gather_ddr,
-                       std::uint64_t scatter_hbm, std::optional<std::uint32_t> gather_wave) {
+                       std::uint64_t scatter_hbm, std::optional<std::uint32_t> gather_wave,
+                       std::optional<std::uint32_t> address_groups) {
              ExecutionResources r;
              r.cores = cores;
              r.jettys = jettys;
@@ -35,14 +36,17 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
              r.gather_ddr_bytes = gather_ddr;
              r.scatter_hbm_bytes = scatter_hbm;
              r.gather_read_wave_wrs = gather_wave;
+             r.gather_address_groups_per_post = address_groups;
              return r;
            }),
            py::kw_only(), py::arg("cores") = 0, py::arg("jettys") = 0,
            py::arg("request_capacity") = 65536, py::arg("max_inflight_total") = py::none(),
            py::arg("kernel_path") = "", py::arg("cpu_threads") = 0,
            py::arg("gather_ddr_bytes") = 0, py::arg("scatter_hbm_bytes") = 0,
-           py::arg("gather_read_wave_wrs") = py::none())
+           py::arg("gather_read_wave_wrs") = py::none(),
+           py::arg("gather_address_groups_per_post") = py::none())
       .def_readonly("gather_read_wave_wrs", &ExecutionResources::gather_read_wave_wrs)
+      .def_readonly("gather_address_groups_per_post", &ExecutionResources::gather_address_groups_per_post)
       .def_readonly("gather_ddr_bytes", &ExecutionResources::gather_ddr_bytes)
       .def_readonly("scatter_hbm_bytes", &ExecutionResources::scatter_hbm_bytes)
       .def_readonly("cpu_threads", &ExecutionResources::cpu_threads)

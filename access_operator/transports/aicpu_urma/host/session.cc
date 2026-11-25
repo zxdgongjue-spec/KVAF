@@ -257,10 +257,25 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   args_.local_buffer = reinterpret_cast<std::uint64_t>(output);
   args_.buffer_bytes = output_bytes;
   args_.worker_count = workers;
-  args_.queue_profile = config_.queue_profile;
+  std::vector<peer::PeerRegion> routes;
+  if (config_.queue_profile == UmdkQueueProfile::Gather) {
+    for (auto candidate : config_.candidates) {
+      peer::PeerRegion route;
+      result = link.PrepareGatherRoute(region_base, candidate, &route);
+      if (!result.ok()) return result;
+      if (std::any_of(routes.begin(), routes.end(), [&](const auto& previous) { return previous.eid == route.eid; }))
+        return Status::InvalidArgument("selected CPU Gather devices advertise the same EID");
+      routes.push_back(route);
+    }
+  }
+  const bool striped = config_.queue_profile == UmdkQueueProfile::Gather &&
+                       (config_.data_jettys > 1 || !routes.empty());
+  if (routes.empty()) routes.push_back(region);
+  args_.queue_profile = striped ? UmdkQueueProfile::GatherStriped : config_.queue_profile;
+  args_.data_jettys = striped ? config_.data_jettys : 1;
   args_.token = region.token_value;
   args_.remote_address = region_base;
-  std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);
+  std::copy(routes.front().eid.begin(), routes.front().eid.end(), args_.route_eid);
   std::copy(config_.local_eid.begin(), config_.local_eid.end(), args_.local_eid);
   UmdkControlStatus prepared{};
   result = Run(UmdkControlOp::kPrepare, prepared);
@@ -269,14 +284,21 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     return Status::Internal("AICPU context EID differs from the Host-selected EID");
   if (prepared.key_bytes != 28 || region.segment_key_bytes > sizeof(args_.segment))
     return Status::Internal("invalid UMDK peer descriptor");
-  args_.segment_bytes = region.segment_key_bytes;
-  std::copy_n(region.segment_key.begin(), args_.segment_bytes, args_.segment);
   const auto controls = UmdkControlQueueCount(config_.queue_profile, workers);
-  const auto data = UmdkDataQueueCount(config_.queue_profile, workers);
+  const auto data = UmdkDataQueueCount(config_.queue_profile, workers) * args_.data_jettys;
   const auto prepared_index = data ? 0U : kUmdkControlQueueIndex;
   for (std::uint32_t queue = 0; queue < controls + data; ++queue) {
     const bool control = queue < controls;
-    const auto index = control ? kUmdkControlQueueIndex + queue : queue - controls;
+    const auto ordinal = control ? queue : queue - controls;
+    const auto index = control ? kUmdkControlQueueIndex + ordinal : UmdkDataSlot(ordinal);
+    const auto lane = ordinal % workers;
+    const auto path = lane % routes.size();
+    const auto& route = routes[path];
+    const auto selector = config_.queue_profile == UmdkQueueProfile::Gather && !config_.candidates.empty()
+        ? config_.candidates[path] + 1U : 0U;
+    std::copy(route.eid.begin(), route.eid.end(), args_.route_eid);
+    args_.segment_bytes = route.segment_key_bytes;
+    std::copy_n(route.segment_key.begin(), args_.segment_bytes, args_.segment);
     args_.worker_index = index;
     auto descriptor = prepared;
     if (index != prepared_index) {
@@ -287,7 +309,7 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     std::copy_n(descriptor.key, descriptor.key_bytes, local_key.begin());
     result = link.CreateChannel(region_base, local_key.data(), descriptor.key_bytes, descriptor.eid,
                                 region.token_value, descriptor.tp, 1, &peer_key, &args_.key_bytes,
-                                &args_.peer_tp, &args_.peer_psn, true);
+                                &args_.peer_tp, &args_.peer_psn, true, selector);
     if (!result.ok()) return result;
     if (args_.key_bytes > sizeof(args_.peer_key))
       return Status::Internal("invalid UMDK Jetty key size");
@@ -295,6 +317,12 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     UmdkControlStatus connected{};
     result = Run(UmdkControlOp::kConnect, connected);
     if (!result.ok()) return result;
+    if (striped && control) {
+      std::fprintf(stderr, "[KVAF_AICPU] GATHER_ROUTE worker=%u data_jettys=%u control_jettys=1 cpu_eid=",
+                   lane, args_.data_jettys);
+      for (auto byte : route.eid) std::fprintf(stderr, "%02x", byte);
+      std::fprintf(stderr, "\n");
+    }
   }
   args_.worker_index = 0;
   connected_ = true;

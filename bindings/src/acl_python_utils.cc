@@ -9,6 +9,7 @@ namespace py = pybind11;
 namespace kvaf::acl_python {
 
 aclrtStream StreamFromPython(const py::object& stream) {
+  // The getter may flush Torch's Host queue; evaluate it exactly once.
   const auto handle = py::getattr(stream, "npu_stream", py::object{});
   if (!handle) {
     throw py::type_error("ACL stream must be a torch.npu.Stream");

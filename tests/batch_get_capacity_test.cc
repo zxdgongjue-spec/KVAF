@@ -1,6 +1,7 @@
 #include "cache_region_service.h"
 #include "session_access_operator.h"
 #include "npu_runtime_config.h"
+#include "gather_workspace.h"
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -25,10 +26,23 @@ struct Session final : execution::Session {
 int main() {
   ExecutionResources configured;
   CHECK(!configured.gather_read_wave_wrs);
+  CHECK(!configured.gather_address_groups_per_post);
   configured.gather_read_wave_wrs = 64;
+  configured.gather_address_groups_per_post = 9;
   const auto resources = detail::ResolveExecutionResources(Transport::Urma, Executor::Aicpu,
                                                            true, true, &configured);
   CHECK(resources.gather_read_wave_wrs && *resources.gather_read_wave_wrs == 64);
+  CHECK(resources.gather_address_groups_per_post == 9);
+  uint32_t groups{};
+  CHECK(ResolveGatherAddressGroupsPerPost(std::nullopt, nullptr, &groups) && groups == 3);
+  CHECK(ResolveGatherAddressGroupsPerPost(std::nullopt, "12", &groups) && groups == 12);
+  CHECK(ResolveGatherAddressGroupsPerPost(7, "12", &groups) && groups == 7);
+  CHECK(ResolveGatherAddressGroupsPerPost(3, "invalid", &groups) && groups == 3);
+  CHECK(ResolveGatherAddressGroupsPerPost(UINT32_MAX, nullptr, &groups) && groups == UINT32_MAX);
+  CHECK(ResolveGatherAddressGroupsPerPost(std::nullopt, "99999999999999999999999", &groups) && groups == UINT32_MAX);
+  CHECK(!ResolveGatherAddressGroupsPerPost(0, "12", &groups));
+  for (const char* value : {"", "0", "-1", "3x", "uniform:3"})
+    CHECK(!ResolveGatherAddressGroupsPerPost(std::nullopt, value, &groups));
   std::array<uint8_t, 64> memory{};
   execution::CacheRegionService service(execution::kUrma | execution::kFabric,
       [&](const execution::Request& q, std::unique_ptr<execution::Allocation>* out) {

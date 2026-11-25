@@ -53,11 +53,11 @@ struct PeerCandidateTable {
 
 struct CpuFeSelection {
   PeerCandidateInfo primary;
-  std::vector<PeerCandidateInfo> direct_get;
+  std::vector<PeerCandidateInfo> read_fes;
   bool explicit_devices{};
   uint32_t requested_count{};
 
-  Status ForDirectGet(uint64_t workers, std::vector<PeerCandidateInfo>* active) const;
+  Status ForWorkers(uint64_t workers, std::vector<PeerCandidateInfo>* active) const;
 };
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
@@ -100,10 +100,13 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   Status ReleaseRegion(uint64_t base);
   virtual Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes, PeerRegion* workspace);
+  Status PrepareGatherRoute(uint64_t workspace_base, uint32_t candidate, PeerRegion* route);
   Status PrepareGatherWindow(uint64_t region_base, uint64_t budget, uint32_t token_bytes,
                              uint32_t workers, PeerRegion* workspace, uint32_t* capacity);
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status EnableGatherLanesWithCapabilities(uint64_t region_base, uint64_t control_address,
+                                           uint32_t lanes, uint32_t& capabilities) const;
   Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
                         OpenCpuPushGetResponse* response) const;
   Status StartCpuPushGet(uint64_t region_base) const;
@@ -125,6 +128,14 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
       std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
       uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
       uint32_t* peer_psn, bool share_tp);
+  Status CreateChannel(
+      uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
+      uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
+      uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
+      std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
+      uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
+      uint32_t* peer_psn, bool share_tp,
+      uint32_t route_selector);
 
  private:
   struct ExecutionState;

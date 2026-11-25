@@ -2,17 +2,42 @@
 
 #include <limits.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 namespace kvaf::aicpu_urma {
 namespace {
 std::mutex kernel_mutex;
 aclrtBinHandle binary = nullptr;
 std::string loaded_path;
-std::unordered_map<std::string, aclrtFuncHandle> functions;
+struct KernelEntry {
+  const char* name;
+  std::atomic<aclrtFuncHandle> function{nullptr};
+};
+KernelEntry functions[] = {
+    {"KvafAicpuUmdkControlSessionsV5"}, {"KvafAicpuBatchPut"},
+    {"KvafAicpuGatherReadExecutionV5"}, {"KvafAicpuCpuPushScatterExecutionV4"}};
+
+aclrtFuncHandle ResolveFunction(const char* name) {
+  for (auto& entry : functions) {
+    if (std::strcmp(entry.name, name) != 0) continue;
+    auto function = entry.function.load(std::memory_order_acquire);
+    if (function) return function;
+    std::lock_guard<std::mutex> lock(kernel_mutex);
+    if (!binary) return nullptr;
+    function = entry.function.load(std::memory_order_relaxed);
+    if (!function) {
+      if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS || !function) return nullptr;
+      // The process keeps the loaded binary alive; published handles never change.
+      entry.function.store(function, std::memory_order_release);
+    }
+    return function;
+  }
+  return nullptr;
+}
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, aclrtStream stream,
                std::uint32_t blocks = 1U) {
   if (function == nullptr || arguments == nullptr || stream == nullptr) return -1;
@@ -76,35 +101,20 @@ Status PrepareUmdkKernel(const std::string& json, UmdkKernelKind kind) {
   const std::string context = "AICPU mode=" + std::string(mode) + " json=" + json;
   if (!LoadUmdkKernel(json.c_str()))
     return Status::Internal(context + ": failed to load installed device package");
-  std::lock_guard<std::mutex> lock(kernel_mutex);
   // Scatter uses its Host RA transport, not the AICPU URMA control session.
   for (const char* name : {kind == UmdkKernelKind::Scatter ? nullptr : "KvafAicpuUmdkControlSessionsV5",
                           entry}) {
     if (!name) continue;
-    if (functions.find(name) != functions.end()) continue;
-    aclrtFuncHandle function = nullptr;
-    if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS || !function)
+    if (!ResolveFunction(name))
       return Status::NotFound(context + ": missing kernel entry " + name +
           "; rebuild and reinstall the matching AICPU package, then restart the client");
-    functions.emplace(name, function);
   }
   return Status::OK();
 }
 int32_t LaunchUmdkKernel(const char* name, const void* args, std::size_t bytes, aclrtStream stream,
                          std::uint32_t blocks) {
   if (!name || !args) return -1;
-  aclrtFuncHandle function = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(kernel_mutex);
-    if (!binary) return -1;
-    auto found = functions.find(name);
-    if (found != functions.end())
-      function = found->second;
-    else {
-      if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS) return -1;
-      functions.emplace(name, function);
-    }
-  }
+  const auto function = ResolveFunction(name);
   return Launch(function, const_cast<void*>(args), bytes, stream, blocks);
 }
 }  // namespace kvaf::aicpu_urma
