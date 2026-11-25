@@ -93,6 +93,56 @@ Put 的 Key 回收、Get 的状态回传及逐字节核对均在计时之外。�
 终端输出 `AICPU_GATHER_RANGES_PERF_RESULT`，可通过 `--output-csv` 保存汇总。
 每个 worker 仍按请求数量切分，`worker_payload_bytes` 可用于判断负载倾斜或空闲。
 
+### 训练激活卸载带宽基线
+
+[aicpu_activation_offload_perf.py](../tests/python/aicpu_activation_offload_perf.py)
+用一次 Runtime 初始化模拟多个训练 step。每层按序 Put 各序列的激活，等前向全部
+写完后按层和序列的逆序用 `batch_get_ranges` 读回，并逐层释放 Key。每个序列的
+payload 是 `seq_len × bytes_per_token`。传多组 `--seq-lengths` 可以让 step 在不同
+形状间轮换。脚本在计时前后逐字节校验源和读回结果。
+
+加载 CANN 环境并启动提供 URMA 的 `kvaf_cpu_service` 后，在 A5 仓库根目录运行：
+
+```bash
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+python3 tests/python/aicpu_activation_offload_perf.py \
+  --peer 127.0.0.1:34555 --device 7 --workers 2 --layers 8 \
+  --seq-lengths 128 384 768 1024 --seq-lengths 1024 192 640 256 \
+  --bytes-per-token 4096 --slot-bytes 4194304 --allocation-mode fixed \
+  --warmup 1 --steps 5 --output-csv /tmp/kvaf_activation_offload.csv
+```
+
+将 `--bytes-per-token` 设为每层、每 rank 实际交给 KVAF 的每 token 激活字节数。
+示例每个 tensor 为 0.5 至 4 MiB，每个 step 每个方向的有效 payload 为 72 或 66 MiB。
+`--token-bytes` 默认 656，用于计算 staging，实际读取长度来自各序列的 `lengths`。
+`--dry-run` 可在无 NPU 时检查每个 worker 的负载及 staging、DDR、HBM 预算。
+
+| 字段 | 计时边界 |
+| --- | --- |
+| `initialize_us` | `link_to` 与初始化，包括启动探测 |
+| `cold` / `steady` | 首个业务 step / 读回校验和预热后的 step，各形状单独统计 |
+| `put` | 每 step 所有同步 Put 的总和，含注册缓存 miss、提交、等待和 Key 提交 |
+| `get_prepare_table` / `get_device_table` | 每 step 的 Host 建表与 NPU 建表开销 |
+| `get_submit` / `get_wait` | 每 step 的 Get 调用提交与其后的 stream 等待 |
+| `get_status_check` | stream 完成后额外检查 GatherRead 的状态，含状态 D2H 和同步 |
+| `get_completion` / `get_checked_completion` | 提交到 stream 完成 / 再加状态检查 |
+| `forward_wall` / `backward_wall` | 模拟前向及反向的卸载阶段墙钟时间，反向包含建表、状态检查和释放 |
+
+CSV 包含每一阶段的 p50、p90、p99 微秒和适用的有效 payload 带宽。
+`ACTIVATION_OFFLOAD_PASS` 表示所有形状的读回校验通过。脚本执行 eager 卸载和取回，
+用空闲 NPU stream 建立基线。训练计算、反向预取重叠和其他 rank 的资源竞争需在真实训练中对照。
+
+排查注册时，把命令改为 `--buffers per-layer` 与默认 `--buffers reuse` 比较。
+默认整个 step 复用同一个源和目标 HBM 范围。`per-layer` 给每层传不同的源地址范围，
+并用独立的目标 Tensor。两种模式都持有 HBM 到 Runtime 关闭，后续 step 可命中缓存。
+首轮差时同时含注册控制 kernel、等待与其他首次准备。
+
+排查小批次开销时，可以增加 `--get-group-size 1`，比较每条序列单独读回和默认每层
+一次 Get 的 `get_completion` 与 `backward_wall`。排查卡住时加 `--trace --steps 1`，
+看最后一条 `ACTIVATION_OFFLOAD_PHASE`。`get_wait` 包括 CPU gather、AICPU READ 和
+stream 上的依赖。训练里若 `d2hprocess` 阶段很长，要对照其入口和退出、它等待的
+stream/event 以及最后提交的 KVAF 操作，才能区分等待和实际 D2H 拷贝。
+
 ## 构建和启动
 
 当前控制协议使用版本 6，CPU 服务和 NPU 客户端使用配套版本构建并重启。
