@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-METRICS = ("mean_us", "p50_us", "p90_us", "p99_us", "mean_GBps", "p50_GBps", "p99_GBps", "mean_GiBps")
+METRICS = ("mean_us", "p50_us", "p90_us", "p99_us", "max_us", "mean_GBps", "p50_GBps", "p99_GBps", "mean_GiBps")
 SUMMARY_FIELDS = (
     "backend", "transport", "execution",
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
@@ -14,6 +14,8 @@ SUMMARY_FIELDS = (
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
+SAMPLE_FIELDS = ("backend", "execution", "sample", "e2e_us", "kernel_us", "outside_kernel_us",
+                 "e2e_timing_source", "kernel_timing_source")
 
 
 def write_csv(path, fields, rows):
@@ -32,6 +34,8 @@ class BatchGetCsv:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             directory = Path("reports/batch-get") / f"{stamp}-{args.backend}-d{args.device_id}"
         self.summary_path = directory / "summary.csv"
+        self.samples_path = directory / "samples.csv"
+        self.sample_rows = []
         self.summary_fields = SUMMARY_FIELDS
         if args.sgl_payload_only:
             self.summary_fields += tuple(f"sgl_payload_{metric}" for metric in
@@ -63,7 +67,20 @@ class BatchGetCsv:
         self.profile_rows.extend(dict(config, execution=execution, kind=kind, name=name, metric=metric, value=value)
                                  for kind, name, metric, value in details)
 
+    def add_samples(self, execution, samples, kernel_samples, e2e_source, kernel_source):
+        if len(samples) != len(kernel_samples):
+            raise ValueError("BatchGet paired sample count mismatch")
+        for sample, (e2e, kernel) in enumerate(zip(samples, kernel_samples)):
+            self.sample_rows.append(dict(
+                backend=self.config["backend"], execution=execution, sample=sample,
+                e2e_us=f"{e2e * 1000:.6f}", kernel_us=f"{kernel * 1000:.6f}",
+                outside_kernel_us=f"{(e2e - kernel) * 1000:.6f}",
+                e2e_timing_source=e2e_source, kernel_timing_source=kernel_source,
+            ))
+
     def write(self):
         write_csv(self.summary_path, self.summary_fields, self.summary_rows)
+        if self.sample_rows:
+            write_csv(self.samples_path, SAMPLE_FIELDS, self.sample_rows)
         if self.profile_path is not None:
             write_csv(self.profile_path, PROFILE_FIELDS, self.profile_rows)

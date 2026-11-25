@@ -232,11 +232,13 @@ def validate_sgl_payload_sample(workers, rows):
 
 def print_measurements(args, execution, samples, profiles, report=None):
     """Keep end-to-end and operator wall time distinct; count payload once."""
-    scopes = [("end_to_end", samples, "host_perf_counter")]
+    e2e_source = "npu_event" if execution == "graph" else "host_perf_counter"
+    scopes = [("end_to_end", samples, e2e_source)]
     if len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
-    scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
-                   "device_ns" if uses_aicpu(args) else "device_cycles"))
+    kernel_samples = [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles]
+    kernel_source = "device_ns" if uses_aicpu(args) else "device_cycles"
+    scopes.append(("kernel", kernel_samples, kernel_source))
     if args.sgl_payload_only:
         sgl_counts = {(p[0]["cpu_sgl_data_wrs"], p[0]["cpu_sgl_tail_cqes"]) for p in profiles}
         if len(sgl_counts) != 1:
@@ -253,6 +255,7 @@ def print_measurements(args, execution, samples, profiles, report=None):
         p50, p90, p99 = (percentile(durations, q) for q in (.5, .9, .99))
         metrics = dict(mean_us=f"{mean * 1000:.6f}", p50_us=f"{p50 * 1000:.6f}",
                        p90_us=f"{p90 * 1000:.6f}", p99_us=f"{p99 * 1000:.6f}",
+                       max_us=f"{max(durations) * 1000:.6f}",
                        mean_GBps=f"{payload / mean / 1e6:.6f}", p50_GBps=f"{payload / p50 / 1e6:.6f}",
                        p99_GBps=f"{payload / p99 / 1e6:.6f}", mean_GiBps=f"{payload / (mean / 1000) / 1024**3:.6f}")
         if scope == "sgl_payload":
@@ -275,6 +278,14 @@ def print_measurements(args, execution, samples, profiles, report=None):
         )
     if report is not None:
         report.add_summary(execution, measurements)
+        report.add_samples(execution, samples, kernel_samples, e2e_source, kernel_source)
+    if execution == "graph":
+        # Keep sample pairs intact: an Event outlier need not be a kernel outlier.
+        for sample in sorted(range(len(samples)), key=lambda i: samples[i], reverse=True)[:3]:
+            print(f"BATCH_GET_SLOW_SAMPLE backend={args.backend} execution=graph sample={sample} "
+                  f"e2e_us={samples[sample] * 1000:.6f} kernel_us={kernel_samples[sample] * 1000:.6f} "
+                  f"outside_kernel_us={(samples[sample] - kernel_samples[sample]) * 1000:.6f} "
+                  f"e2e_timing_source={e2e_source}", flush=True)
     if args.kernel_profile:
         details = [] if report is not None and report.profile_path is not None else None
         if args.backend == "aiv_cpu_sgl_write":
@@ -1202,7 +1213,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         kernel_profile_started = True
         print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
 
-        print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
+        print("BATCH_GET_TIMING_CONTRACT end_to_end_eager=call_to_device_completion "
+              "end_to_end_graph=stream_event_interval "
               "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "
               f"profile_overhead_included={int(kernel_profile_started)} detail_output_enabled={int(args.kernel_profile)} "
               f"eager_get_timing={args.get_timing} "

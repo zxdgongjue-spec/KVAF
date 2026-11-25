@@ -52,6 +52,18 @@ done 并执行可见性屏障后结束。异步调用仍须等待完成才可读
 设备 profile 的 `scatter_us`、`scatter_copies` 和 ready 查询数为零，最终等待计入 `ack_us`。
 CPU profile 的 `address_read_us` 包含本轮 output 描述读取/导入，`done_us` 包含释放。
 
+性能脚本中，eager 的 `scope=end_to_end` 使用 Host `perf_counter`，graph 则使用
+`start_event.record → graph.replay → end_event.record` 的 NPU Event 时间区间，
+对应 `timing_source=npu_event`。graph 结果包含事件之间 kernel 窗口以外的间隙，
+不能把 Event 与 kernel 时长之差全部归因于 Host 开销；先前输出中的
+`timing_source=host_perf_counter` 对 graph 是标签错误，数值本身来自 Event。
+
+每个 scope 输出 `max_us`。报告目录的 `samples.csv` 保存每轮配对的
+`e2e_us`、`kernel_us`、`outside_kernel_us` 和两种计时来源；sample 从 0 开始，
+已排除预热、输入更新、校验和 profile 读回。`outside_kernel_us` 仅为两种区间
+时长之差，不直接表示某个代码阶段。graph 另打印三条 `BATCH_GET_SLOW_SAMPLE`，
+按 Event 时长排序，同时保留对应轮次的 kernel 时长，便于定位长尾发生在哪个窗口。
+
 ## 构建和真机验证
 
 CPU 服务、NPU Host/Python 库须使用匹配版本重建并重启。首次引入直接输出时也须更新设备包。

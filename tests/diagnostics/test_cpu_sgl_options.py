@@ -16,6 +16,39 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_timing_sources_and_outliers_keep_iteration_pairs(self):
+        for backend, clock, timestamps, source in (
+            ("cpu_sgl_write", 500, (120_000, 140_000), "device_ns"),
+            ("aiv_cpu_sgl_write", 500, (60_000, 70_000), "device_cycles"),
+        ):
+            args = parse_args(["--backend", backend, "--kernel-profile-clock-mhz", str(clock)])
+            self.assertIsNone(validate_args(args))
+            for execution in ("eager", "graph"):
+                with self.subTest(backend=backend, execution=execution), tempfile.TemporaryDirectory() as directory:
+                    args.output_dir = Path(directory)
+                    report = BatchGetCsv(args)
+                    begin, end = (("device_start_ns", "device_finish_ns") if backend == "cpu_sgl_write" else
+                                  ("kernel_start_cycle", "kernel_finish_cycle"))
+                    profiles = [[{begin: 1_000_000, end: 1_000_000 + elapsed} for _ in range(args.parallelism)]
+                                for elapsed in timestamps]
+                    with redirect_stdout(StringIO()) as output:
+                        print_measurements(args, execution, [0.16, 5.4], profiles, report)
+                        report.write()
+                    e2e_source = "npu_event" if execution == "graph" else "host_perf_counter"
+                    self.assertIn(f"timing_source={e2e_source}", output.getvalue())
+                    if execution == "graph":
+                        self.assertIn("sample=1 e2e_us=5400.000000 kernel_us=140.000000 outside_kernel_us=5260.000000",
+                                      output.getvalue())
+                    with report.samples_path.open() as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual([row["sample"] for row in rows], ["0", "1"])
+                    self.assertEqual([float(row["kernel_us"]) for row in rows], [120, 140])
+                    self.assertEqual([float(row["outside_kernel_us"]) for row in rows], [40, 5260])
+                    self.assertTrue(all(row["e2e_timing_source"] == e2e_source and row["kernel_timing_source"] == source
+                                        for row in rows))
+                    with report.summary_path.open() as stream:
+                        self.assertEqual(next(csv.DictReader(stream))["e2e_max_us"], "5400.000000")
+
     def test_aiv_sgl_timeline_and_stages_share_one_cycle_window(self):
         start = 415_359_716_975_000
         worker = dict(core=0, kernel_start_cycle=start, kernel_finish_cycle=start + 120_000,
