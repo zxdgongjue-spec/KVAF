@@ -155,7 +155,7 @@ struct BatchGetExecutionOptions {
   std::uint64_t output_lease{0};
   // Scatter/Gather callers guarantee live contiguous, correctly typed NPU
   // tensors, valid indices/offsets, unique output rows and a valid stream.
-  // Gather uses eager submission; Scatter capture uses an ordinary graph lease.
+  // Capture uses a Get graph lease. Gather still validates tensor layout at capture.
   bool trusted_npu_request{false};
 };
 

@@ -17,7 +17,7 @@ std::vector<std::unique_ptr<std::string>> binaries;
 void Check(bool ok) { if (!ok) std::abort(); }
 constexpr char kDirect[] = "KvafExecuteBatchGetAivKernelV2";
 constexpr char kScatter[] = "KvafScatterBatchGetAivKernelV1";
-constexpr char kGather[] = "KvafGatherBatchGetAivKernelV10";
+constexpr char kGather[] = "KvafGatherBatchGetAivKernelV11";
 std::vector<std::string> launched;
 uint32_t failure_stage{};
 }
@@ -87,9 +87,9 @@ int main(int argc, char** argv) {
   }
   if (scenario == "wrong_symbol") {
     Check(KvafScatterBatchGetLoadKernel(gather.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
-    // V10 adds the trusted descriptor-head option; older kernels must be rebuilt.
+    // V11 advances the sequence on replay; older kernels must be rebuilt.
     for (const char* old : {"KvafGatherBatchGetAivKernelV1", "KvafGatherBatchGetAivKernelV2",
-                            "KvafGatherBatchGetAivKernelV3", "KvafGatherBatchGetAivKernelV4", "KvafGatherBatchGetAivKernelV5", "KvafGatherBatchGetAivKernelV6", "KvafGatherBatchGetAivKernelV7", "KvafGatherBatchGetAivKernelV8", "KvafGatherBatchGetAivKernelV9"}) {
+                            "KvafGatherBatchGetAivKernelV3", "KvafGatherBatchGetAivKernelV4", "KvafGatherBatchGetAivKernelV5", "KvafGatherBatchGetAivKernelV6", "KvafGatherBatchGetAivKernelV7", "KvafGatherBatchGetAivKernelV8", "KvafGatherBatchGetAivKernelV9", "KvafGatherBatchGetAivKernelV10"}) {
       std::ofstream(gather) << old;
       Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
     }

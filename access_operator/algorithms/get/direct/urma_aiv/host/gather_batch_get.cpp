@@ -52,7 +52,14 @@ class GatherBatchGet final : public SequentialBatchGet {
   Status Shutdown() override;
   Status SetGatherBatchGetProfiling(bool enabled) override;
   Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const override;
+  std::unique_ptr<ExecutionState> CreateExecutionState() override;
+  Status BindExecutionState(ExecutionState*) override;
+  Status PrepareGetGraph(const GetGraphOptions&) override;
+  Status CheckBatchGetStatus(void*) override;
+  Status FinishGetGraph(void*, bool discard) override;
+  bool GetGraphNeedsRecovery() const override;
  private:
+  struct GraphNode final : ExecutionState { bool recovery_fenced{}; };
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -77,6 +84,12 @@ struct GatherBatchGet::Impl {
   KvafBatchGetLocalBuffer* workspace_buffer{};
   KvafBatchGetLocalBuffer* output_buffer{};
   aclrtStream pending{};
+  GraphNode* node{};
+  struct Graph {
+    aclrtStream stream{};
+    uint64_t initial_sequence{}, output_entity{};
+    bool captured{};
+  } graph;
   uint64_t sequence{};
   bool gather_enabled{}, initialized{}, failed{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
@@ -89,6 +102,49 @@ struct GatherBatchGet::Impl {
         " sequence=" + std::to_string(sequence) + " phase=" + phase +
         " acl=" + std::to_string(code) + " probe=" + ProbeName(args.probe) +
         "; resources retained");
+  }
+
+  Status QueryCapture(aclrtStream stream, bool* capturing) const {
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI id = nullptr;
+    if (aclmdlRICaptureGetInfo(stream, &capture, &id) != ACL_SUCCESS)
+      return Error("query stream capture state");
+    *capturing = capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    return Status::OK();
+  }
+
+  Status ValidateLane(const KvafSequentialStatus& lane, uint32_t worker,
+                      uint64_t expected, uint64_t phase, uint64_t result) {
+    if (lane.magic == KVAF_SEQ_STATUS_MAGIC && lane.sequence == expected &&
+        lane.phase == phase && lane.result == result) return Status::OK();
+    failed = true;
+    return Status::Internal("AIV sequential BatchGet worker=" + std::to_string(worker) +
+        " sequence=" + std::to_string(expected) + " observed_sequence=" +
+        std::to_string(lane.sequence) + " phase=" + std::to_string(lane.phase) +
+        " result=" + std::to_string(lane.result) + " expected_phase=" +
+        std::to_string(phase) + " expected_result=" + std::to_string(result));
+  }
+
+  Status ReadGraphStatus(bool require_replay) {
+    const auto copied = aclrtMemcpyAsync(status_host, StatusBytes(), status_device,
+                                        StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, graph.stream);
+    if (copied != ACL_SUCCESS) { failed = true; return AclFailure("copy_graph_status", copied); }
+    const auto synchronized = aclrtSynchronizeStream(graph.stream);
+    if (synchronized != ACL_SUCCESS) { failed = true; return AclFailure("graph_synchronize", synchronized); }
+    const auto* lanes = static_cast<const KvafSequentialStatus*>(status_host);
+    const auto observed = lanes[0].sequence;
+    for (uint32_t i = 0; i < config.npu_core_count; ++i) {
+      auto status = ValidateLane(lanes[i], i, observed, KVAF_SEQ_COMPLETE, KVAF_SEQ_OK);
+      if (!status.ok()) return status;
+    }
+    if (observed < sequence || observed > UINT32_MAX) {
+      failed = true;
+      return Error("invalid Gather graph sequence");
+    }
+    if (require_replay && observed == graph.initial_sequence)
+      return Status::InvalidState("Gather graph has not been replayed");
+    sequence = observed;
+    return Status::OK();
   }
 
   Status Drain() {
@@ -133,16 +189,8 @@ struct GatherBatchGet::Impl {
     uint64_t completed_requests = 0, data_wrs = 0;
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
-      if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != expected_result ||
-          s.phase != expected_phase) {
-        failed = true;
-        return Status::Internal("AIV sequential BatchGet worker=" + std::to_string(i) +
-            " sequence=" + std::to_string(sequence) + " observed_sequence=" +
-            std::to_string(s.sequence) + " phase=" + std::to_string(s.phase) +
-            " result=" + std::to_string(s.result) +
-            " expected_phase=" + std::to_string(expected_phase) +
-            " expected_result=" + std::to_string(expected_result));
-      }
+      auto status = ValidateLane(s, i, sequence, expected_phase, expected_result);
+      if (!status.ok()) return status;
       const uint64_t expected_wrs = args.probe == KVAF_GATHER_PROBE_FIRST_READ ?
           std::min<uint64_t>(KVAF_GATHER_WRS_PER_POST,
               (s.requests + args.sgl_size - 1) / args.sgl_size) : 0;
@@ -209,6 +257,7 @@ struct GatherBatchGet::Impl {
   }
 
   Status Shutdown() {
+    if (graph.stream) return Status::Busy("release the Gather graph lease before shutdown");
     // Finish pending CPU work; on errors quiesce transports before freeing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
     failed = true;  // A partially closed transport cannot accept another Execute.
@@ -449,11 +498,86 @@ Status GatherBatchGet::DrainGet() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->Drain();
 }
+std::unique_ptr<ExecutionState> GatherBatchGet::CreateExecutionState() {
+  return std::make_unique<GraphNode>();
+}
+Status GatherBatchGet::BindExecutionState(ExecutionState* state) {
+  impl_->node = state && state->graph_node ? static_cast<GraphNode*>(state) : nullptr;
+  return Status::OK();
+}
+Status GatherBatchGet::PrepareGetGraph(const GetGraphOptions& options) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.initialized || s.failed || !s.node || s.graph.stream || s.pending ||
+      s.profiling || s.args.probe || s.sequence == UINT32_MAX)
+    return Status::InvalidState("Gather requires one graph lease on an idle provider without profiling or probes");
+  if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
+      !options.request_capacity || options.request_capacity > KVAF_SEQ_MAX_REQUESTS)
+    return Status::InvalidArgument("invalid Gather graph stream, output or capacity");
+  const auto stream = static_cast<aclrtStream>(options.stream);
+  bool capturing = false;
+  auto status = s.QueryCapture(stream, &capturing);
+  if (!status.ok()) return status;
+  if (capturing) return Status::InvalidState("prepare the Gather graph lease before capture");
+  auto* lanes = static_cast<KvafSequentialStatus*>(s.status_host);
+  for (uint32_t i = 0; i < s.config.npu_core_count; ++i)
+    lanes[i] = {KVAF_SEQ_STATUS_MAGIC, s.sequence, KVAF_SEQ_OK, KVAF_SEQ_COMPLETE, 0, 0, 0, 0};
+  const auto copied = aclrtMemcpy(s.status_device, s.StatusBytes(), s.status_host,
+                                 s.StatusBytes(), ACL_MEMCPY_HOST_TO_DEVICE);
+  if (copied != ACL_SUCCESS) return s.AclFailure("initialize_graph_status", copied);
+  uint64_t entity = 0;
+  if (KvafBatchGetLocalBufferAcquire(s.gather_transport, options.output.data, options.output.bytes,
+                                   &s.output_buffer, &entity)) return Error("register graph output");
+  s.graph = {stream, s.sequence, entity, false};
+  s.profile_valid = false;
+  return Status::OK();
+}
+Status GatherBatchGet::CheckBatchGetStatus(void* stream) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.node || !s.graph.captured || s.graph.stream != stream || s.failed)
+    return Status::InvalidState("check Gather replay using its captured graph lease and stream");
+  bool capturing = false;
+  auto status = s.QueryCapture(s.graph.stream, &capturing);
+  if (!status.ok()) return status;
+  if (capturing) return Status::InvalidState("finish Gather graph capture before checking replay");
+  return s.ReadGraphStatus(true);
+}
+Status GatherBatchGet::FinishGetGraph(void* stream, bool discard) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.node || !s.graph.stream || s.graph.stream != stream)
+    return Status::InvalidState("finish Gather using its prepared graph lease and stream");
+  if (s.failed && !discard) return Status::InvalidState("destroy and discard the failed Gather graph");
+  bool capturing = false;
+  auto status = s.QueryCapture(s.graph.stream, &capturing);
+  if (!status.ok()) return status;
+  if (capturing) return Status::InvalidState("finish Gather graph capture before releasing its lease");
+  if (s.graph.captured && !s.failed) {
+    status = s.ReadGraphStatus(false);
+    if (!status.ok() && !discard) return status;
+  }
+  if (s.failed) {
+    const auto synchronized = aclrtSynchronizeStream(s.graph.stream);
+    if (synchronized != ACL_SUCCESS) return s.AclFailure("discard_graph_synchronize", synchronized);
+    s.node->recovery_fenced = true;
+    // Shutdown quiesces the communication transport before releasing this registration.
+  } else {
+    KvafBatchGetLocalBufferRelease(s.output_buffer);
+    s.output_buffer = nullptr;
+  }
+  s.graph = {};
+  return Status::OK();
+}
+bool GatherBatchGet::GetGraphNeedsRecovery() const {
+  return impl_->node && impl_->node->recovery_fenced;
+}
 Status GatherBatchGet::SetGatherBatchGetProfiling(bool enabled) {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
   if (!enabled) { s.profiling = false; return Status::OK(); }
+  if (s.graph.stream) return Status::InvalidState("release the Gather graph lease before profiling");
   if (s.args.probe) return Status::InvalidState("gather prefix probes cannot collect performance profiles");
   auto result = s.Drain();
   if (!result.ok()) return result;
@@ -483,13 +607,33 @@ Status GatherBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
   if (s.failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
   if (!exec.request || !exec.execution.stream) return Status::InvalidArgument("BatchGet needs request and stream");
-  if (!exec.execution.trusted_npu_request) {
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
-      return Error("query stream capture state");
-    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
-      return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  const bool attach_graph = exec.execution.graph_lease != 0;
+  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  if (s.graph.stream && !attach_graph)
+    return Status::InvalidState("release the Gather graph lease before eager BatchGet");
+  if (attach_graph || !exec.execution.trusted_npu_request) {
+    bool capturing = false;
+    auto status = s.QueryCapture(stream, &capturing);
+    if (!status.ok()) return status;
+    if (attach_graph) {
+      if (!capturing || !s.node || s.graph.stream != stream || s.graph.captured || exec.execution.synchronize)
+        return Status::InvalidState("capture Gather with its unused graph lease and stream");
+      auto args = s.args;
+      status = Input(exec, s.config, &args.request);
+      if (!status.ok()) return status;
+      args.head_start = exec.execution.trusted_npu_request;
+      args.request.core_status = Ptr(s.status_device);
+      args.request.queue_state = Ptr(s.queues);
+      args.request.channel_entity = s.graph.output_entity;
+      args.sequence = 0;
+      s.graph.captured = true;
+      if (KvafGatherBatchGetLaunch(&args, stream)) {
+        s.failed = true;
+        return Status::CompletionUnknown("Gather graph launch failed; destroy and discard the graph");
+      }
+      return Status::OK();
+    }
+    if (capturing) return Status::InvalidState("use a Get graph lease for Gather capture");
   }
   if (s.profiling && !exec.execution.synchronize)
     return Status::InvalidArgument("gather profiling requires synchronize=True");

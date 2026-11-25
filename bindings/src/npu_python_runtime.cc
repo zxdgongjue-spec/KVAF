@@ -1301,9 +1301,13 @@ class NpuPythonRuntime final {
       if (device_status != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else {
         BatchGetProfileScope call(get_call_trace_ ? &host.core_call_ns : nullptr);
-        status = native_->core().BatchGet(
-            request, BatchGetExecutionOptions{acl_stream, synchronize, timings.get(), execution,
-                                              graph_lease, output_lease}, get_call_trace_ ? &host : nullptr);
+        BatchGetExecutionOptions options{acl_stream, synchronize, timings.get(), execution,
+                                         graph_lease, output_lease};
+        const auto& target = execution ? execution : selected;
+        options.trusted_npu_request = graph_lease && trusted_gather_inputs_ && target &&
+            target->transport == Transport::Urma && target->executor == Executor::Aiv &&
+            target->algorithm == GetAlgorithm::Gather;
+        status = native_->core().BatchGet(request, options, get_call_trace_ ? &host : nullptr);
       }
     }
     const auto owner_begin = get_call_trace_ ? BatchGetProfileNowNs() : 0;

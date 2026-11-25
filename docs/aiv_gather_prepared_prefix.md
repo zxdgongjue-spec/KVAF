@@ -156,7 +156,7 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 
 ## ABI 与兼容性
 
-- kernel `KvafGatherBatchGetAivKernelV10`，args 256 B；loader 拒绝 V1–V9。
+- kernel `KvafGatherBatchGetAivKernelV11`，args 256 B。V11 在图回放时由 AIV 推进请求序号，loader 拒绝旧内核。
 - profile PRF5、256 B；CSV schema 10。profile 直接写每核独占的 GM 记录。
 - GDR2：整批/普通 byte-prefix；GDR4：均分协作块；均为 48 B header + 16 B span 数组。
 - GDR5：CPU 继续接受固定 1/32 首块 + 4 尾块的旧格式。
@@ -171,7 +171,7 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 ## 验证边界
 
 原分支已有的模型、Host/loader 和 Python 回归及其构建目标保留，Gather 相关模型
-已适配当前 V10 和异步流程；生产 ABI 静态断言及 Python binding 构建后导入检查也保留。
+覆盖 V11 的异步执行与图回放序号。生产 ABI 静态断言及 Python binding 构建后导入检查也保留。
 真机功能入口、性能脚本及 CPU 日志分析工具继续保留，性能入口
 只依赖 `aiv_batch_get_common.py` 的路径解析与安全退出辅助函数。
 

@@ -74,7 +74,7 @@ void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
     KvafScatterBatchGetAivKernelV1(ScatterLaunchArgs(a));
   } else {
-    KvafGatherBatchGetAivKernelV10({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV11({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
@@ -745,7 +745,9 @@ struct Fixture {
     aiv_model::descriptor_begin = aiv_model::descriptor_end = 0;
     aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
   }
-  void Run(bool success = true, bool allow_partial = false) {
+  void Run(bool success = true, bool allow_partial = false, bool graph_replay = false) {
+    auto launch = args;
+    if (graph_replay) launch.sequence = 0;
     const auto cycles = aiv_model::cycle;
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
     const auto payload_cache_lines = aiv_model::payload_cache_lines;
@@ -773,7 +775,7 @@ struct Fixture {
       } else {
         launch_vf_begin = aiv_model::vf_calls;
       }
-      Launch(args);
+      Launch(launch);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
       if (success) {
@@ -1079,7 +1081,7 @@ int main() {
     } catch (const std::invalid_argument&) {
     }
   }
-  const auto& metadata = KvafGatherBatchGetAivKernelV10_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV11_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
   // Stage 1: WQEs precede the final ACK, but no payload READ does. Stage 2's
   // prefix gate must also submit a short ready slice of a 128-WR UB bank.
@@ -1295,6 +1297,23 @@ int main() {
     f.args.pipeline_chunk_bytes = 4096; f.DataQueueDepth(32768);
     f.Run(); // Profiling disabled: the production path must read no clocks.
     f.Next(1); f.Run();
+  }
+  // A captured argument buffer is reused across changing sizes, including empty lanes.
+  {
+    Fixture f(2051, 656, 2, KVAF_SEQ_GATHER, 5);
+    f.args.pipeline_chunk_bytes = 131072;
+    f.args.prepare_ahead = 1;
+    f.args.cooperative_chunks = 4;
+    f.args.first_chunk_divisor = 32;
+    f.args.head_start = 1;
+    f.DataQueueDepth(32768);
+    f.Run();  // Eager seeds the sequence used at capture.
+    for (uint32_t count : {2051U, 0U, 1U, 2051U}) {
+      f.Next(count);
+      f.Run(true, false, true);
+    }
+    f.Next(2051);
+    f.Run();
   }
   // Small SQ/CQ rings and readiness jumps still respect physical wave limits.
   for (uint32_t depth : {4U, 16U, 520U}) {

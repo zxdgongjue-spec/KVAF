@@ -2,7 +2,7 @@
 
 Gather 当前实现与配置见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)，
 性能与排障见 [Gather 性能与排障](aiv_gather_serial_profile.md)。
-部署使用最新 Gather V10 / args 256 B，并同步更新 CPU 服务、NPU Host 和 kernel。
+部署使用最新 Gather V11 / args 256 B，并同步更新 NPU Host 和 kernel。
 
 ## 数据通路
 
@@ -75,7 +75,7 @@ CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
 | 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，256 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV10` |
+| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV11` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的

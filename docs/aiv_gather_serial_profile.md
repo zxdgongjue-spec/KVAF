@@ -1,7 +1,7 @@
 # Gather 性能采集与排障
 
 当前实现、各阶段优化和配置合同见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)。
-以下统一使用 V10 / args 256 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
+以下使用 V11 / args 256 B / PRF5 256 B / CSV schema 10。
 
 ## 构建与入口
 
@@ -25,7 +25,7 @@ export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.
 python -u tests/python/test_aiv_gather_batch_get.py
 ```
 
-启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV10 args_bytes=256`。
+启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV11 args_bytes=256`。
 功能脚本校验 payload/guard、空批及重复调用；probe 结果不能当完整回归 PASS。
 环境变量在 Runtime 初始化时捕获，换组须新建 Runtime。
 
@@ -36,7 +36,7 @@ python -u tests/python/test_aiv_gather_batch_get.py
 ```python
 TOKEN_BYTES = 656          # 另测 4096
 REQUEST_COUNT = 8192       # 可比较 1024 / 8192 / 8193 / 65536
-GATHER_SGL_SIZE = 6        # 支持范围 1..6
+GATHER_SGL_SIZE = 5        # 支持范围 1..6
 WARMUP = 20
 ITERATIONS = 100           # 无 profile E2E；0 跳过
 PROFILE_SAMPLES = 10       # 独立同步诊断组；0 跳过
@@ -84,9 +84,17 @@ CPU profile 由远端服务的 KVAF_GATHER_PROFILE 单独控制，正式 E2E 关
 均在计时循环外。合并 SGE/小首块会在计时前采 profile 检查配置实际生效。
 
 无 profile 组调用 `synchronize=False`，再由 Python 同步至本批完成，不做状态 D2H；
-计时合同为 `async_call_to_stream_completion`。profile 组用同步调用，含 status/profile
+计时合同为 `async_call_to_device_completion`。profile 组用同步调用，含 status/profile
 D2H 和校验，合同为 `synchronous_call_with_status_check`，快照复制在外层计时之外。
 二者差值包含诊断回收成本，不能全归为设备打点开销。
+
+在同一配置下加 `--acl-graph` 测量 Gather READ 图模式。每张图捕获一个 Gather 节点，
+每次回放更新设备请求序号，并复用固定输入地址、已注册的输出和工作区。计时从回放提交到设备同步返回，
+状态检查在计时之外。每个 Gather provider 同时持有一个图租约，销毁图并释放租约后可继续 eager 调用。
+
+```bash
+python -u tests/python/test_aiv_gather_batch_get_perf.py --acl-graph
+```
 
 比较 direct 时对齐数据 Jetty 数：gather 每核仅一条数据 Jetty，控制 Jetty 不搬 payload。
 还须对齐软件在途预算、有效字节、统计量和计时范围；kernel-only 带宽不能直接比 E2E。

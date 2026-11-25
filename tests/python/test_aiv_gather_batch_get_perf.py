@@ -15,7 +15,7 @@ ITERATIONS = 100                # Profile OFF samples; 0 skips E2E for profile d
 PROFILE_SAMPLES = 10            # Profile ON: diagnostic stage samples, separately.
 TABLE_CAPACITY = 16_384         # Number of remote source blocks.
 TOKENS_PER_BLOCK = 128
-GATHER_SGL_SIZE = 6             # Supported range: 1..6.
+GATHER_SGL_SIZE = 5             # Supported range: 1..6.
 SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 128    # Setup only; does not change BatchGet request size.
@@ -23,6 +23,7 @@ CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
 RUN_LABEL = "gather_prepared_prefix"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
 
+import argparse
 import csv
 import math
 import os
@@ -320,7 +321,8 @@ def latency_summary(samples_us: Sequence[float], payload_bytes: int) -> dict[str
     }
 
 
-def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> dict[str, object]:
+def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
+                 graph: bool, profile_samples: int) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     local = now.astimezone(timezone(timedelta(hours=8)))
     revision, dirty = "", "unknown"
@@ -352,12 +354,13 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "configured_cooperative_chunks": configured_cooperative_chunks(),
         "configured_first_chunk_divisor": configured_first_chunk_divisor(),
         "trusted_gather_inputs": int(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1"),
-        "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
+        "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": profile_samples,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
         "cpu_profile": "external", "kernel_path": kernel, "put_kernel_path": put_kernel,
         "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR", ""),
-        "request_plan": "fixed_random", "timing_contract": "async_call_to_stream_completion",
+        "request_plan": "fixed_random", "execution": "graph" if graph else "eager",
+        "timing_contract": "graph_replay_to_device_completion" if graph else "async_call_to_device_completion",
     }
 
 
@@ -481,7 +484,14 @@ def token_pattern(torch, token_ids, token_bytes: int):
     return ((x * 37 + y * 13 + (y >> 3) + (x >> 8) * (y % 7)) % 251).to(torch.uint8)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--acl-graph", action="store_true",
+                        help="capture one Gather READ and time device completion after each replay")
+    args = parser.parse_args(argv)
+    if args.acl_graph and not ITERATIONS:
+        parser.error("--acl-graph requires ITERATIONS > 0")
+    profile_samples = 0 if args.acl_graph else PROFILE_SAMPLES
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
@@ -512,7 +522,8 @@ def main() -> int:
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware benchmark was requested but NPU Runtime is unavailable")
     coalesce = os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1"
-    if (PROFILE_SAMPLES or coalesce) and not all(hasattr(kvaf.NpuRuntime, method) for method in (
+    if (profile_samples or coalesce or configured_first_chunk_divisor()) and not all(
+        hasattr(kvaf.NpuRuntime, method) for method in (
         "start_gather_batch_get_profile", "gather_batch_get_profile", "stop_gather_batch_get_profile",
     )):
         raise RuntimeError("rebuild KVAF Host/Python and gather kernel for gather profiling")
@@ -531,21 +542,24 @@ def main() -> int:
         batch_get_max_inflight_total=0,
         trusted_gather_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1",
     )
-    metadata = csv_metadata(cores, device_id, kernel, put_kernel)
+    metadata = csv_metadata(cores, device_id, kernel, put_kernel, args.acl_graph, profile_samples)
     layout = metadata["output_layout"]
     samples_us, snapshots, profile_calls_us = [], [], []
+    graph = stream = None
+    graph_lease = 0
     try:
         runtime.link_to(endpoint)
         print(
-            f"GATHER_PERF_CONFIG mode=gather_read cores={cores} token_bytes={TOKEN_BYTES} "
+            f"GATHER_PERF_CONFIG mode=gather_read execution={metadata['execution']} "
+            f"cores={cores} token_bytes={TOKEN_BYTES} "
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"populate_chunk_entries={POPULATE_CHUNK_ENTRIES} "
             f"coalesce_sges={metadata['coalesce_sges']} "
             f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
             f"configured_first_chunk_divisor={metadata['configured_first_chunk_divisor']} "
-            f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={PROFILE_SAMPLES} "
-            "plan=fixed_random timing=async_call_to_stream_completion",
+            f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={profile_samples} "
+            f"plan=fixed_random timing={metadata['timing_contract']}",
             flush=True,
         )
         print("GATHER_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -622,18 +636,51 @@ def main() -> int:
             expected[rows_cpu[start:end].long()] = token_pattern(torch, source_ids[start:end], TOKEN_BYTES)
         if not torch.equal(output.cpu(), expected):
             raise AssertionError("gather correctness preflight payload/guard mismatch")
+
+        measure = batch_get
+        check_replay = None
+        if args.acl_graph:
+            stream = torch.npu.current_stream()
+            execution = kvaf.GetExecutionConfig("urma", "aiv", "gather")
+            graph_lease = runtime.begin_get_graph(execution, output, REQUEST_COUNT, stream)
+            graph = kvaf.AclGraph()
+            graph.capture_begin(stream)
+            runtime.batch_get(view, indices, offsets, miss_count, rows, output, stream=stream,
+                              synchronize=False, execution=execution, graph_lease=graph_lease)
+            graph.capture_end()
+
+            def measure():
+                graph.replay()
+                torch.npu.synchronize()
+
+            def check_replay():
+                runtime.check_batch_get_status(stream, execution=execution, graph_lease=graph_lease)
+
+            # Prove replay really overwrites payload, with guard rows preserved.
+            for replay in range(2):
+                output.fill_(0xAD)
+                torch.npu.synchronize()
+                measure()
+                check_replay()
+                if not torch.equal(output.cpu(), expected):
+                    raise AssertionError(f"Gather graph replay {replay + 1} payload/guard mismatch")
         print("GATHER_PERF_CORRECTNESS_PASS", flush=True)
 
         for _ in range(WARMUP):
-            batch_get()
+            measure()
+            if check_replay:
+                check_replay()
         for _ in range(ITERATIONS):
             begin = time.perf_counter_ns()
-            batch_get()
+            measure()
             samples_us.append((time.perf_counter_ns() - begin) / 1000)
+            if check_replay:
+                check_replay()
         if samples_us:
             result = latency_summary(samples_us, payload_bytes)
             print(
-                f"GATHER_PERF_RESULT profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
+                f"GATHER_PERF_RESULT execution={metadata['execution']} timing={metadata['timing_contract']} "
+                f"profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
                 f"mean_us={result['mean_us']:.3f} p50_us={result['p50_us']:.3f} "
                 f"p95_us={result['p95_us']:.3f} p99_us={result['p99_us']:.3f} "
                 f"useful_GiBps={result['useful_GiBps']:.3f} bandwidth_basis=p50_us",
@@ -641,11 +688,11 @@ def main() -> int:
             )
         else:
             print("GATHER_PERF_SKIPPED profile=off reason=iterations_zero", flush=True)
-        if PROFILE_SAMPLES:
-            print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={PROFILE_SAMPLES}", flush=True)
+        if profile_samples:
+            print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={profile_samples}", flush=True)
             runtime.start_gather_batch_get_profile()
             batch_get(checked=True)  # Warm the profiling path; exclude this sample.
-            for _ in range(PROFILE_SAMPLES):
+            for _ in range(profile_samples):
                 begin = time.perf_counter_ns()
                 batch_get(checked=True)
                 elapsed = (time.perf_counter_ns() - begin) / 1000
@@ -670,7 +717,22 @@ def main() -> int:
             print(f"GATHER_CSV_ERROR preserving original exception: {export_error}", file=sys.stderr)
         finally:
             # Keep all request/output tensors alive through transport shutdown.
-            shutdown_runtime(runtime)
+            try:
+                try:
+                    if graph is not None and graph.capturing:
+                        graph.capture_end()
+                finally:
+                    if graph is not None and graph.ready:
+                        graph.synchronize()
+                        graph.reset()
+                    if graph_lease:
+                        runtime.end_get_graph(graph_lease, stream, discard_result=original is not None)
+            except Exception as error:
+                if original is None:
+                    raise
+                print(f"GATHER_GRAPH_TEARDOWN_ERROR preserving original exception: {error}", file=sys.stderr)
+            finally:
+                shutdown_runtime(runtime)
 
 
 if __name__ == "__main__":

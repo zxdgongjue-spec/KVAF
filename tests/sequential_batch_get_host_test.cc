@@ -150,6 +150,7 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   if (a->probe) assert(!last_pipeline_chunk_bytes);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
+  if (!a->sequence) model.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterDeviceSequence;
   const auto rc = Launch(&model);
   if (a->probe && !old_probe_kernel && !kernel_result) {
     const auto args = *a;
@@ -686,6 +687,35 @@ int main() {
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
   unsetenv("KVAF_AIV_GATHER_CHECK_STATUS");
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    auto eager = exec;
+    eager.execution.synchronize = true;
+    assert(owner->ExecuteBatchGet(eager).ok() && sequences.back() == 1);
+    auto node = owner->CreateExecutionState();
+    node->graph_node = true;
+    assert(owner->BindExecutionState(node.get()).ok());
+    const GetGraphOptions options{request.output, exec.execution.stream,
+                                  static_cast<uint32_t>(request.indices.bytes / sizeof(int32_t))};
+    assert(owner->PrepareGetGraph(options).ok());
+    assert(!owner->ExecuteBatchGet(eager).ok() && !owner->Shutdown().ok());
+    auto capture = exec;
+    capture.execution.synchronize = false;
+    capture.execution.graph_lease = 1;
+    capturing = true;
+    assert(owner->ExecuteBatchGet(capture).ok() && sequences.back() == 0);
+    capturing = false;
+    auto replay = std::move(work.back());
+    work.pop_back();
+    assert(!owner->CheckBatchGetStatus(options.stream).ok());
+    work.push_back(std::move(replay));
+    assert(owner->CheckBatchGetStatus(options.stream).ok());
+    assert(owner->FinishGetGraph(options.stream, false).ok());
+    assert(owner->BindExecutionState(nullptr).ok());
+    assert(owner->ExecuteBatchGet(eager).ok() && sequences.back() == 3);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
   allow_queued_launches = true;
   exec.execution.synchronize = false;
   {
