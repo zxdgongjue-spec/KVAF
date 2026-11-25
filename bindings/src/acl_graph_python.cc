@@ -63,6 +63,7 @@ class AclGraph final {
   AclGraph& operator=(const AclGraph&) = delete;
 
   void CaptureBegin(const py::object& stream) {
+    Use use(in_use_);
     if (capturing_) {
       throw py::value_error("ACLGraph capture is already active");
     }
@@ -79,6 +80,7 @@ class AclGraph final {
   }
 
   void CaptureEnd() {
+    Use use(in_use_);
     if (!capturing_) {
       throw py::value_error("ACLGraph capture is not active");
     }
@@ -99,9 +101,8 @@ class AclGraph final {
   }
 
   void Replay(const py::object& stream) const {
-    if (capturing_ || graph_ == nullptr) {
-      throw py::value_error("ACLGraph has no completed capture to replay");
-    }
+    Use use(in_use_);
+    RequireReplayable();
     // The no-argument path uses the native capture stream directly. The caller
     // submits/fences input producers before replay; no torch task-queue getter
     // or Python stream conversion is needed here.
@@ -113,20 +114,49 @@ class AclGraph final {
                     "aclmdlRIExecuteAsync");
   }
 
-  void Synchronize(const py::object& stream) const {
+  float ReplayTimed() {
+    Use use(in_use_);
+    RequireReplayable();
+    if (start_event_ == nullptr) {
+      ThrowIfAclError(
+          aclrtCreateEventWithFlag(&start_event_, ACL_EVENT_TIME_LINE),
+          "aclrtCreateEventWithFlag start");
+    }
+    if (end_event_ == nullptr) {
+      ThrowIfAclError(
+          aclrtCreateEventWithFlag(&end_event_, ACL_EVENT_TIME_LINE),
+          "aclrtCreateEventWithFlag end");
+    }
+    timed_pending_ = true;
+    ThrowIfAclError(aclrtRecordEvent(start_event_, stream_), "aclrtRecordEvent start");
+    ThrowIfAclError(aclmdlRIExecuteAsync(graph_, stream_), "aclmdlRIExecuteAsync");
+    ThrowIfAclError(aclrtRecordEvent(end_event_, stream_), "aclrtRecordEvent end");
+    {
+      py::gil_scoped_release release;
+      ThrowIfAclError(aclrtSynchronizeEvent(end_event_), "aclrtSynchronizeEvent");
+    }
+    timed_pending_ = false;
+    float milliseconds = 0;
+    ThrowIfAclError(aclrtEventElapsedTime(&milliseconds, start_event_, end_event_),
+                    "aclrtEventElapsedTime");
+    return milliseconds;
+  }
+
+  void Synchronize(const py::object& stream) {
+    Use use(in_use_);
     if (capturing_ || graph_ == nullptr ||
         (!stream.is_none() && acl_python::StreamFromPython(stream) != stream_)) {
       throw py::value_error(
           "ACLGraph synchronize requires a completed graph and its capture stream");
     }
-    ThrowIfAclError(aclrtSynchronizeStream(stream_),
-                    "aclrtSynchronizeStream");
+    SynchronizeStream();
   }
 
   void CopyHostToDeviceAsync(std::uint64_t destination,
                              std::size_t destination_bytes,
                              const py::buffer& source,
                              const py::object& stream) const {
+    Use use(in_use_);
     if (capturing_ || graph_ == nullptr) {
       throw py::value_error(
           "ACLGraph async input copy requires a completed graph capture");
@@ -158,11 +188,17 @@ class AclGraph final {
   }
 
   void Reset() {
+    Use use(in_use_);
     if (capturing_) {
       throw py::value_error(
           "ACLGraph capture is active; call capture_end before reset");
     }
     if (graph_ != nullptr) {
+      if (timed_pending_) {
+        SynchronizeStream();
+      }
+      DestroyTimingEvent(start_event_);
+      DestroyTimingEvent(end_event_);
       ThrowIfAclError(aclmdlRIDestroy(graph_), "aclmdlRIDestroy");
       graph_ = nullptr;
       stream_ = nullptr;
@@ -174,7 +210,54 @@ class AclGraph final {
   bool Ready() const { return graph_ != nullptr; }
 
  private:
+  class Use {
+   public:
+    explicit Use(bool& in_use) : in_use_(in_use) {
+      if (in_use_) {
+        throw py::value_error("ACLGraph is in use by another call");
+      }
+      in_use_ = true;
+    }
+    ~Use() { in_use_ = false; }
+
+    Use(const Use&) = delete;
+    Use& operator=(const Use&) = delete;
+
+   private:
+    bool& in_use_;
+  };
+
+  void RequireReplayable() const {
+    if (capturing_ || graph_ == nullptr) {
+      throw py::value_error("ACLGraph has no completed capture to replay");
+    }
+    if (timed_pending_) {
+      throw py::value_error("ACLGraph timed replay is unfinished; call synchronize first");
+    }
+  }
+
+  void SynchronizeStream() {
+    ThrowIfAclError(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+    timed_pending_ = false;
+  }
+
+  static void DestroyTimingEvent(aclrtEvent& event) {
+    if (event != nullptr) {
+      ThrowIfAclError(aclrtDestroyEvent(event), "aclrtDestroyEvent");
+      event = nullptr;
+    }
+  }
+
   void ResetNoThrow() {
+    if (timed_pending_) {
+      (void)aclrtSynchronizeStream(stream_);
+    }
+    if (start_event_ != nullptr) {
+      (void)aclrtDestroyEvent(start_event_);
+    }
+    if (end_event_ != nullptr) {
+      (void)aclrtDestroyEvent(end_event_);
+    }
     if (capturing_) {
       aclmdlRI ignored_graph = nullptr;
       (void)aclmdlRICaptureEnd(stream_, &ignored_graph);
@@ -192,8 +275,12 @@ class AclGraph final {
 
   aclmdlRI graph_{nullptr};
   aclrtStream stream_{nullptr};
+  aclrtEvent start_event_{nullptr};
+  aclrtEvent end_event_{nullptr};
   py::object stream_owner_{py::none()};
   bool capturing_{false};
+  bool timed_pending_{false};
+  mutable bool in_use_{false};
 };
 
 }  // namespace
@@ -209,6 +296,9 @@ void BindAclGraph(py::module_& module) {
            "Submit through aclmdlRIExecuteAsync. Omitting stream uses the retained native "
            "capture stream; the caller must submit/fence input producers before replay. "
            "Passing stream preserves the torch stream getter fence and identity check.")
+      .def("replay_timed", &AclGraph::ReplayTimed,
+           "Replay on the native capture stream and return device event elapsed milliseconds. "
+           "The caller must submit/fence input producers before replay.")
       .def("synchronize", &AclGraph::Synchronize, py::arg("stream") = py::none(),
            "Wait through aclrtSynchronizeStream on the native capture stream.")
       .def("copy_host_to_device_async", &AclGraph::CopyHostToDeviceAsync,

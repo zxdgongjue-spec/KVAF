@@ -30,6 +30,10 @@ class GetGraph:
         else:
             self.graph.replay()
 
+    def replay_timed(self):
+        # GraphInputs.prepare has already fenced the input producers.
+        return self.graph.replay_timed()
+
     def synchronize(self):
         self.stream.synchronize()
 

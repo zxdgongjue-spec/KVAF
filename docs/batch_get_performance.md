@@ -42,6 +42,10 @@ UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 
 Graph 的 E2E 使用同一 stream 上 replay 前后两个 NPU Event 的间隔，
 资源准备、输入更新及同步、输出校验和 profile 读取均在计时外。
+AICPU Scatter 的单卡图基准默认用 `--graph-api acl --acl-graph-submit native`，
+由一次原生调用记录起始 Event、提交图并记录结束 Event。使用
+`--graph-api acl --acl-graph-submit python` 可在同一 ACL 图上对照 Python Event 提交。
+`BATCH_GET_RESULT` 的 `timing_source` 会标明采用的方式。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
 Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-profile` 还验证

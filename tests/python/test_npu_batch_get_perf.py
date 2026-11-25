@@ -80,7 +80,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--execution", choices=("eager", "graph", "both"), default="eager")
     parser.add_argument("--graph", dest="execution", action="store_const", const="graph",
                         help="shorthand for --execution graph")
-    parser.add_argument("--graph-api", choices=("acl", "torch"), default="torch")
+    parser.add_argument("--graph-api", choices=("acl", "torch"),
+                        help="graph API (default: acl for AICPU Scatter, torch otherwise)")
+    parser.add_argument("--acl-graph-submit", choices=("native", "python"),
+                        help="ACL graph timing submission (default: native for AICPU Scatter, python otherwise)")
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
     parser.add_argument("--multi-graph-check", action="store_true",
@@ -96,6 +99,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     configure_backend_help(parser, argv)
     args = parser.parse_args(argv)
     resolve_backend(args, parser)
+    if args.graph_api is None:
+        args.graph_api = "acl" if args.backend == "cpu_push_scatter" and args.execution != "eager" else "torch"
+    if args.acl_graph_submit is not None and (args.graph_api != "acl" or args.execution == "eager"):
+        parser.error("--acl-graph-submit requires ACL graph execution")
+    if args.acl_graph_submit is None:
+        args.acl_graph_submit = "native" if args.backend == "cpu_push_scatter" else "python"
     return args
 
 
@@ -190,9 +199,9 @@ def print_aicpu_details(args, execution, samples, details=None):
                           metrics, details, "worker", worker)
 
 
-def print_measurements(args, execution, samples, profiles, report=None):
+def print_measurements(args, execution, samples, profiles, report=None, *, e2e_timing_source="host_perf_counter"):
     """Keep end-to-end and operator wall time distinct; count payload once."""
-    scopes = [("end_to_end", samples, "host_perf_counter")]
+    scopes = [("end_to_end", samples, e2e_timing_source)]
     if len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
@@ -403,28 +412,42 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             check(plan, count, graph.leases[0])
 
         validate_graph_inputs(graph, inputs, check_captured, args.miss_count, args.graph_replays)
-        start_event = torch.npu.Event(enable_timing=True)
-        end_event = torch.npu.Event(enable_timing=True)
-        start_event.record(stream)
-        end_event.record(stream)
-        end_event.synchronize()
-        for iteration in range(args.warmup):
-            inputs.prepare(args.miss_count)
-            graph.replay()
-            graph.synchronize()
-            check_captured(inputs.fixed, args.miss_count)
-        durations, profiles = [], []
-        for iteration in range(args.iterations):
-            inputs.prepare(args.miss_count)
+        native_submit = args.graph_api == "acl" and args.acl_graph_submit == "native"
+        if native_submit:
+            timed_replay = graph.replay_timed
+            timing_source = "acl_event_native"
+        else:
+            start_event = torch.npu.Event(enable_timing=True)
+            end_event = torch.npu.Event(enable_timing=True)
             start_event.record(stream)
-            graph.replay()
             end_event.record(stream)
             end_event.synchronize()
-            durations.append(float(start_event.elapsed_time(end_event)))
+            timing_source = "torch_npu_event"
+
+            def timed_replay():
+                start_event.record(stream)
+                graph.replay()
+                end_event.record(stream)
+                end_event.synchronize()
+                return float(start_event.elapsed_time(end_event))
+
+        warmup = max(1, args.warmup) if native_submit else args.warmup
+        for _ in range(warmup):
+            inputs.prepare(args.miss_count)
+            if native_submit:
+                timed_replay()  # Allocate the native timing events before measurement.
+            else:
+                graph.replay()
+                graph.synchronize()
+            check_captured(inputs.fixed, args.miss_count)
+        durations, profiles = [], []
+        for _ in range(args.iterations):
+            inputs.prepare(args.miss_count)
+            durations.append(timed_replay())
             check_captured(inputs.fixed, args.miss_count)
             profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
         graph.validated = True
-        print_measurements(args, "graph", durations, profiles, report)
+        print_measurements(args, "graph", durations, profiles, report, e2e_timing_source=timing_source)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
               "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
 
