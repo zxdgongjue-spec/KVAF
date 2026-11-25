@@ -28,6 +28,9 @@ void RunMailbox(uint32_t count, uint32_t sge, bool fail_suffix = false, bool inv
   Transport transport;
   assert(transport.Initialize(&context, &src, base, QueryTp, ImportJetty, 1, &reply.base, 0, &setup, &reply).ok());
   assert(reply.mailbox_bytes == layout.staging && reply.segment_bytes == sizeof(urma_seg_t) && reply.control.bytes == 28);
+  urma_seg_t mailbox_segment{};
+  std::memcpy(&mailbox_segment, reply.segment, sizeof(mailbox_segment));
+  assert(mailbox_segment.attr.bs.access == 6U); // Remote READ/WRITE, no LOCAL_ONLY.
   const auto mailbox = reply.mailbox_base;
   assert(mailbox != base.hbm_base);
   const auto head = std::min(count, kPipelineHeadRows);

@@ -118,6 +118,12 @@ CPU profiling 输出 `CPU_SGL_PUSH_PROFILE`：`descriptor_reads=0`、`ready_wrs=
 这些阶段可嵌套并与 DMA 重叠，不能相加作为 kernel 时间。
 设备 profile 的 scatter 和 ready 查询均为零，ack 包含 CPU 数据传输和完成等待。
 
+若在 `CPU_PUSH_INIT stage=register_control` 后报注册失败，先确认 CPU 服务已包含
+mailbox 权限修复：新 mailbox 注册使用 `READ | WRITE`（access=6）。URMA 的
+`LOCAL_ONLY`（bit 0）不能与远端权限组合，WRITE 注册还要求 READ；access=5 会被拒绝。
+开放 READ 权限是注册约束，设备推送路径仍不发起描述符 READ。
+此修复只改 CPU 服务，更新后重建 CPU 并重启服务即可，测试命令保持不变。
+
 ## 本地验证边界
 
 ```bash
@@ -129,6 +135,7 @@ KVAF_TEST_URMA_INCLUDE_DIR=/path/to/umdk/include \
 ASan/UBSan、GM 独立地址空间编译、Host 声明检查及 Python 配置回归。
 新模型检查实际 AIV WQE 编码/拆分/SQ-CQ 回绕、多轮 sequence、部分/空请求、
 head/suffix 错误、等待 done、零描述符 READ、head CQE 未收齐时提交 suffix，以及
-在途 WR/SGE 不被复用。没有 UMDK 头文件时跳过 CPU 传输模型和原生 UMDK 语法检查。
+在途 WR/SGE 不被复用，并模拟 URMA 注册权限的互斥和依赖校验。
+没有 UMDK 头文件时跳过 CPU 传输模型和原生 UMDK 语法检查。
 
 这些检查不替代 CANN/ccec 编译、真实 DMA 可见性、注册退役及 NPU 图回放验证。

@@ -110,15 +110,20 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   cfg.len = bytes;
   cfg.token_id = control_token_;
   cfg.token_value.token = setup.token_value;
-  // This pinned buffer receives local READ results and supplies local WRITE
-  // payloads. Use the probe's direct-host registration, not remote DDR flags.
+  // READ mode uses a local-only buffer. Device-push mode exposes the mailbox
+  // to remote WRITEs: LOCAL_ONLY is exclusive, and WRITE also requires READ.
   cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-  cfg.flag.bs.access = device_push_ ? (1U | (1U << 2U)) : 1U; // Mailbox also accepts remote WRITE.
+  cfg.flag.bs.access = device_push_ ? ((1U << 1U) | (1U << 2U)) : 1U;
   cfg.flag.bs.non_pin = 0;
   cfg.flag.bs.token_id_valid = 1;
   Stage("register_control");
   control_ = urma_register_seg(context_, &cfg);
-  if (!control_) return Error("register control buffer");
+  if (!control_) {
+    const auto code = errno;
+    return Status::Internal("CPU push: register control buffer (access=" + std::to_string(cfg.flag.bs.access) +
+        ", flags=" + std::to_string(cfg.flag.value) + ", bytes=" + std::to_string(cfg.len) +
+        ", errno=" + std::to_string(code) + ": " + std::strerror(code) + ")");
+  }
   std::uint64_t cpu_tp = 0;
   Stage("query_ctp");
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");

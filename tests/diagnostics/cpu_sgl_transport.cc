@@ -4,6 +4,7 @@
 #include "urma_device_abi.h"
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -62,9 +63,18 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attributes) 
 urma_token_id_t* urma_alloc_token_id(urma_context_t*) { return new urma_token_id_t{}; }
 urma_status_t urma_free_token_id(urma_token_id_t* token) { delete token; return URMA_SUCCESS; }
 urma_target_seg_t* urma_register_seg(urma_context_t*, urma_seg_cfg_t* config) {
+  // Public UMDK rejects LOCAL_ONLY combined with remote access, and WRITE
+  // without READ. Enforce provider validation before simulating registration.
+  const auto access = config->flag.bs.access;
+  if (((access & 1U) && (access & 14U)) || ((access & 4U) && !(access & 2U)) ||
+      ((access & 8U) && (access & 6U) != 6U)) {
+    errno = EINVAL;
+    return nullptr;
+  }
   auto* segment = new urma_target_seg_t{};
   segment->seg.ubva.va = config->va;
   segment->seg.len = config->len;
+  segment->seg.attr.bs.access = access;
   ++segments;
   return segment;
 }
