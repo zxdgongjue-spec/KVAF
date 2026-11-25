@@ -43,7 +43,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      setup.output_mode > kPipelinedOutput ||
+      setup.output_mode > kChunkedOutput ||
       setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode == kScatterOutput) ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode != kScatterOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
@@ -58,7 +58,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   token_bytes_ = setup.token_bytes;
   direct_output_ = setup.output_mode != kScatterOutput;
   payload_only_ = setup.output_mode == kPayloadOnlyOutput;
-  pipeline_ = setup.output_mode == kPipelinedOutput;
+  chunked_ = setup.output_mode == kChunkedOutput;
+  pipeline_ = chunked_ || setup.output_mode == kPipelinedOutput;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
@@ -268,13 +269,15 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_ ||
-      r.mode != (direct_output_ ? kDirectOutput : kScatterOutput))
+      r.mode != (chunked_ ? kChunkedOutput : direct_output_ ? kDirectOutput : kScatterOutput))
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
   const bool detail = (payload_only_ || pipeline_) && profile_.enabled;
   batch_result_ = Result::kOk;
   head_count_ = pipeline_ ? static_cast<std::uint32_t>(r.reserved_words[0]) : 0;
-  if (pipeline_ && (r.reserved_words[0] != std::min(r.count, kPipelineHeadRows) || !head_count_))
+  if (chunked_ && (r.reserved_words[0] != kChunkRows || !r.count))
+    return Status::InvalidArgument("invalid CPU SGL chunk size");
+  if (pipeline_ && !chunked_ && (r.reserved_words[0] != std::min(r.count, kPipelineHeadRows) || !head_count_))
     return Status::InvalidArgument("invalid CPU SGL pipeline head");
   Status read;
   if (!pipeline_) {
@@ -314,7 +317,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     }
     if (!output_remote_) return Error("import output segment");
   }
-  if (pipeline_) {
+  if (pipeline_ && !chunked_) {
     {
       BatchGetProfileScope stage(detail ? &profile_.address_list_read_ns : nullptr);
       read = Transfer(false, layout_.descriptor, std::uint64_t{head_count_} * 8);
@@ -392,7 +395,9 @@ void Transport::SealPrepared(PreparedWrite& plan) {
     q.posts.back().end_sge = local;
     q.wrs.back().flag.bs.complete_enable = 1;
     q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
-    plan.fences[plan.fence_count++] = {index, q.wrs.size(), 0};
+    // Preserve the probe's conservative SGE budget across concurrent chunks,
+    // rather than applying that limit only within an individual plan.
+    plan.fences[plan.fence_count++] = {index, chunked_ ? std::max(q.wrs.size(), q.local.size()) : q.wrs.size(), 0};
   }
 }
 Status Transport::PrepareWrites(std::uint32_t count) {
@@ -404,17 +409,20 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   }
   prepared_.clear();
   head_waves_ = 0;
-  const auto phases = pipeline_ && head_count_ < count ? 2U : 1U;
+  chunk_plans_.clear();
+  const auto phases = chunked_ ? (count + kChunkRows - 1) / kChunkRows : pipeline_ && head_count_ < count ? 2U : 1U;
   for (std::uint32_t phase = 0; phase < phases; ++phase) {
+    const auto first_plan = static_cast<std::uint32_t>(prepared_.size());
     std::array<std::vector<PreparedQueue>, kJettyCount> shards;
     const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
     for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
       auto& waves = shards[queue];
       waves.emplace_back();
-      ForEachPipelineChunk(count, token_bytes_, workers_,
-        [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
+      const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
           auto shard = JettyRange(range, queue);
-          if (pipeline_) {
+          if (chunked_) {
+            shard = JettyRange({phase * kChunkRows, std::min(count, (phase + 1) * kChunkRows)}, queue);
+          } else if (pipeline_) {
             shard.begin = std::max(shard.begin, phase == 0 ? 0U : head_count_);
             shard.end = std::min(shard.end, phase == 0 ? head_count_ : count);
             if (shard.begin >= shard.end) return;
@@ -462,7 +470,9 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
           AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                          8, 1, true);
-        });
+        };
+      if (chunked_) append(phase % workers_, phase / workers_, {});
+      else ForEachPipelineChunk(count, token_bytes_, workers_, append);
     }
     std::size_t waves = 0;
     for (const auto& shard : shards) waves = std::max(waves, shard.size());
@@ -473,6 +483,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       SealPrepared(*plan);
       if (plan->fence_count) prepared_.push_back(std::move(plan));
     }
+    if (chunked_) chunk_plans_.push_back({first_plan, static_cast<std::uint32_t>(prepared_.size())});
     if (!phase) head_waves_ = static_cast<std::uint32_t>(prepared_.size());
   }
   prepared_count_ = count;
@@ -514,13 +525,14 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
     *marker->value = Progress(request().sequence, marker->progress);
 
 }
-Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
+Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, bool* accepted) {
   for (const auto& q : queues_)
     if (q.poisoned || q.pending) return Error("queue unavailable");
   bool submitted = false;
   auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
   if (!status.ok()) return status;
-  if (!submitted) return Error("drained queue has insufficient credits");
+  if (accepted) *accepted = submitted;
+  if (!submitted) return accepted ? Status::OK() : Error("drained queue has insufficient credits");
   for (std::size_t i = 0; i < plan.fence_count; ++i) {
     const auto& fence = plan.fences[i];
     plan.queues[fence.queue].wrs.back().user_ctx = fence.context;
@@ -565,7 +577,8 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
   }
   return Status::OK();
 }
-Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
+Status Transport::PollAnyPrepared(std::uint64_t* completed, Profile* profile, bool wait) {
+  *completed = 0;
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
   std::uint32_t polls = 0;
   for (;;) {
@@ -585,21 +598,25 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
           if (cr.status != URMA_CR_SUCCESS) {
             queues_[q].poisoned = true; return Error("prepared CQ status");
           }
-          std::uint64_t completed = 0;
-          auto status = tracker_.Complete(q, cr.user_ctx, &completed);
+          auto status = tracker_.Complete(q, cr.user_ctx, completed);
           if (!status.ok()) { queues_[q].poisoned = true; return status; }
-          if (completed && completed != id) return Error("unexpected prepared completion");
-          *finished = completed != 0;
+          *finished = *completed != 0;
           return Status::OK();
         });
     next_poll_queue_ = (next_poll_queue_ + 1) % kJettyCount;
     if (!status.ok()) return status;
-    if (count) return Status::OK();
+    if (count || !wait) return Status::OK();
     if ((++polls & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
       for (auto& q : queues_) q.poisoned = true;
       return Error("prepared CQ timeout; resources retained");
     }
   }
+}
+Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
+  std::uint64_t completed = 0;
+  auto status = PollAnyPrepared(&completed, profile, true);
+  if (status.ok() && completed != id) return Error("unexpected prepared completion");
+  return status;
 }
 Status Transport::WritePayloadOnly() {
   payload_sample_ = {};
@@ -720,6 +737,116 @@ Status Transport::WritePipeline() {
   return Status::OK();
 }
 
+Status Transport::WriteChunks() {
+  auto* p = profile_.enabled ? &profile_ : nullptr;
+  const auto count = request().count;
+  const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+  constexpr std::uint32_t kWindow = 4;  // Bounded even for split-token, multi-wave chunks.
+  std::array<std::uint32_t, kMaxWorkers> published{};
+  std::vector<bool> posted(chunks);
+  std::uint32_t submitted_chunks = 0, inflight = 0, prefetched = chunks;
+  std::uint64_t prefetch_start = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+  auto poll = [&](bool wait) -> Status {
+    std::uint64_t completed = 0;
+    BatchGetProfileScope timer(p ? &p->chunk_cq_wait_ns : nullptr);
+    auto status = PollAnyPrepared(&completed, p, wait);
+    if (status.ok() && completed) {
+      if (completed > prepared_.size() || !inflight) return Error("unexpected chunk completion");
+      --inflight;
+    }
+    return status;
+  };
+  while (submitted_chunks < chunks && batch_result_ == Result::kOk) {
+    std::uint32_t next = prefetched;
+    if (next == chunks) for (std::uint32_t c = 0; c < chunks; ++c)
+      if (!posted[c] && published[c % workers_] > c / workers_) { next = c; break; }
+    if (next == chunks) {
+      {
+        BatchGetProfileScope timer(p ? &p->chunk_ready_ns : nullptr);
+        auto status = Transfer(false, layout_.ready, workers_ * sizeof(Ready));
+        if (!status.ok()) return status;
+        if (p) ++p->progress_reads;
+      }
+      for (std::uint32_t w = 0; w < workers_; ++w) {
+        const auto token = reinterpret_cast<const Word*>(memory_ + layout_.ready)[w].value;
+        const auto sequence = token >> 32;
+        if (sequence < request().sequence) continue;
+        if (sequence > request().sequence) { batch_result_ = Result::kSequenceError; break; }
+        const auto progress = static_cast<std::uint32_t>(token);
+        if (progress & kChunkFailed) {
+          const auto error = progress & ~kChunkFailed;
+          batch_result_ = error >= std::uint32_t(Result::kInvalidRequest) && error <= std::uint32_t(Result::kCopyError)
+              ? static_cast<Result>(error) : Result::kInvalidRequest;
+          break;
+        }
+        const auto owned = chunks / workers_ + (w < chunks % workers_ ? 1U : 0U);
+        if (progress > owned || progress < published[w]) { batch_result_ = Result::kInvalidRequest; break; }
+        published[w] = progress;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) batch_result_ = Result::kTimeout;
+      // Reap without waiting for an unpublished chunk; another producer may be ready.
+      bool ready = false;
+      for (std::uint32_t c = 0; c < chunks; ++c)
+        ready |= !posted[c] && published[c % workers_] > c / workers_;
+      if (inflight && !ready) { auto status = poll(false); if (!status.ok()) return status; }
+      continue;
+    }
+    const auto begin = next * kChunkRows, end = std::min(count, begin + kChunkRows);
+    {
+      const auto reading = prefetched != chunks ? prefetch_start : p ? BatchGetProfileNowNs() : 0;
+      auto status = prefetched != chunks ? Status::OK() :
+          BeginControlRead(layout_.descriptor + std::uint64_t{begin} * 8, std::uint64_t{end - begin} * 8);
+      if (status.ok()) status = Wait(control_queue_);
+      if (p) p->chunk_read_ns += BatchGetProfileNowNs() - reading;
+      prefetched = chunks;
+      if (!status.ok()) return status;
+    }
+    if (!ValidateSources(begin, end).ok()) { batch_result_ = Result::kInvalidRequest; break; }
+    // Read the next known-ready descriptor slice while refreshing/posting this
+    // chunk. Each READ lands in its own stable slice of the registered mirror.
+    for (std::uint32_t c = 0; c < chunks; ++c) {
+      if (c == next || posted[c] || published[c % workers_] <= c / workers_) continue;
+      const auto first = c * kChunkRows, last = std::min(count, first + kChunkRows);
+      prefetch_start = p ? BatchGetProfileNowNs() : 0;
+      auto status = BeginControlRead(layout_.descriptor + std::uint64_t{first} * 8, std::uint64_t{last - first} * 8);
+      if (!status.ok()) return status;
+      prefetched = c;
+      break;
+    }
+    const auto plans = chunk_plans_[next];
+    for (auto w = plans.begin; w < plans.end; ++w) {
+      auto& plan = *prepared_[w];
+      bool accepted = false;
+      while (!accepted) {
+        if (inflight < kWindow) {
+          auto status = BeginPrepared(plan, w + 1, &accepted);
+          if (!status.ok()) return status;
+        }
+        if (!accepted) {
+          if (!inflight) return Error("chunk exceeds drained queue credits");
+          auto status = poll(true);
+          if (!status.ok()) return status;
+        }
+      }
+      // Every plan owns independent WR/SGE storage, retained through its tail CQEs.
+      {
+        BatchGetProfileScope timer(p ? &p->chunk_submit_ns : nullptr);
+        auto status = PostPrepared(plan, true, p);
+        if (!status.ok()) return status;
+      }
+      ++inflight;
+      if (p) p->max_inflight = std::max(p->max_inflight, inflight);
+    }
+    posted[next] = true;
+    ++submitted_chunks;
+    if (p) ++p->chunks;
+  }
+  // An invalid later chunk cannot retire imports or publish done over prior DMA.
+  while (inflight) { auto status = poll(true); if (!status.ok()) return status; }
+  return Status::OK();
+}
+
 Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   Status status;
@@ -729,6 +856,7 @@ Status Transport::WriteBatch() {
   }
   if (!status.ok()) return status;
   if (payload_only_) return WritePayloadOnly();
+  if (chunked_) return WriteChunks();
   if (pipeline_) return WritePipeline();
   // Match the ordered-WRITE probe: short submissions to all four queues from
   // their owner, then poll their tails together. Avoid waking an OpenMP team
@@ -759,6 +887,7 @@ Status Transport::WriteBatch() {
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
+  if (control_queue_.pending) return Error("control READ is still in flight");
   // No imported output survives done. Host may unregister/release it as soon
   // as the kernel observes completion; cached plans are retargeted next round.
   if (output_remote_) {
@@ -786,6 +915,26 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
 
 void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
+  if (chunked_) {
+    const auto& p = profile_;
+    std::fprintf(stderr,
+        "CPU_SGL_CHUNK_PROFILE sequence=%" PRIu64 " rows=%u chunk_rows=%u chunks=%u"
+        " notify_read_us=%.3f header_read_us=%.3f output_import_us=%.3f plan_us=%.3f"
+        " first_post_us=%.3f chunk_ready_us=%.3f chunk_read_us=%.3f chunk_submit_us=%.3f chunk_cq_wait_us=%.3f"
+        " address_validate_us=%.3f source_sge_update_us=%.3f target_update_us=%.3f"
+        " output_unimport_us=%.3f done_post_us=%.3f done_cq_wait_us=%.3f cpu_total_us=%.3f"
+        " progress_reads=%u max_inflight=%u data_wrs=%u ready_wrs=0 post_calls=%u waves=%u tail_cqes=%u plan_reused=%u result=%u\n",
+        request().sequence, request().count, kChunkRows, p.chunks,
+        p.notify_read_ns / 1000.0, p.header_read_ns / 1000.0, p.output_import_ns / 1000.0,
+        (p.prepare_writes_ns - p.target_update_ns) / 1000.0,
+        (p.first_post_ns ? p.first_post_ns - p.cpu_start_ns : 0) / 1000.0,
+        p.chunk_ready_ns / 1000.0, p.chunk_read_ns / 1000.0, p.chunk_submit_ns / 1000.0, p.chunk_cq_wait_ns / 1000.0,
+        p.address_validate_ns / 1000.0, p.source_sge_update_ns / 1000.0, p.target_update_ns / 1000.0,
+        p.output_unimport_ns / 1000.0, p.done_post_ns / 1000.0, p.done_cq_wait_ns / 1000.0, p.cpu_total_ns / 1000.0,
+        p.progress_reads, p.max_inflight, p.data_wrs, p.post_calls, p.waves, p.tail_cqes,
+        unsigned(p.plan_reused), unsigned(batch_result_));
+    return;
+  }
   if (pipeline_) {
     const auto& p = profile_;
     std::fprintf(stderr,

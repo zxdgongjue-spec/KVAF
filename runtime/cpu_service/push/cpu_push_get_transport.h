@@ -41,6 +41,8 @@ class Transport {
     std::uint64_t output_unimport_ns{}, done_post_ns{}, done_cq_wait_ns{};
     std::uint64_t head_submit_ns{}, head_cq_wait_ns{}, suffix_wait_ns{}, suffix_read_ns{};
     std::uint64_t suffix_submit_ns{}, suffix_cq_wait_ns{};
+    std::uint64_t chunk_ready_ns{}, chunk_read_ns{}, chunk_submit_ns{}, chunk_cq_wait_ns{};
+    std::uint32_t chunks{}, progress_reads{}, max_inflight{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
   } profile_;
@@ -77,14 +79,16 @@ class Transport {
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
-  Status BeginPrepared(PreparedWrite&, std::uint64_t id);
+  Status BeginPrepared(PreparedWrite&, std::uint64_t id, bool* submitted = nullptr);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr,
                       std::uint64_t* first_post_ns = nullptr);
   Status WritePayloadOnly();
   Status WritePipeline();
+  Status WriteChunks();
   Status ValidateSources(std::uint32_t begin, std::uint32_t end);
   Status BeginControlRead(std::uint64_t offset, std::uint64_t bytes);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
+  Status PollAnyPrepared(std::uint64_t* completed, Profile* profile, bool wait);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
   Status Post(Queue&);
@@ -95,6 +99,7 @@ class Transport {
   std::array<Queue, kJettyCount> queues_;
   Queue control_queue_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
+  std::vector<Range> chunk_plans_;
   PreparedWrite done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
@@ -107,6 +112,7 @@ class Transport {
   bool direct_output_{};
   bool payload_only_{};
   bool pipeline_{};
+  bool chunked_{};
   Result batch_result_{Result::kOk};
   CpuSglWriteSample payload_sample_{};
   urma_target_seg_t* control_{};

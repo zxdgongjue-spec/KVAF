@@ -1000,7 +1000,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} aicpu_workers={args.aicpu_workers} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
             f"sge_per_wr={args.sge_per_wr} "
-            f"sgl_pipeline={int(args.sgl_pipeline)} "
+            f"sgl_pipeline={int(args.sgl_pipeline)} sgl_pipeline_mode={'chunked' if args.sgl_pipeline else 'disabled'} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "

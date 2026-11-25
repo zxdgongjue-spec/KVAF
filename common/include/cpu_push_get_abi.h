@@ -23,6 +23,12 @@ constexpr std::uint64_t kSuffixNotifyOffset = 72;
 // Host launch hint in KernelArgs::sequence; device tickets still own the real
 // request sequence. Existing Hosts initialize this field to zero.
 constexpr std::uint64_t kPipelineLaunch = std::uint64_t{1} << 62;
+// Chunked direct output uses the otherwise unused direct-output Ready lines:
+// one device producer per line, Progress(sequence, completed local chunks).
+// Global chunk c belongs to worker c % workers. The high progress bit reports
+// failure instead of a count; previously published chunks may be in flight.
+constexpr std::uint32_t kChunkedOutput = 4, kChunkFailed = 1U << 31;
+constexpr std::uint64_t kChunkPipelineLaunch = std::uint64_t{1} << 61;
 struct alignas(64) OutputTarget {
   std::uint64_t base{}, bytes{};
   std::uint32_t token_value{}, segment_bytes{};
@@ -48,7 +54,8 @@ struct alignas(64) Completion {
   CpuSglWriteSample cpu_sgl_write{};
   std::uint64_t reserved[5]{};
 };
-// CPU owns all four words; each Jetty updates only its own 8-byte progress.
+// Scatter: CPU owns all four words; each Jetty updates its own progress.
+// Chunked direct output: device worker owns the entire line, publishing word 0.
 struct alignas(64) Ready { std::uint64_t jetty[kJettyCount]{}, reserved[4]{}; };
 struct alignas(64) Coordination {
   // Cumulative counts/epochs, initialized once per transport. result retains

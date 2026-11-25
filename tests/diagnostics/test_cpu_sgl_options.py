@@ -56,7 +56,9 @@ class CpuSglOptionsTest(unittest.TestCase):
                 report.add_summary("eager", {})
                 report.write()
                 with report.summary_path.open() as source:
-                    self.assertEqual(next(csv.DictReader(source))["sgl_pipeline"], "1")
+                    row = next(csv.DictReader(source))
+                    self.assertEqual(row["sgl_pipeline"], "1")
+                    self.assertEqual(row["sgl_pipeline_mode"], "chunked")
             both = parse_args(["--backend", backend, "--sgl-pipeline", "--sgl-payload-only"])
             self.assertIn("--sgl-pipeline", validate_args(both))
         for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):

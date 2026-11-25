@@ -440,7 +440,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.workers = s.config.workers;
   open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
   if (s.config.sgl_payload_only) open.output_mode = kPayloadOnlyOutput;
-  if (s.config.sgl_pipeline) open.output_mode = kPipelinedOutput;
+  if (s.config.sgl_pipeline) open.output_mode = kChunkedOutput;
   open.sge_per_wr = s.config.sge_per_wr;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
@@ -569,7 +569,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.status = detail::PointerValue(view.completion.device);
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
-  if (view.sgl_pipeline) args.sequence = kPipelineLaunch;
+  if (view.sgl_pipeline) args.sequence = kChunkPipelineLaunch;
   const CpuSglWriteArgs direct_args{args, view.output_target};
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = call.last_stream = stream;

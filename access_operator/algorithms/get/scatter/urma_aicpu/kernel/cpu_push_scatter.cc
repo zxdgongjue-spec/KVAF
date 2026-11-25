@@ -43,6 +43,7 @@ struct Execution {
   std::uint64_t start, timeout;
   BatchGetWorkerProfile* profile;
   bool pipeline{};
+  bool chunked{};
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   void Relax(bool check_remote = true) {
@@ -134,11 +135,12 @@ struct Execution {
     const auto head = std::min(*count, kPipelineHeadRows);
     const auto build_range = !pipeline ? *range : !worker ? Range{0, head} :
         Range{std::max(range->begin, head), std::max(range->end, head)};
-    if (!FillSources(build_range)) return false;
+    if (!chunked && !FillSources(build_range)) return false;
     if (!worker) {
       auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
       *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, direct ? kDirectOutput : kScatterOutput, {}};
       if (pipeline) header->reserved_words[0] = head;
+      if (chunked) { header->mode = kChunkedOutput; header->reserved_words[0] = kChunkRows; }
       if (direct)
         *reinterpret_cast<OutputTarget*>(Memory() + layout.output_target) = *output_target;
     }
@@ -154,7 +156,8 @@ struct Execution {
 };
 }  // namespace
 
-static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target, bool pipeline = false) {
+static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target,
+                                    bool pipeline = false, bool chunked = false) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
@@ -172,12 +175,40 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   Execution io{*args, output_target, layout, c, CounterNow(),
-      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline};
+      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked};
   std::uint32_t count = 0;
   Range range{};
   if (io.Status() == Result::kPending && !io.Build(worker, &count, &range))
     Fail(c, Result::kInvalidRequest);
   bool head_notified = false;
+  if (chunked) {
+    range = {};
+    const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+    auto* progress = reinterpret_cast<Word*>(io.Memory() + layout.ready) + worker;
+    std::uint32_t completed = 0;
+    for (auto chunk = worker; chunk < chunks; chunk += args->workers) {
+      const Range part{chunk * kChunkRows, std::min(count, (chunk + 1) * kChunkRows)};
+      range.end += part.end - part.begin;
+      if (io.Status() != Result::kPending) continue;
+      {
+        BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
+        if (!io.FillSources(part)) Fail(c, Result::kInvalidRequest);
+        Barrier();
+      }
+      if (io.Status() != Result::kPending) continue;
+      Store(*progress, Progress(args->sequence, ++completed));
+      Barrier();
+      if (!worker && !head_notified) {
+        io.Notify();
+        head_notified = true;
+        Store(c.published, args->sequence);
+      }
+    }
+    if (io.Status() != Result::kPending)
+      Store(*progress, Progress(args->sequence, kChunkFailed | std::uint32_t(io.Status())));
+    else if (!completed) Store(*progress, Progress(args->sequence, 0));
+    Barrier();
+  }
   if (pipeline && !worker && count && io.Status() == Result::kPending) {
     io.Notify();
     head_notified = true;
@@ -191,14 +222,14 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
   if (!worker) {
     const bool built = io.Wait(c.built, target, false);
-    if (head_notified) {
+    if (head_notified && !chunked) {
       const auto result = io.Status() == Result::kPending && built ? Result::kOk : io.Status();
       auto* suffix = reinterpret_cast<Word*>(io.Memory() + layout.notify);
       __atomic_store_n(&suffix->reserved[0], Progress(args->sequence, std::uint32_t(result)), __ATOMIC_RELEASE);
       Barrier();
     }
     if (built && io.Status() == Result::kPending) {
-      if (count && !pipeline) io.Notify();
+      if (count && !pipeline && !chunked) io.Notify();
       Store(c.published, args->sequence);
     }
   } else {
@@ -258,6 +289,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
 }
 std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) { return ExecuteCpuPush(args, nullptr); }
 std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
-  return args ? ExecuteCpuPush(&args->execution, &args->output_target, (args->execution.sequence & kPipelineLaunch) != 0) : 1;
+  return args ? ExecuteCpuPush(&args->execution, &args->output_target,
+      (args->execution.sequence & kPipelineLaunch) != 0, (args->execution.sequence & kChunkPipelineLaunch) != 0) : 1;
 }
 }  // namespace kvaf::cpu_push

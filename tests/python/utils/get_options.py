@@ -97,7 +97,7 @@ def add_backend_arguments(parser, *, sweep=False):
                        default=environment_int("KVAF_BATCH_GET_PERF_SGE_PER_WR", 0),
                        help="maximum source SGEs per WRITE WR; cpu_sgl_write/aiv_cpu_sgl_write (0=auto, 1..16)")
     group.add_argument("--sgl-pipeline", action="store_true",
-                       help="overlap a 1024-row head WRITE with suffix construction; CPU SGL Write backends only")
+                       help="pipeline 1024-row chunks through construction, descriptor READ and concurrent WRITEs; CPU SGL Write backends only")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")

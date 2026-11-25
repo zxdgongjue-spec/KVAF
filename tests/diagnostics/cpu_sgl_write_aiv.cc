@@ -74,9 +74,9 @@ struct Fixture {
     }
     const auto* request = reinterpret_cast<Request*>(workspace.data());
     assert(request->magic == kMagic && request->sequence == sequence && request->count == uint32_t(count));
-    assert(request->mode == kDirectOutput && request->workers == args.execution.workers);
+    assert(request->mode == ((args.execution.sequence & kChunkPipelineLaunch) ? kChunkedOutput : kDirectOutput) && request->workers == args.execution.workers);
     assert(request->token_bytes == kBytes);
-    assert(request->reserved_words[0] == ((args.execution.sequence & kPipelineLaunch) ? std::min(uint32_t(count), kPipelineHeadRows) : 0U));
+    assert(request->reserved_words[0] == ((args.execution.sequence & kChunkPipelineLaunch) ? kChunkRows : (args.execution.sequence & kPipelineLaunch) ? std::min(uint32_t(count), kPipelineHeadRows) : 0U));
     for (uint32_t i = 1; i < 4; ++i) assert(request->reserved_words[i] == 0);
     const auto* target = reinterpret_cast<OutputTarget*>(args.execution.workspace + layout.output_target);
     assert(target->base == args.execution.output && target->bytes == output.size());
@@ -85,6 +85,16 @@ struct Fixture {
     assert(!std::memcmp(target->segment, args.output_target.segment, kOutputSegmentBytes));
   }
   void Complete(uint64_t sequence, Result result = Result::kOk) {
+    if (args.execution.sequence & kChunkPipelineLaunch) {
+      const auto chunks = (uint32_t(count) + kChunkRows - 1) / kChunkRows;
+      const auto deadline = std::chrono::steady_clock::now() + 5s;
+      for (uint32_t w = 0; w < args.execution.workers; ++w) {
+        const auto owned = chunks / args.execution.workers + (w < chunks % args.execution.workers ? 1U : 0U);
+        if (result != Result::kOk) continue;
+        while (sgl_model::Load(args.execution.workspace + layout.ready + uint64_t(w) * 64) != Progress(sequence, owned))
+          assert(std::chrono::steady_clock::now() < deadline);
+      }
+    }
     if ((args.execution.sequence & kPipelineLaunch)) {
       const auto deadline = std::chrono::steady_clock::now() + 5s;
       while ((sgl_model::Load(args.execution.workspace + kSuffixNotifyOffset) >> 32) != sequence)
@@ -132,9 +142,9 @@ struct Fixture {
 };
 }
 int main() {
-  for (bool pipeline : {false, true}) for (uint32_t workers : {1U, 4U, 8U}) {
+  for (uint64_t mode : {uint64_t(0), kPipelineLaunch, kChunkPipelineLaunch}) for (uint32_t workers : {1U, 4U, 5U, 8U}) {
     Fixture f(workers);
-    f.args.execution.sequence = pipeline ? kPipelineLaunch : 0;
+    f.args.execution.sequence = mode;
     uint64_t sequence = 0;
     for (uint32_t count : {9001U, 7U, 0U, 1U, 4097U}) {
       f.count = count; ++sequence;
@@ -197,6 +207,43 @@ int main() {
   {
     Fixture f(4); f.count = 1; f.args.execution.timeout_ms = 1;
     auto work = f.Launch(); f.Check(work, 1, Result::kTimeout);
+  }
+  {
+    Fixture f(1); f.args.execution.sequence = kChunkPipelineLaunch; f.count = kCapacity;
+    f.rows[7000] = -1;
+    auto work = f.Launch(); f.WaitNotify(1);
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!(uint32_t(sgl_model::Load(f.args.execution.workspace + f.layout.ready)) & kChunkFailed))
+      assert(std::chrono::steady_clock::now() < deadline);
+    assert(work[0].wait_for(1ms) == std::future_status::timeout);
+    f.Complete(1, Result::kInvalidRequest);
+    f.Check(work, 1, Result::kInvalidRequest);
+  }
+  {
+    Fixture f(4); f.args.execution.sequence = kChunkPipelineLaunch; f.count = kCapacity;
+    std::memset(reinterpret_cast<void*>(f.args.execution.workspace + f.layout.descriptor), 0xff, uint64_t(kCapacity) * 8);
+    sgl_model::pause_row = 4 * kChunkRows;
+    sgl_model::paused = false; sgl_model::resume = false;
+    auto work = f.Launch(); f.WaitNotify(1);
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!sgl_model::paused.load()) assert(std::chrono::steady_clock::now() < deadline);
+    assert(sgl_model::Load(f.args.execution.workspace + f.layout.ready) == Progress(1, 1));
+    const auto* descriptors = reinterpret_cast<uint64_t*>(f.args.execution.workspace + f.layout.descriptor);
+    assert(descriptors[4 * kChunkRows] == UINT64_MAX); // Later chunk is still unpublished.
+    for (uint32_t i = 0; i < kChunkRows; ++i)
+      assert(descriptors[i] == f.addresses[f.indices[i]] + uint32_t(f.offsets[i]));
+    sgl_model::resume = true;
+    f.Complete(1); f.Check(work, 1, Result::kOk);
+    sgl_model::pause_row = UINT32_MAX;
+  }
+  {
+    Fixture f(5); f.args.execution.sequence = kChunkPipelineLaunch; f.count = kCapacity;
+    f.args.execution.profile = 0;
+    auto work = f.Launch(); f.WaitNotify(1); f.Complete(1);
+    for (auto& w : work) { assert(w.wait_for(5s) == std::future_status::ready); w.get(); }
+    for (const auto& status : f.statuses) assert(status.result == uint64_t(Result::kOk));
+    const auto* bytes = reinterpret_cast<const uint8_t*>(f.profiles.data());
+    for (uint64_t i = 0; i < f.profiles.size() * sizeof(f.profiles[0]); ++i) assert(bytes[i] == 0xa5);
   }
   assert(sgl_model::descriptor_copies > 0);
   std::cout << "AIV CPU SGL kernel model passed\n";

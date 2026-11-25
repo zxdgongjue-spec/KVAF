@@ -20,13 +20,21 @@
 
 namespace {
 using kvaf::urma::Sge;
-std::uint32_t device_sges = 13, queue_sges{}, data_wrs{}, data_sges{}, segments{};
+std::uint32_t device_sges = 13, device_message = 65536, queue_sges{}, data_wrs{}, data_sges{}, segments{};
 std::uint64_t output_base{}, output_bytes{}, done_address{};
 std::uint32_t ready_wrs{}, data_tails{};
 bool delay_output_import{};
 std::function<void()> publish_suffix;
 std::uint64_t head_bytes{}, head_written{}, suffix_descriptor{};
 bool saw_async_suffix_read{};
+std::function<void(std::uint64_t, std::uint32_t)> chunk_read, chunk_write;
+bool retain_chunk_storage{};
+urma_jfc_t* last_read_cq{};
+using Checks = std::vector<std::function<void()>>;
+std::map<urma_jfc_t*, Checks> unfenced;
+std::map<std::pair<urma_jfc_t*, std::uint64_t>, Checks> retained;
+std::map<urma_jfc_t*, std::size_t> pending_sges, unfenced_sges;
+std::map<std::pair<urma_jfc_t*, std::uint64_t>, std::size_t> fenced_sges;
 std::map<urma_jfc_t*, std::deque<std::uint64_t>> completions;
 int QueryTp(urma_context_t*, kvaf::urma::TpQuery*, std::uint32_t* count, kvaf::urma::TpInfo* info) {
   *count = 1; info->tp_handle = 1; return 0;
@@ -46,7 +54,7 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attributes) 
   auto& value = *reinterpret_cast<kvaf::urma::UbDeviceAttributes*>(attributes);
   value = {};
   value.dev_cap.max_jfs_sge = device_sges;
-  value.dev_cap.max_msg_size = 65536;
+  value.dev_cap.max_msg_size = device_message;
   return URMA_SUCCESS;
 }
 urma_token_id_t* urma_alloc_token_id(urma_context_t*) { return new urma_token_id_t{}; }
@@ -106,6 +114,31 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
       assert(!publish_suffix && pending_data > 0);  // Head CQEs have not been drained.
       saw_async_suffix_read = true;
     }
+    if (wr->opcode == URMA_OPC_READ) last_read_cq = queue->jetty_cfg.jfs_cfg.jfc;
+    if (chunk_read && wr->opcode == URMA_OPC_READ) chunk_read(src[0].addr, src[0].len);
+    const bool data = wr->opcode == URMA_OPC_WRITE && dst->addr >= output_base && dst->addr < output_base + output_bytes;
+    if (retain_chunk_storage && data) {
+      auto* cq = queue->jetty_cfg.jfs_cfg.jfc;
+      pending_sges[cq] += wr->rw.src.num_sge;
+      unfenced_sges[cq] += wr->rw.src.num_sge;
+      assert(pending_sges[cq] <= 8192);
+      const auto saved = *wr;
+      const std::vector<Sge> sources(src, src + wr->rw.src.num_sge);
+      const auto destination = *dst;
+      unfenced[queue->jetty_cfg.jfs_cfg.jfc].push_back([wr, saved, src, dst, sources, destination] {
+        assert(wr->next == saved.next && wr->user_ctx == saved.user_ctx);
+        assert(wr->rw.src.sge == saved.rw.src.sge && wr->rw.dst.sge == saved.rw.dst.sge);
+        for (std::size_t i = 0; i < sources.size(); ++i)
+          assert(src[i].addr == sources[i].addr && src[i].len == sources[i].len && src[i].tseg == sources[i].tseg);
+        assert(dst->addr == destination.addr && dst->len == destination.len && dst->tseg == destination.tseg);
+      });
+      if (wr->flag.bs.complete_enable) {
+        fenced_sges[{cq, wr->user_ctx}] = unfenced_sges[cq];
+        unfenced_sges.erase(cq);
+        retained[{queue->jetty_cfg.jfs_cfg.jfc, wr->user_ctx}] = std::move(unfenced[queue->jetty_cfg.jfs_cfg.jfc]);
+        unfenced.erase(queue->jetty_cfg.jfs_cfg.jfc);
+      }
+    }
     std::uint32_t bytes = 0;
     for (std::uint32_t i = 0; i < wr->rw.src.num_sge; ++i) {
       assert(src[i].addr >= src[i].tseg->seg.ubva.va);
@@ -117,6 +150,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
     if (wr->opcode == URMA_OPC_WRITE && dst->addr >= output_base && dst->addr < output_base + output_bytes) {
       assert(wr->rw.src.num_sge <= queue_sges);
       ++data_wrs; data_sges += wr->rw.src.num_sge;
+      if (chunk_write) chunk_write(dst->addr, bytes);
       if (publish_suffix) {
         assert(dst->addr + bytes <= output_base + head_bytes);
         head_written += bytes;
@@ -145,6 +179,15 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
   auto& pending = completions[cq];
   int count = 0;
   while (count < capacity && !pending.empty()) {
+    const auto key = std::make_pair(cq, pending.front());
+    auto storage = retained.find(key);
+    if (storage != retained.end()) {
+      for (const auto& check : storage->second) check();
+      retained.erase(storage);
+      pending_sges[cq] -= fenced_sges.at(key);
+      if (!pending_sges[cq]) pending_sges.erase(cq);
+      fenced_sges.erase(key);
+    }
     result[count] = {};
     result[count].status = URMA_CR_SUCCESS;
     result[count++].user_ctx = pending.front();
@@ -157,7 +200,7 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
 namespace {
 void CheckProfile(const kvaf::cpu_push::Transport& transport,
                   const kvaf::CpuSglWriteSample& sample, std::uint32_t sequence,
-                  bool payload_only, bool profiling, bool pipeline = false) {
+                  bool payload_only, bool profiling, bool pipeline = false, bool chunked = false) {
   auto* capture = std::tmpfile();
   assert(capture);
   std::fflush(stderr);
@@ -173,6 +216,25 @@ void CheckProfile(const kvaf::cpu_push::Transport& transport,
   while (const auto bytes = std::fread(buffer, 1, sizeof(buffer), capture)) log.append(buffer, bytes);
   std::fclose(capture);
   if (!profiling) { assert(log.empty()); return; }
+  if (chunked) {
+    assert(log.find("CPU_SGL_CHUNK_PROFILE sequence=" + std::to_string(sequence)) == 0);
+    std::istringstream fields(log);
+    std::map<std::string, double> values;
+    std::string field;
+    while (fields >> field) {
+      const auto equals = field.find('=');
+      if (equals != std::string::npos) values[field.substr(0, equals)] = std::stod(field.substr(equals + 1));
+    }
+    assert(values.at("chunk_rows") == kvaf::cpu_push::kChunkRows);
+    assert(values.at("max_inflight") <= 4 && values.at("ready_wrs") == 0);
+    assert(values.at("data_wrs") == data_wrs && values.at("tail_cqes") == data_tails);
+    assert(values.at("plan_reused") == (sequence == 2));
+    if (values.at("result") == double(kvaf::cpu_push::Result::kOk))
+      assert(values.at("chunks") == (uint32_t(values.at("rows")) + kvaf::cpu_push::kChunkRows - 1) / kvaf::cpu_push::kChunkRows);
+    for (const auto* name : {"chunk_ready_us", "chunk_read_us", "chunk_submit_us", "chunk_cq_wait_us", "cpu_total_us"})
+      assert(std::isfinite(values.at(name)) && values.at(name) >= 0);
+    return;
+  }
   if (pipeline) {
     assert(log.find("CPU_SGL_PIPELINE_PROFILE sequence=" + std::to_string(sequence)) == 0);
     assert(log.find("ready_wrs=0") != std::string::npos);
@@ -319,6 +381,117 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
   assert(segments == 0 && completions.empty());
   std::free(hbm);
 }
+// Release chunks only after a prior chunk has actually been posted. Chunk 2
+// precedes chunk 1, proving the consumer has no head-of-line builder barrier.
+void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault = 0, bool profiling = true, bool all_ready = false, std::uint32_t workers = 4) {
+  using namespace kvaf::cpu_push;
+  Layout layout;
+  assert(MakeLayout(token_bytes, workers, &layout, true));
+  auto* hbm = static_cast<std::uint8_t*>(std::aligned_alloc(64, layout.bytes));
+  assert(hbm); std::memset(hbm, 0, layout.bytes);
+  std::vector<std::uint8_t> source(std::size_t(count) * token_bytes), output(source.size()), second(source.size());
+  for (std::size_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 37 + i / token_bytes);
+  urma_device_t device{}; urma_context_t context{}; context.dev = &device;
+  urma_target_seg_t source_segment{};
+  source_segment.seg.ubva.va = reinterpret_cast<std::uint64_t>(source.data()); source_segment.seg.len = source.size();
+  urma_seg_t hbm_segment{};
+  hbm_segment.ubva.va = reinterpret_cast<std::uint64_t>(hbm); hbm_segment.len = layout.bytes;
+  kvaf::peer::OpenCpuPushGetRequest setup{};
+  setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = layout.bytes;
+  setup.npu_tp = 1; setup.npu_psn = 1; setup.token_value = 7;
+  setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = workers;
+  setup.output_mode = kChunkedOutput; setup.sge_per_wr = 4;
+  std::memcpy(setup.segment, &hbm_segment, sizeof(hbm_segment));
+  for (auto& channel : setup.channels) channel.bytes = 28;
+  kvaf::peer::OpenCpuPushGetResponse response{};
+  Transport transport;
+  assert(transport.Initialize(&context, &source_segment, setup, QueryTp, ImportJetty, 1, &response).ok());
+  done_address = setup.hbm_base + layout.done;
+  const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+  retain_chunk_storage = true;
+  for (auto sequence : {1U, 2U}) {
+    auto& result = sequence == 1 ? output : second;
+    std::fill(result.begin(), result.end(), 0xa5);
+    output_base = reinterpret_cast<std::uint64_t>(result.data()); output_bytes = result.size();
+    *reinterpret_cast<Request*>(hbm) = {kMagic, sequence, count, token_bytes, workers, kChunkedOutput, {kChunkRows}};
+    auto* target = reinterpret_cast<OutputTarget*>(hbm + layout.output_target);
+    *target = {}; target->base = output_base; target->bytes = output_bytes;
+    target->token_value = 7; target->segment_bytes = sizeof(urma_seg_t);
+    urma_seg_t segment{}; segment.ubva.va = output_base; segment.len = output_bytes;
+    std::memcpy(target->segment, &segment, sizeof(segment));
+    auto* addresses = reinterpret_cast<std::uint64_t*>(hbm + layout.descriptor);
+    std::fill(addresses, addresses + count, UINT64_MAX);
+    std::vector<bool> published(chunks), written(chunks);
+    std::vector<std::uint64_t> written_bytes(chunks);
+    const auto expected_address = [&](std::uint32_t row) {
+      return source_segment.seg.ubva.va + std::uint64_t((count - row + sequence - 1) % count) * token_bytes;
+    };
+    auto publish = [&](std::uint32_t c) {
+      assert(c < chunks && (c < workers || published[c - workers]));
+      for (auto i = c * kChunkRows; i < std::min(count, (c + 1) * kChunkRows); ++i) addresses[i] = expected_address(i);
+      if (fault == 2 && c == 1) addresses[kChunkRows] = source_segment.seg.ubva.va - 1;
+      published[c] = true;
+      reinterpret_cast<Word*>(hbm + layout.ready)[c % workers].value = Progress(sequence, c / workers + 1);
+    };
+    if (all_ready) for (uint32_t c = 0; c < chunks; ++c) publish(c);
+    else publish(0);
+    if (fault == 3) reinterpret_cast<Word*>(hbm + layout.ready)[1].value = Progress(sequence + 1, 1);
+    if (fault == 4) reinterpret_cast<Word*>(hbm + layout.ready)[1].value = Progress(sequence, chunks / workers + 2);
+    bool read_with_pending_data = false, multiple_pending_chunks = false, post_with_pending_read = false;
+    chunk_read = [&](std::uint64_t address, std::uint32_t bytes) {
+      const auto descriptors = setup.hbm_base + layout.descriptor;
+      if (address < descriptors || address >= descriptors + uint64_t(count) * 8) return;
+      const auto row = uint32_t((address - descriptors) / 8), c = row / kChunkRows;
+      assert(published[c] && row + bytes / 8 <= std::min(count, (c + 1) * kChunkRows));
+      if (c) for (const auto& cq : completions) read_with_pending_data |= !cq.second.empty();
+    };
+    chunk_write = [&](std::uint64_t address, std::uint32_t bytes) {
+      const auto c = uint32_t((address - output_base) / token_bytes / kChunkRows);
+      assert(published[c]); written[c] = true; written_bytes[c] += bytes;
+      post_with_pending_read |= last_read_cq && !completions[last_read_cq].empty();
+      std::size_t pending = 0;
+      for (const auto& cq : completions) pending += cq.second.size();
+      multiple_pending_chunks |= pending > kJettyCount;
+      if (written_bytes[c] != uint64_t(std::min(count, (c + 1) * kChunkRows) - c * kChunkRows) * token_bytes) return;
+      if (all_ready) return;
+      if (chunks > 2 && c == 0) { publish(2); return; }
+      if (c == 2) {
+        if (fault == 1) reinterpret_cast<Word*>(hbm + layout.ready)[1].value = Progress(sequence, kChunkFailed | uint32_t(Result::kInvalidRequest));
+        else publish(1);
+        return;
+      }
+      const auto next = c == 1 && chunks > 2 ? 3U : c + 1;
+      if (next < chunks) publish(next);
+    };
+    data_wrs = data_sges = ready_wrs = data_tails = 0;
+    reinterpret_cast<Word*>(hbm + layout.notify)->value = sequence | (profiling ? kProfileNotify : 0);
+    std::uint64_t received = 0;
+    assert(transport.ReadRequest(&received).ok() && received == sequence);
+    assert(transport.ReadDescriptor(sequence).ok());
+    assert(transport.WriteBatch().ok());
+    assert(transport.batch_result() == (fault == 3 ? Result::kSequenceError : fault ? Result::kInvalidRequest : Result::kOk));
+    assert(retained.empty() && unfenced.empty() && pending_sges.empty() && unfenced_sges.empty() && fenced_sges.empty());
+    assert(transport.Complete(sequence, transport.batch_result()).ok());
+    assert(reinterpret_cast<Completion*>(hbm + layout.done)->token == Progress(sequence, uint32_t(transport.batch_result())));
+    assert(ready_wrs == 0);
+    if (!fault && count == 8192 && token_bytes == 656) assert(data_wrs == 2048 && data_tails == 32 && data_sges == count);
+    CheckProfile(transport, {}, sequence, false, profiling, false, true);
+    if (all_ready && chunks > 1) assert(post_with_pending_read);
+    if (chunks > 1 && fault < 3) assert(read_with_pending_data);
+    if (chunks > 2 && fault < 3 && device_message == 65536) assert(multiple_pending_chunks);
+    for (uint32_t c = 0; c < chunks; ++c) {
+      if (fault) assert(written[c] == (fault < 3 && (c == 0 || c == 2)));
+      else assert(written[c]);
+      for (auto i = c * kChunkRows; i < std::min(count, (c + 1) * kChunkRows); ++i)
+        if (written[c]) assert(!std::memcmp(result.data() + uint64_t(i) * token_bytes, reinterpret_cast<void*>(expected_address(i)), token_bytes));
+        else for (uint32_t j = 0; j < token_bytes; ++j) assert(result[uint64_t(i) * token_bytes + j] == 0xa5);
+    }
+  }
+  chunk_read = {}; chunk_write = {}; retain_chunk_storage = false;
+  assert(transport.Shutdown().ok());
+  assert(segments == 0 && completions.empty());
+  std::free(hbm);
+}
 void Reject(std::uint32_t requested, std::uint32_t device_limit, std::uint32_t mode) {
   device_sges = device_limit;
   urma_context_t context{};
@@ -361,6 +534,23 @@ int main() {
   Run(4, 4, 65536, 16, false, true, true);
   Run(4, 4, 4096, 656, false, true, true, kvaf::cpu_push::Result::kInvalidRequest);
   Run(4, 4, 4096, 656, false, true, true, kvaf::cpu_push::Result::kOk, true);
+  RunChunks(8192);
+  RunChunks(8192, 656, 0, true, true); // Descriptor prefetch stays outstanding during the prior post.
+  RunChunks(8192, 656, 0, true, false, 5); // User AICPU worker count.
+  RunChunks(8192, 656, 0, true, true, 1);
+  RunChunks(1, 656, 0, true, false, 8);
+  RunChunks(65536, 16); // More than the in-flight window and tracker slots over time.
+  RunChunks(7); RunChunks(1, 656, 0, false);
+  RunChunks(4097, 20000); // Byte-limited SGEs and non-aligned final chunk.
+  RunChunks(8192, 656, 1); // Producer error after earlier writes.
+  RunChunks(8192, 656, 2); // Invalid descriptor must never become an SGE.
+  RunChunks(8192, 656, 3); // Future sequence is not a current publication.
+  RunChunks(8192, 656, 4); // Progress cannot exceed the producer's assigned chunks.
+  device_message = 1024;
+  RunChunks(4097, 10000); // Concurrent plans must reserve total SGEs as well as WR credits.
+  device_message = 256;
+  RunChunks(3073, 10000); // One chunk spans multiple SQ waves; credits require draining.
+  device_message = 65536;
   Reject(8, 4, kvaf::cpu_push::kDirectOutput);
   Reject(17, 32, kvaf::cpu_push::kDirectOutput);
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);

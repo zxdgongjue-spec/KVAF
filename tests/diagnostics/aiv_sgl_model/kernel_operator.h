@@ -29,6 +29,8 @@ inline void Store(uint64_t address, uint64_t value) {
   __atomic_store_n(reinterpret_cast<uint64_t*>(address), value, __ATOMIC_RELEASE);
 }
 inline std::atomic<uint32_t> descriptor_copies{};
+inline uint32_t pause_row = UINT32_MAX;
+inline std::atomic<bool> paused{}, resume{true};
 inline uint64_t descriptor{}, descriptor_end{};
 }
 inline thread_local struct { uint32_t x; } threadIdx;
@@ -63,6 +65,10 @@ inline void DataCopyPad(GlobalTensor<uint8_t> dst, LocalTensor<uint8_t> src, Dat
   const auto address = reinterpret_cast<uint64_t>(dst.data);
   assert(address >= sgl_model::descriptor && address + p.bytes <= sgl_model::descriptor_end);
   assert(p.blocks == 1);
+  if (address == sgl_model::descriptor + uint64_t(sgl_model::pause_row) * 8) {
+    sgl_model::paused = true;
+    while (!sgl_model::resume.load()) std::this_thread::yield();
+  }
   ++sgl_model::descriptor_copies;
 #if defined(KVAF_CPU_SGL_AIV_ADDRESS_SPACE_CHECK)
   for (uint32_t i = 0; i < p.bytes; ++i) dst.data[i] = src.data[i];

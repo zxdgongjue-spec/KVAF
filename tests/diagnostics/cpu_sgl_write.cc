@@ -83,7 +83,7 @@ struct Fixture {
         std::this_thread::yield();
       }
       const auto* request = reinterpret_cast<Request*>(memory());
-      assert(request->mode == kDirectOutput && request->count == count);
+      assert(request->mode == ((args.sequence & kChunkPipelineLaunch) ? kChunkedOutput : kDirectOutput) && request->count == count);
       const auto* target = reinterpret_cast<OutputTarget*>(memory() + layout.output_target);
       assert(target->base == args.output && target->bytes == output.size());
       // Every worker must remain pending without done, even though no scatter
@@ -101,6 +101,16 @@ struct Fixture {
           assert(std::chrono::steady_clock::now() < deadline);
         assert(std::uint32_t(*suffix) == std::uint32_t(Result::kOk));
       }
+      if (args.sequence & kChunkPipelineLaunch) {
+        assert(request->reserved_words[0] == kChunkRows);
+        const auto chunks = (uint32_t(count) + kChunkRows - 1) / kChunkRows;
+        for (uint32_t w = 0; w < args.workers; ++w) {
+          const auto owned = chunks / args.workers + (w < chunks % args.workers ? 1U : 0U);
+          auto* progress = reinterpret_cast<Word*>(memory() + layout.ready) + w;
+          while (__atomic_load_n(&progress->value, __ATOMIC_ACQUIRE) != Progress(sequence, owned))
+            assert(std::chrono::steady_clock::now() < deadline);
+        }
+      }
       for (int i = head; i < count; ++i)
         std::memcpy(output.data() + i * kBytes, reinterpret_cast<void*>(sources[i]), kBytes);
       auto* done = reinterpret_cast<Completion*>(memory() + layout.done);
@@ -113,7 +123,9 @@ struct Fixture {
       for (auto value : output) assert(value == 0xA5);
       return;
     }
+    uint64_t spans = 0;
     for (std::uint32_t w = 0; w < args.workers; ++w) {
+      spans += profiles[w].spans;
       assert(statuses[w].sequence == sequence && statuses[w].result == std::uint64_t(Result::kOk));
       assert(profiles[w].scatter_ns == 0 && profiles[w].scatter_copies == 0);
       assert(profiles[w].ready_queries == 0);
@@ -125,6 +137,7 @@ struct Fixture {
         assert(sample.elapsed_ns == 0 && sample.waves == 0);
       }
     }
+    assert(spans == uint32_t(count));
     for (int i = 0; i < count; ++i)
       assert(std::memcmp(output.data() + i * kBytes,
           reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), kBytes) == 0);
@@ -134,9 +147,9 @@ struct Fixture {
 }  // namespace
 
 int main() {
-  for (bool pipeline : {false, true}) for (auto workers : {1U, 4U, 8U}) {
+  for (uint64_t mode : {uint64_t(0), kPipelineLaunch, kChunkPipelineLaunch}) for (auto workers : {1U, 4U, 5U, 8U}) {
     Fixture f(workers);
-    f.args.sequence = pipeline ? kPipelineLaunch : 0;
+    f.args.sequence = mode;
     f.Run(true);
     std::fill(f.output.begin(), f.output.end(), 0xA5);
     f.count = 7;
@@ -161,6 +174,23 @@ int main() {
     assert(kernels[0].get() != 0);
     assert(f.statuses[0].result == std::uint64_t(Result::kInvalidRequest));
   }
+  {
+    Fixture f(1); f.args.sequence = kChunkPipelineLaunch; f.rows[2 * kChunkRows + 17] = -1;
+    auto kernels = f.Launch();
+    auto* notify = reinterpret_cast<Word*>(f.memory() + f.layout.notify);
+    auto* progress = reinterpret_cast<Word*>(f.memory() + f.layout.ready);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((__atomic_load_n(&notify->value, __ATOMIC_ACQUIRE) & ~kProfileNotify) != 1)
+      assert(std::chrono::steady_clock::now() < deadline);
+    while (!(uint32_t(__atomic_load_n(&progress->value, __ATOMIC_ACQUIRE)) & kChunkFailed))
+      assert(std::chrono::steady_clock::now() < deadline);
+    assert(kernels[0].wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout);
+    auto* done = reinterpret_cast<Completion*>(f.memory() + f.layout.done);
+    __atomic_store_n(&done->token, Progress(1, uint32_t(Result::kInvalidRequest)), __ATOMIC_RELEASE);
+    assert(kernels[0].get() != 0);
+  }
+  { Fixture f; f.args.sequence = kChunkPipelineLaunch; f.count = 0; f.Run(true, false); }
+  { Fixture f; f.args.sequence = kChunkPipelineLaunch; f.rows[17] = -1; f.Run(false, false); }
   { Fixture f; f.count = 0; f.rows[0] = -1; f.Run(true, false); }
   { Fixture f; f.args.sequence = kPipelineLaunch; f.count = 0; f.rows[0] = -1; f.Run(true, false); }
   { Fixture f; f.args.sequence = kPipelineLaunch; f.rows[17] = -1; f.Run(false, false); }
@@ -196,6 +226,23 @@ int main() {
     for (int i = 0; i < f.count; ++i)
       assert(std::memcmp(f.output.data() + f.rows[i] * kBytes,
           reinterpret_cast<void*>(f.addresses[f.indices[i]] + f.offsets[i]), kBytes) == 0);
+  }
+  {
+    Fixture f(5); f.args.sequence = kChunkPipelineLaunch; f.args.profile = 0;
+    auto kernels = f.Launch();
+    auto* notify = reinterpret_cast<Word*>(f.memory() + f.layout.notify);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (__atomic_load_n(&notify->value, __ATOMIC_ACQUIRE) != 1)
+      assert(std::chrono::steady_clock::now() < deadline);
+    auto* progress = reinterpret_cast<Word*>(f.memory() + f.layout.ready);
+    const auto chunks = (uint32_t(f.count) + kChunkRows - 1) / kChunkRows;
+    for (uint32_t w = 0; w < f.args.workers; ++w)
+      while (__atomic_load_n(&progress[w].value, __ATOMIC_ACQUIRE) != Progress(1, chunks / f.args.workers + (w < chunks % f.args.workers)))
+        assert(std::chrono::steady_clock::now() < deadline);
+    auto* done = reinterpret_cast<Completion*>(f.memory() + f.layout.done);
+    __atomic_store_n(&done->token, Progress(1, uint32_t(Result::kOk)), __ATOMIC_RELEASE);
+    for (auto& kernel : kernels) assert(kernel.get() == 0);
+    for (const auto& p : f.profiles) assert(p.enter_ns == 0 && p.exit_ns == 0);
   }
   const GetExecutionConfig config{Transport::Urma, Executor::Aicpu, GetAlgorithm::CpuSglWrite};
   assert(ValidateExecution(TransportMode::Urma, config).ok());

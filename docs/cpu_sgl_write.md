@@ -108,31 +108,40 @@ done
 4096×656 B、4 worker、当前 1024 行 chunk/四路 Jetty 划分下，
 4 SGE 应为 1024 个数据 WR，8 SGE 应为 512 个；均另有 16 个 ready WR。
 
-## 请求构建、描述读取和数据写入的两段流水
+## 请求构建、描述读取和数据写入的逐 chunk 流水
 
 `--sgl-pipeline` 对应 `ExecutionResources(sgl_pipeline=True)`，默认关闭。
-支持 `cpu_sgl_write`（AICPU）和 `aiv_cpu_sgl_write`（AIV），与
-`--sgl-payload-only` 互斥；开启后以 `scope=kernel` 比较总延迟和带宽。
+本版本将该开关从前缀/后缀两段升级为逐 chunk 推进；日志/CSV 的
+`sgl_pipeline_mode=chunked` 可区分旧版本。支持 `cpu_sgl_write`（AICPU）和
+`aiv_cpu_sgl_write`（AIV），与 `--sgl-payload-only` 互斥。
 
-每轮由 worker/core 0 先构建前 `min(miss_count, 1024)` 项，发布请求头、output 描述及
-notify。其余 worker/core 构建各自后缀，worker/core 0 发布前缀后继续自己的后缀。
-CPU 收到 notify 后即可导入 output、读取并校验前缀源地址、更新 SGE、提交前缀 WRITE，
-与设备剩余请求构建重叠。全部构建完成后，设备在 notify 缓存行的独立字发布本轮后缀
-完成/失败 token。CPU 只在后缀成功后读取后缀描述符。
+每个 chunk 固定最多 1024 项，全局 chunk `c` 由核 `c % workers` 构建。
+每核拥有独立的 64 B 进度行；写完一个 chunk 的地址描述符并完成内存可见性同步后，
+发布 `Progress(sequence, 本核已完成的 chunk 数)`。这复用 direct output 模式原本
+空闲的 Ready 区域，由设备写进度、CPU 读取；不产生 CPU 到设备的 payload ready WRITE。
+核 0 完成第一个 chunk 后发布请求头、output 描述和 notify，其余核无需等待该通知即可构建。
 
-CPU 保留原来的四条数据 Jetty，另建一条专用控制 Jetty 和 CQ，导入同一个 NPU target。
-后缀 READ、范围检查和源 SGE 更新可以在前缀 DMA 尚未完成时进行，控制 CQE 不与数据
-CQE 混用。准备好后缀后收齐前缀 CQE，再提交后缀数据；超出队列容量时仍逐 wave 排空。
-描述符、WRITE 链及 SGE 使用独立且保留到完成的存储。整个请求不写 chunk ready，
-不执行 scatter，只有最终数据全部完成后才释放 output 导入并发布 done。
+CPU 使用四条数据 Jetty 和一条专用控制 Jetty/CQ。收到 notify 后导入 output，
+读取各核进度并选择已就绪且尚未提交的 chunk，不要求按 chunk 编号提交。
+例如 chunk 1 尚未发布时，chunk 2 可以先读取、校验和写入自己的输出位置。
+每个 chunk 独立读取源地址、校验范围、更新 SGE 并提交 WRITE；已知下一 chunk 就绪时，
+先异步预读其描述符，再更新和提交当前 chunk。描述符 READ、SGE 更新和提交可与其他
+chunk 的 DMA 重叠，不再等待所有设备核完成整批构建。
 
-空请求不通知 CPU；不超过 1024 项的请求全部作为前缀处理。固定容量时复用两个阶段的
-WRITE 计划；冷启动的计划构建仍发生在首次提交之前。前缀大小目前固定，不自动调优。
+每个 chunk 的 WRITE/SGE 存储独立保留到尾 CQE 完成；CPU 最多同时保留四个在途
+WRITE 计划。常规 8192×656 B、4 SGE 配置下，每 chunk 为一个计划，即最多四个
+chunk 同时在途。单 chunk 超出 SQ 预算时拆成多个 wave，按实际队列 credits
+收割已完成计划后继续，不扩大已有 token/request 大小上限。
+仅全部数据完成后，CPU 才释放 output 导入并发布强序 done。AIV 不执行 scatter。
 
-流水模式保留逐段源地址范围检查，但失败时可能已经写入合法前缀。后缀输出映射、源地址
-或构建状态非法时，不提交后缀；CPU 排空前缀后发布失败，设备等待该确认后退出。
-失败请求的 output 不可消费，并按原有执行资源失败/Shutdown 流程恢复。
-默认模式继续保留整批检查完成前不提交 payload 的行为。
+空请求不通知 CPU；不足 1024 项为一个部分 chunk。固定有效项数时复用计划，
+每轮更新输出注册和源地址；冷启动的计划构建仍发生在首次提交之前。
+每核进度携带 sequence，图回放不把上一轮的进度误认为本轮就绪，也不需要 Host 重置。
+
+流水模式保留逐 chunk 范围检查。若设备报告某 chunk 构建失败，或 CPU 校验发现非法源地址，
+停止提交后续 chunk，先排空已在途的合法 WRITE，再发布失败 done；设备等待该确认后退出。
+失败请求可能已写入若干非连续 chunk，output 不可消费，沿用执行资源失败/Shutdown 恢复。
+默认关闭流水时继续整批检查后再提交。
 
 此功能使用新的 setup output mode 和设备端提前发布逻辑。CPU 服务、NPU Host/Python
 及所选设备 kernel 均须使用本次源码重建，重启 CPU 服务及 NPU 测试进程。
@@ -154,16 +163,25 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 AIV 对照使用 `--backend aiv_cpu_sgl_write --aiv-cores 4` 替换后端和 worker 参数，
 并按实际设备设置 `--kernel-profile-clock-mhz`。图模式使用原来的 `--execution graph`
-及图租约接口；sequence 和后缀 token 随每次回放推进，不由 Host 逐次重置。
+及图租约接口；sequence 和每核 chunk 进度随每次回放推进，不由 Host 逐次重置。
 
-CPU 日志新增 `CPU_SGL_PIPELINE_PROFILE`。`head_first_post_us` 是命中本轮 notify 的
-CPU READ 开始到首次数据 post 的时间；不含设备构建前缀的时间。
-`head_submit_us` 包含前缀 SGE 更新与提交，`suffix_wait_us` 包含轮询后缀发布，
-`suffix_read_us` 覆盖后缀 READ 的提交与完成，`head_cq_wait_us` 是准备完后缀后剩余的
-前缀完成等待，`suffix_submit_us` 和 `suffix_cq_wait_us` 分别记录后缀提交和完成等待。
-源地址校验及源/目标 SGE 更新按整轮累计。部分字段嵌套且与 DMA 重叠，不能相加成
-kernel 总时间；`cpu_total_us` 仍为本轮 notify READ 开始到 done CQE 观察完成。
-没有首尾之间的单独 payload 带宽报告，避免把等待后缀构建的时间隐藏在诊断口径之外。
+CPU 日志为 `CPU_SGL_CHUNK_PROFILE`：
+
+- `first_post_us`：命中本轮 notify 的 CPU READ 开始到首次数据 post，不含设备构建首 chunk。
+- `chunk_ready_us` / `progress_reads`：累计读取进度的耗时/次数。
+- `chunk_read_us`：累计描述符 READ 提交到完成的耗时。
+- `chunk_submit_us`：累计源 SGE 更新和数据提交耗时。
+- `chunk_cq_wait_us`：收割数据 CQE 的累计耗时，包含窗口/credits 不足时等待。
+- `chunks` / `max_inflight`：已提交的 chunk 数/实际最多同时在途的计划数。
+- `data_wrs` / `tail_cqes`：数据 WR 数/观察到的尾 CQE 数；每 chunk 每个有数据的 Jetty 一个尾 CQE。
+- `cpu_total_us`：本轮 notify READ 开始到 done CQE 观察完成。
+
+源地址检查、源/目标 SGE 更新等仍按整轮累计。部分字段嵌套且与 DMA 重叠，不能
+相加当作 kernel 时间。以 `scope=kernel` 比较整体延迟和带宽，同时记录端到端结果。
+8192×656 B、4 SGE 正常完成时应为 `chunks=8 data_wrs=2048 tail_cqes=32 ready_wrs=0`；
+`max_inflight` 不超过 4。更多尾 CQE 和描述符 READ 也有成本，收益需与相同配置的
+非流水结果及旧两段版本实测比较。
+CPU 服务保留旧 mode=3 的两段协议兼容路径；新 Host 的开关使用 mode=4，设备核也必须更新。
 
 ## 测 CPU SGL 写入 HBM 的有效载荷带宽
 
@@ -263,8 +281,8 @@ resources = kvaf.ExecutionResources(cores=4, sge_per_wr=8)
 ```
 
 源地址构建参考 `origin/aiv-scatter` 的 `BuildSourcesSimt`：SIMT 绕过私有
-DCache 读取输入，经 UB → GM 写入地址描述符。所有 AIV 核验证输出恒等映射并完成
-描述符写入后，核 0 发布 notify。CPU 复用上文的四路 Jetty、SGL WRITE、output
+DCache 读取输入，经 UB → GM 写入地址描述符。默认模式在所有 AIV 核验证
+输出恒等映射并完成描述符写入后，由核 0 发布 notify；流水模式按上述 chunk 发布。CPU 复用上文的四路 Jetty、SGL WRITE、output
 segment 导入和 done 协议，直接写调用方连续 output。AIV 不分配 payload staging、
 不轮询 ready，也不执行 payload scatter。`sge_per_wr`、`sgl_payload_only`、有效前缀、
 输出注册复用和故障时先 STOP 再注销 HBM 的规则与 AICPU SGL 相同。
@@ -272,7 +290,8 @@ segment 导入和 done 协议，直接写调用方连续 output。AIV 不分配 
 `cores` 支持 1..8，CPU 全局固定四路 Jetty；此算法不接受 `jettys` 或
 `max_inflight_total` 资源配置。每个核独占 epoch/builder cache line，在同一资源的
 多个图节点、图回放和普通调用之间推进 sequence，不依赖 Host 回放代理或 AIV
-跨核标量原子操作。任一核发现非法输入时不通知 CPU；后续排队回放也保留失败。
+跨核标量原子操作。默认模式在非法输入时不通知 CPU；流水已发布的请求先等待 CPU
+排空在途数据并发布失败 done。后续排队回放保留失败。
 控制轮询使用有界 poll budget，不将 AIV cycle 当作 CPU 单调时间。
 
 同步、异步、两种 AccessTable 重载、`begin_get_output` 和 Get 图租约沿用现有接口。
@@ -306,7 +325,7 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 `--backend cpu_sgl_write --aicpu-workers 4` 的 CPU 侧统计。
 
 不依赖 SDK 的检查入口为 `bash tests/diagnostics/run_cpu_sgl_host_checks.sh`。
-包含真实 AIV `.asc` 控制流的多线程模型、1/4/8 核、超过单个 UB tile 的请求、
+包含真实 AIV `.asc` 控制流的多线程模型、1/4/5/8 核、超过单个 UB tile 的请求、
 多轮 sequence、输入变化、部分/空前缀、非法映射和源输入、等待 done、远端失败与超时，
 并检查 MTE 只复制地址描述符。ASan/UBSan 和 Host 声明检查不替代 CANN 编译、
 真实 DMA 可见性、注册退役和图回放的目标设备验证。
