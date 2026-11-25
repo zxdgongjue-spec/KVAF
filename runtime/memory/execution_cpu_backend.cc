@@ -96,7 +96,10 @@ class UrmaSession final : public execution::Session {
          command == peer::Command::kPrepareGatherWindow) &&
         (profile_.put || profile_.algorithm != GetAlgorithm::Gather))
       return Status::InvalidArgument("session has no Gather profile");
+    if (command == peer::Command::kOpenCpuPushMailbox && profile_.executor != Executor::Aicpu)
+      return Status::InvalidArgument("mailbox is available to AICPU Scatter");
     if ((command == peer::Command::kOpenCpuPushGet || command == peer::Command::kOpenAivCpuGatherPushGet ||
+         command == peer::Command::kOpenCpuPushMailbox ||
          command == peer::Command::kStartCpuPushGet ||
          command == peer::Command::kStopCpuPushGet) &&
         (profile_.put || profile_.algorithm != GetAlgorithm::Scatter))

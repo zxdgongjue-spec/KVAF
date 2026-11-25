@@ -70,5 +70,8 @@ struct ScatterLaunchView {
   AicpuBufferView completion, profile;
   ExecutionHealth* health{};
   bool profiling{false};
+  UmdkContext mailbox_context{};
+  void* mailbox_source{};
+  std::uint64_t mailbox_remote{};
 };
 }  // namespace kvaf::aicpu_urma

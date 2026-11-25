@@ -87,5 +87,7 @@ struct KernelArgs {
   std::uint32_t workers{}, timeout_ms{kTimeoutMs};
   std::uint32_t window_capacity{kDefaultGetWindow};
   std::uint64_t window_base{};
+  aicpu_urma::UmdkContext mailbox_context{};
+  std::uint64_t mailbox_source{}, mailbox_remote{};
 };
 }  // namespace kvaf::cpu_push

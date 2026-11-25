@@ -108,8 +108,10 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   Status StopGatherLanes(uint64_t region_base) const;
   Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
                         OpenCpuPushGetResponse* response) const;
+  Status OpenCpuPushMailbox(uint64_t region_base, OpenCpuPushGetRequest request,
+                            OpenCpuPushGetResponse* response, PeerRegion* mailbox);
   Status StartCpuPushGet(uint64_t region_base) const;
-  Status StopCpuPushGet(uint64_t region_base) const;
+  Status StopCpuPushGet(uint64_t region_base, uint64_t mailbox_base = 0);
   Status OpenAivCpuPushGet(uint64_t region_base, OpenAivCpuPushGetRequest request,
                           OpenAivCpuPushGetResponse* response) const;
   Status OpenAivCpuPushGet(uint64_t region_base, OpenAivCpuPushJettyRequest request,

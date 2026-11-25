@@ -41,6 +41,7 @@ enum class Command : uint16_t {
   kOpenAivCpuGatherPushGet = 17U,
   kEnableAivGatherLanes = 18U,
   kStopGatherLanes = 19U,
+  kOpenCpuPushMailbox = 20U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
@@ -243,6 +244,10 @@ struct OpenCpuPushGetResponse {
   uint32_t cpu_psn;
   CpuPushChannelKey channels[4];
 };
+struct OpenCpuPushMailboxResponse {
+  OpenCpuPushGetResponse base;
+  AllocateRegionResponse mailbox;
+};
 struct OpenAivCpuPushGetResponse {
   MessageHeader header;
   int32_t result;
@@ -297,6 +302,7 @@ static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI chang
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
 static_assert(sizeof(OpenCpuPushGetRequest) == 428U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(OpenCpuPushMailboxResponse) == 432U, "CPU push mailbox response ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetRequest) == 424U, "AIV CPU push setup ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetResponse) == 392U, "AIV CPU push setup response ABI changed");
 static_assert(sizeof(OpenAivCpuPushJettyRequest) == 2332U && sizeof(OpenAivCpuPushJettyResponse) == 2296U,

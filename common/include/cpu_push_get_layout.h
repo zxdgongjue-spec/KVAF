@@ -27,14 +27,15 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
   return true;
 }
 inline std::uint32_t ScatterWindowCapacity(std::uint32_t token_bytes, std::uint32_t workers,
-                                         std::uint64_t budget) {
+                                         std::uint64_t budget, bool mailbox = false) {
   if (!budget) {
     Layout layout;
     return MakeLayout(token_bytes, workers, &layout) ? kDefaultGetWindow : 0U;
   }
   return LargestGetWindow([&](std::uint32_t capacity) {
     Layout layout;
-    return MakeLayout(token_bytes, workers, &layout, capacity) && layout.bytes <= budget;
+    return MakeLayout(token_bytes, workers, &layout, capacity) &&
+        layout.bytes + (mailbox ? layout.staging : 0U) <= budget;
   });
 }
 template <class Emit>

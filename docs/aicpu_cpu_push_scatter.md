@@ -48,7 +48,7 @@ CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
 当前 push 协议为 V3，逐行复制源于 `codex/aicpu-ordered-write` 的
 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24），Ready 由 AICPU 按 Jetty 分片消费。
-当前设备入口为 `KvafAicpuCpuPushScatterExecutionV4`。主机库和设备 SO 必须一起更新，
+当前设备入口为 `KvafAicpuCpuPushScatterExecutionV5`。主机库和设备 SO 必须一起更新，
 包括移除废弃排序字段后的 profile 布局。以下命令从各自仓库根目录执行。
 CPU 端构建服务：
 
@@ -131,6 +131,12 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 源池大小由 `--table-capacity` 和块布局显式决定，不再由独立后端脚本分配 100 GiB。
 扫描不同 miss 数、token 大小或 worker 数时，循环调用同一个入口。
+
+设置 `KVAF_AICPU_SCATTER_MAILBOX=1` 后，AICPU 通过独立的 UMDK 控制队列依次
+WRITE 请求头、源地址清单和通知序号。K 端轮询本地通知序号，沿用同一套 SGL payload
+WRITE 和 Ready/Done 发布逻辑。默认值 `0` 下，K 端通过 READ 获取请求。
+A/B 时只切换该变量，两端使用同一次构建的代码。启动日志中的 `request_control`
+显示实际选择，`CPU_PUSH_PROFILE` 的 `address_read_us` 在 mailbox 模式下仍包含源地址范围校验。
 详细口径及其他后端参数见 [统一 Get 性能测试](batch_get_performance.md)。
 
 ## 请求与数据流
@@ -218,22 +224,24 @@ workspace 在初始化时分配，窗口间复用，每个窗口 payload 必须�
 
 一次执行完成前不复用 staging。异步返回表示已经入队；同一 Get 方向的下次普通调用会先 Drain，
 检查前一轮执行状态。`synchronize=True` 在本次调用内完成等待和状态检查。
-Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、释放 HBM。
+Shutdown 停止 CPU worker 并销毁其 DMA 队列后释放 HBM。Mailbox 模式先同步 Scatter
+stream 并关闭 AICPU 控制队列，再停止 CPU worker。
 传输或 stream 失败会阻止执行资源复用；关闭失败时保留资源以便重试。
 
 ## Profile
 
-`request_us` 记录每个 worker 的源地址分片构建，含发布屏障；worker 0 还计入请求头填写。
+`request_us` 记录每个 worker 的源地址分片构建和发布屏障。Worker 0 还计入请求头填写。
 分片汇合等待不计入 `request_us`，`scatter_us` 记录本地复制。
 `scatter_copies` 为实际逐行 memcpy 次数。4096 × 656 B、完整前缀、4 worker 时，
 每个 worker 为 1024 次，总计 4096 次。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
-`source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
-缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
+`notify_us` 记录 AICPU 发布请求的时间。Mailbox 模式下包含 UMDK WRITE 提交和 CQ 等待，
+源地址分片的 cache flush 也计入 `request_us`。设备 worker 的区间重叠，不能相加作为端到端时长。
 
 启用 CPU Push profiling 时，CPU 服务在采样请求完成后输出
 `CPU_PUSH_PROFILE`。统一性能入口的 `--kernel-profile` 控制测试端的分段明细输出。
-`header_read_us` 是请求头 READ 耗时，`address_read_us` 是有效源地址数组 READ 耗时；
+`header_read_us` 记录请求头 READ，`address_read_us` 记录源地址数组 READ 和范围校验。
+`header_read_us` 在 mailbox 模式下为零。
 `write_us` 包含 `build_us`、`post_us`
 和 `cq_wait_us`，分别表示计划构建/源地址更新、URMA post 调用、提交后的 CQ 等待。
 `submit_to_cqe_us` 从首次 payload post 到最后一个数据链尾 CQE，包含提交与 DMA 的重叠；

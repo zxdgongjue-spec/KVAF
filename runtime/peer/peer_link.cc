@@ -1016,6 +1016,45 @@ Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
   return Status::OK();
 }
 
+Status PeerLink::OpenCpuPushMailbox(uint64_t base, OpenCpuPushGetRequest request,
+                                  OpenCpuPushGetResponse* response, PeerRegion* mailbox) {
+  PeerRegion source;
+  auto status = LookupRegion(base, &source);
+  if (!status.ok()) return status;
+  constexpr auto command = Command::kOpenCpuPushMailbox;
+  request.header = MakeHeader(command, sizeof(request));
+  request.session_id = source.session_id;
+  OpenCpuPushMailboxResponse reply{};
+  std::string error;
+  if (!Exchange(*this, request, &reply, &error) ||
+      !IsValidResponseHeader(reply.base.header, command, sizeof(reply)) ||
+      !ResultOk(static_cast<Result>(reply.base.result), &error))
+    return ToStatus("CPU push mailbox setup failed", std::move(error));
+  const auto& mr = reply.mailbox;
+  const uint64_t mailbox_base = mr.peer_base;
+  if (mr.session_id != source.session_id || !mailbox_base || mailbox_base % 64U ||
+      !mr.peer_length || mailbox_base > UINT64_MAX - mr.peer_length ||
+      !mr.token_id || mr.token_value != source.token_value ||
+      !mr.segment_key_bytes || mr.segment_key_bytes > kSegKeyBytes ||
+      regions_.find(mailbox_base) != regions_.end())
+    return Status::Internal("peer returned an invalid CPU push mailbox");
+  PeerRegion binding{};
+  binding.session_id = source.session_id;
+  binding.epoch = source.epoch;
+  binding.region_id = source.region_id;
+  binding.base = mailbox_base;
+  binding.length = mr.peer_length;
+  binding.token_id = mr.token_id;
+  binding.token_value = mr.token_value;
+  binding.segment_key_bytes = mr.segment_key_bytes;
+  std::memcpy(binding.eid.data(), mr.peer_eid, binding.eid.size());
+  std::memcpy(binding.segment_key.data(), mr.segment_key, binding.segment_key_bytes);
+  regions_.emplace(mailbox_base, binding);
+  *response = reply.base;
+  *mailbox = binding;
+  return Status::OK();
+}
+
 namespace {
 Status PushSessionCommand(const PeerLink& address, uint64_t session, Command command,
                           uint16_t version = kProtocolVersion) {
@@ -1037,11 +1076,13 @@ Status PeerLink::StartCpuPushGet(uint64_t base) const {
   if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
   return PushSessionCommand(*this, found->second.session_id, Command::kStartCpuPushGet);
 }
-Status PeerLink::StopCpuPushGet(uint64_t base) const {
+Status PeerLink::StopCpuPushGet(uint64_t base, uint64_t mailbox_base) {
   const auto found = regions_.find(base);
   // ReleaseRegion succeeds only after the remote producer has stopped.
   if (found == regions_.end()) return Status::OK();
-  return PushSessionCommand(*this, found->second.session_id, Command::kStopCpuPushGet);
+  auto stopped = PushSessionCommand(*this, found->second.session_id, Command::kStopCpuPushGet);
+  if (stopped.ok() && mailbox_base) regions_.erase(mailbox_base);
+  return stopped;
 }
 Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenAivCpuPushGetRequest request,
                                    OpenAivCpuPushGetResponse* response) const {

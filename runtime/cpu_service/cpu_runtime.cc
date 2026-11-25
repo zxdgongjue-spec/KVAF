@@ -178,6 +178,8 @@ Status CpuRuntime::ServeConnection(int fd) {
       return Reply<peer::CandidateInfoResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kCreateChannel:
       return Reply<peer::CreateChannelResponse>(fd, command, peer::Result::kResourceError);
+    case peer::Command::kOpenCpuPushMailbox:
+      return Reply<peer::OpenCpuPushMailboxResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kOpenCpuPushGet:
     case peer::Command::kOpenAivCpuGatherPushGet:
       if (header.version == peer::kAivCpuPushJettyProtocolVersion)

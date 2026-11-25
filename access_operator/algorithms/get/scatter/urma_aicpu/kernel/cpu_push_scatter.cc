@@ -42,13 +42,20 @@ struct Execution {
   Coordination& coordination;
   std::uint64_t start, timeout;
   BatchGetWorkerProfile* profile;
+  MailboxTransfer mailbox_transfer;
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
-  void RefreshWindowMemory(const void* address, std::uint64_t bytes) {
-    if (!args.window_base || !bytes) return;
+  std::uint8_t* RequestMemory() const {
+    return args.mailbox_source ? reinterpret_cast<std::uint8_t*>(args.mailbox_source) : Memory();
+  }
+  void FlushMemory(const void* address, std::uint64_t bytes) {
     BatchGetProfileScope timer(profile ? &profile->input_cache_ns : nullptr);
     aicpu_urma::FlushUmdkCache(address, bytes);
     Barrier();
+  }
+  void RefreshWindowMemory(const void* address, std::uint64_t bytes) {
+    if (!args.window_base || !bytes) return;
+    FlushMemory(address, bytes);
   }
   void Relax(bool check_remote = true) {
     // Sample remote errors every 32 stalled polls.
@@ -129,37 +136,57 @@ struct Execution {
     const auto* addresses = reinterpret_cast<const std::uint64_t*>(r.address_table);
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
-    auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
+    auto* sources = reinterpret_cast<std::uint64_t*>(RequestMemory() + layout.descriptor);
     for (auto i = range->begin; i < range->end; ++i) {
       const auto global = args.window_base + i;
       sources[i] = addresses[indices[global]] + static_cast<std::uint32_t>(offsets[global]);
     }
     if (!worker) {
-      auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
+      auto* header = reinterpret_cast<Request*>(RequestMemory() + layout.request);
       *header = {kMagic, args.sequence, count, r.token_bytes, args.workers, 0, {}};
     }
-    Barrier();
+    if (args.mailbox_source)
+      FlushMemory(sources + range->begin, std::uint64_t{range->end - range->begin} * sizeof(*sources));
+    else
+      Barrier();
     return true;
   }
   void Notify() {
     BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
+    const auto count = reinterpret_cast<const Request*>(RequestMemory() + layout.request)->count;
+    const auto descriptor_bytes = std::uint64_t{count} * sizeof(std::uint64_t);
+    auto* notify = reinterpret_cast<Word*>(RequestMemory() + layout.notify);
+    const auto value = args.sequence | (profile ? kProfileNotify : 0);
+    if (args.mailbox_remote) {
+      Store(*notify, value);
+      FlushMemory(RequestMemory(), layout.notify + sizeof(notify->value));
+      // All writers have flushed their descriptor rows and crossed built.
+      // UMDK strongly orders the trailing notify WRITE after head and list.
+      const aicpu_urma::UmdkTransfer writes[] = {
+          {args.mailbox_remote + layout.request, args.mailbox_source + layout.request, sizeof(Request)},
+          {args.mailbox_remote + layout.descriptor, args.mailbox_source + layout.descriptor, descriptor_bytes},
+          {args.mailbox_remote + layout.notify, args.mailbox_source + layout.notify, sizeof(notify->value)},
+      };
+      if (mailbox_transfer(&args.mailbox_context, true, writes, 3, 0))
+        Fail(coordination, Result::kTransportError);
+      return;
+    }
     // All descriptor writers have crossed built. Publish their stores before
     // the CPU can observe notify; avoid sweeping caller input/output tensors.
     RefreshWindowMemory(Memory() + layout.request, sizeof(Request));
-    const auto count = reinterpret_cast<const Request*>(Memory() + layout.request)->count;
-    RefreshWindowMemory(Memory() + layout.descriptor, std::uint64_t{count} * sizeof(std::uint64_t));
-    auto* notify = reinterpret_cast<Word*>(Memory() + layout.notify);
-    Store(*notify, args.sequence | (profile ? kProfileNotify : 0));
+    RefreshWindowMemory(Memory() + layout.descriptor, descriptor_bytes);
+    Store(*notify, value);
     RefreshWindowMemory(notify, sizeof(Word));
     Barrier();
   }
 };
 }  // namespace
 
-std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
+std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, MailboxTransfer mailbox_transfer) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !args->request.miss_count ||
+      (args->mailbox_remote && (!args->mailbox_source || !args->mailbox_context.session || !mailbox_transfer)) ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, args->window_capacity)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.
@@ -173,7 +200,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   Execution io{*args, layout, c, CounterNow(),
-      CounterFrequency() * args->timeout_ms / 1000, profile};
+      CounterFrequency() * args->timeout_ms / 1000, profile, mailbox_transfer};
   // Reserve wire sequences once for the launch; graph/status identities remain
   // the ticket's launch sequence even when each replay needs different windows.
   if (!worker) {

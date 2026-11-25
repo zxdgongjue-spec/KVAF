@@ -37,7 +37,8 @@ Transport::~Transport() {
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                              const peer::OpenCpuPushGetRequest& setup, urma::GetTpList query,
                              urma::ImportJettyEx import, std::uint32_t psn,
-                             peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base) {
+                             peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base,
+                             peer::AllocateRegionResponse* mailbox) {
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
@@ -93,15 +94,27 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   cfg.len = bytes;
   cfg.token_id = control_token_;
   cfg.token_value.token = setup.token_value;
-  // This pinned buffer receives local READ results and supplies local WRITE
-  // payloads. Use the probe's direct-host registration, not remote DDR flags.
+  // It supplies the same local Ready/Done words in both modes. The mailbox
+  // also receives WRITE from AICPU and requires remote READ and WRITE access.
   cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-  cfg.flag.bs.access = 1U;  // LOCAL_WRITE in the deployed public UMDK ABI.
+  mailbox_ = mailbox != nullptr;
+  cfg.flag.bs.access = mailbox_ ? ((1U << 1U) | (1U << 2U)) : 1U;
   cfg.flag.bs.non_pin = 0;
   cfg.flag.bs.token_id_valid = 1;
   Stage("register_control");
   control_ = urma_register_seg(context_, &cfg);
   if (!control_) return Error("register control buffer");
+  if (mailbox) {
+    static_assert(sizeof(urma_seg_t) <= peer::kSegKeyBytes);
+    mailbox->session_id = setup.session_id;
+    mailbox->peer_base = control_->seg.ubva.va;
+    mailbox->peer_length = control_->seg.len;
+    mailbox->token_id = control_token_->token_id;
+    mailbox->token_value = setup.token_value;
+    mailbox->segment_key_bytes = sizeof(urma_seg_t);
+    std::memcpy(mailbox->peer_eid, control_->seg.ubva.eid.raw, sizeof(mailbox->peer_eid));
+    std::memcpy(mailbox->segment_key, &control_->seg, sizeof(urma_seg_t));
+  }
   std::uint64_t cpu_tp = 0;
   Stage("query_ctp");
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
@@ -135,7 +148,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                         sizeof(Completion), control_, nullptr});
   AppendPrepared(done, 0, hbm_base_ + layout_.done, sizeof(Completion), 1, true);
   SealPrepared(done_);
-  Stage("ready");
+  Stage(mailbox_ ? "ready_mailbox" : "ready");
   return Status::OK();
 }
 
@@ -213,32 +226,36 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
   return Status::OK();
 }
 Status Transport::ReadRequest(std::uint64_t* sequence) {
-  auto result = Transfer(false, layout_.notify, sizeof(Word));
-  if (result.ok()) {
-    const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
-    *sequence = notify & ~kProfileNotify;
-    profile_.enabled = (notify & kProfileNotify) != 0;
+  if (!mailbox_) {
+    auto read = Transfer(false, layout_.notify, sizeof(Word));
+    if (!read.ok()) return read;
   }
-  return result;
+  // AICPU's ordered notify WRITE publishes the request and its descriptor list.
+  const auto notify = __atomic_load_n(
+      reinterpret_cast<const std::uint64_t*>(memory_ + layout_.notify), __ATOMIC_ACQUIRE);
+  *sequence = notify & ~kProfileNotify;
+  profile_.enabled = (notify & kProfileNotify) != 0;
+  return Status::OK();
 }
 Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (profile_.enabled) {
     profile_ = {};
     profile_.enabled = true;
   }
-  Status result;
-  {
+  if (!mailbox_) {
     BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
-    result = Transfer(false, layout_.request, sizeof(Request));
+    auto read = Transfer(false, layout_.request, sizeof(Request));
+    if (!read.ok()) return read;
   }
-  if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > window_capacity_ || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
-  if (!read.ok()) return read;
+  if (!mailbox_) {
+    auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+    if (!read.ok()) return read;
+  }
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   for (std::uint32_t i = 0; i < r.count; ++i)
     if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))

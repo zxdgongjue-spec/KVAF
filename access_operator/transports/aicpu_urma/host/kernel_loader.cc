@@ -70,14 +70,14 @@ Status PrepareUmdkKernel(const std::string& json, UmdkKernelKind kind) {
     case UmdkKernelKind::Control: mode = "control"; break;
     case UmdkKernelKind::Put: mode = "put"; entry = "KvafAicpuBatchPut"; break;
     case UmdkKernelKind::Gather: mode = "gather_read"; entry = "KvafAicpuGatherReadExecutionV5"; break;
-    case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV4"; break;
+    case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV5"; break;
     default: return Status::InvalidArgument("unknown AICPU kernel kind");
   }
   const std::string context = "AICPU mode=" + std::string(mode) + " json=" + json;
   if (!LoadUmdkKernel(json.c_str()))
     return Status::Internal(context + ": failed to load installed device package");
   std::lock_guard<std::mutex> lock(kernel_mutex);
-  // Scatter uses its Host RA transport, not the AICPU URMA control session.
+  // Mailbox Scatter prepares the UMDK control entry with its own session.
   for (const char* name : {kind == UmdkKernelKind::Scatter ? nullptr : "KvafAicpuUmdkControlSessionsV5",
                           entry}) {
     if (!name) continue;

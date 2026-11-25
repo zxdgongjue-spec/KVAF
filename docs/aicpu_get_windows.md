@@ -19,7 +19,8 @@ get_resources = [
 
 `gather_ddr_bytes` 只用于 URMA AICPU Gather Get，预算覆盖额外 CPU DDR 注册工作区的
 payload、源描述符、控制区和显式 HugeTLB backing 对齐。`scatter_hbm_bytes` 只用于 URMA
-AICPU Scatter Get，预算覆盖连续 HBM 工作区的 payload、源地址数组和控制区。
+AICPU Scatter Get，预算覆盖连续 HBM 工作区的 payload、源地址数组和控制区，
+开启 mailbox 时也计入它的 AICPU WRITE 源缓冲区。
 通信队列、运行库内部开销、独立状态/profile/协调缓冲区及最终 output 不属于这两项工作区预算。
 HBM 预算约束的是传给 ACL 的申请字节数，不是驱动内部保留量。
 
@@ -122,8 +123,8 @@ Scatter 软件超时按窗口重新计时；CANN 单次 launch 的总时限仍�
 
 ## 部署和验证
 
-Gather 的 READ 波次参数使用新入口 `KvafAicpuGatherReadExecutionV5`；Scatter 保持
-`KvafAicpuCpuPushScatterExecutionV4`。
+Gather 的 READ 波次参数使用入口 `KvafAicpuGatherReadExecutionV5`。
+Scatter 的请求控制参数（含可选 mailbox）使用入口 `KvafAicpuCpuPushScatterExecutionV5`。
 自动策略沿用 V5 布局，以内部 0 表示自动模式；部署本次默认值变更也须重编并更新 AICPU 包。
 必须一起更新 CPU 服务、Host 库、Python binding 和 AICPU 包并重启进程，避免旧布局混用。
 新增的 Gather 窗口协商消息和 Scatter setup 的窗口字段在初始化阶段传递，不增加逐窗 Host RPC

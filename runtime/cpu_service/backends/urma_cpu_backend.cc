@@ -1053,9 +1053,20 @@ class CpuService {
         }
       }
     }
-    const auto status = transport->Initialize(region.resources->context(), region.registration->segment(),
-        request, region.resources->tp_query(), region.resources->jetty_import(),
-        NextPsn(), response, region.base);
+    const auto status = [&] {
+      const auto psn = NextPsn();
+      if constexpr (std::is_same_v<Response, peer::OpenCpuPushMailboxResponse>) {
+        if (setup.token_value != region.registration->token_value())
+          return Status::InvalidArgument("CPU push mailbox token differs from region token");
+        return transport->Initialize(region.resources->context(), region.registration->segment(),
+            request, region.resources->tp_query(), region.resources->jetty_import(),
+            psn, &response->base, region.base, &response->mailbox);
+      } else {
+        return transport->Initialize(region.resources->context(), region.registration->segment(),
+            request, region.resources->tp_query(), region.resources->jetty_import(),
+            psn, response, region.base);
+      }
+    }();
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
       const auto stopped = transport->Shutdown();
@@ -1430,6 +1441,20 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       return;
     }
 
+    case Command::kOpenCpuPushMailbox: {
+      peer::OpenCpuPushGetRequest request{};
+      request.header = header;
+      const bool valid = IsValidHeader(header, command, sizeof(request)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
+      peer::OpenCpuPushMailboxResponse response{};
+      response.base.header = MakeHeader(command, sizeof(response));
+      response.base.header.command = ResponseCommand(command);
+      response.base.result = static_cast<int32_t>(valid ?
+          service->OpenCpuPushGet<cpu_push::Transport>(request, &response, &Region::push) :
+          Result::kInvalidRequest);
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
     case Command::kOpenCpuPushGet:
     case Command::kOpenAivCpuGatherPushGet: {
       if (header.version != peer::kProtocolVersion) {
@@ -1591,6 +1616,7 @@ Status UrmaCpuBackend::Call(const std::vector<std::uint8_t>& input,
     case Command::kEnableAivGatherLanes:
     case Command::kPrepareGatherWorkspace:
     case Command::kPrepareGatherWindow:
+    case Command::kOpenCpuPushMailbox:
     case Command::kOpenCpuPushGet:
     case Command::kOpenAivCpuGatherPushGet:
     case Command::kStopGatherLanes:
