@@ -91,6 +91,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOA
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/algorithms
       ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/algorithms/get/direct/urma_aiv/include
       ${ASCEND_CANN_PACKAGE_PATH}/include
       ${CMAKE_CURRENT_BINARY_DIR}/generated
@@ -99,7 +100,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOA
     PUBLIC kvaf_runtime
     PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_GET)
-    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator kvaf_cpu_push_get_host
       kvaf_ubmem_operator kvaf_execute_batch_get_host)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
   endif()

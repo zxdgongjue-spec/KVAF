@@ -106,7 +106,7 @@ def validate_args(args: argparse.Namespace) -> str | None:
     if error:
         return error
     if args.sgl_payload_only and (
-        args.backend != "cpu_sgl_write" or args.miss_count <= 0 or args.contention_control_dir is not None
+        args.backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write") or args.miss_count <= 0 or args.contention_control_dir is not None
     ):
         return "--sgl-payload-only requires a single-card cpu_sgl_write benchmark with positive miss-count"
     if args.device_id < 0:
@@ -196,6 +196,16 @@ def print_aicpu_details(args, execution, samples, details=None):
                           metrics, details, "worker", worker)
 
 
+def print_aiv_sgl_details(args, execution, samples, details=None):
+    for stage in ("request", "notify", "ack"):
+        values = [max(float(w[f"sgl_{stage}_cycles"]) for w in sample) / args.kernel_profile_clock_mhz
+                  for sample in samples]
+        metrics = dict(mean_us=f"{statistics.mean(values):.6f}", p50_us=f"{percentile(values, .5):.6f}",
+                       p99_us=f"{percentile(values, .99):.6f}")
+        print_profile_row("BATCH_GET_PROFILE", dict(backend=args.backend, execution=execution, stage=stage),
+                          metrics, details, "stage", stage)
+
+
 def validate_sgl_payload_sample(workers, rows):
     if not workers or "cpu_sgl_waves" not in workers[0]:
         raise RuntimeError("missing CPU SGL sample; rebuild the matching CPU service, NPU host and AICPU kernel")
@@ -254,7 +264,9 @@ def print_measurements(args, execution, samples, profiles, report=None):
         report.add_summary(execution, measurements)
     if args.kernel_profile:
         details = [] if report is not None and report.profile_path is not None else None
-        if uses_aicpu(args):
+        if args.backend == "aiv_cpu_sgl_write":
+            print_aiv_sgl_details(args, execution, profiles, details)
+        elif uses_aicpu(args):
             print_aicpu_details(args, execution, profiles, details)
         else:
             print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.parallelism,
@@ -270,7 +282,7 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
     execution.release_output(runtime)
     inputs = [GraphInputs(make_plan, torch.empty_like(miss_count), torch.empty_like(output), stream)
               for _ in range(3)]
-    aicpu = uses_aicpu(args)
+    aicpu = uses_aicpu(args) or args.backend == "aiv_cpu_sgl_write"
     unreplayed_error = ("Gather graph has not been replayed" if args.backend == "gather_read" else
                         "Scatter graph has not replayed; replay or discard it")
 
@@ -307,6 +319,8 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
                     if sum(int(p["active_requests"]) for p in profiles) != count:
                         raise AssertionError(f"graph node {i} profile request count mismatch")
                     for p in profiles:
+                        if args.backend == "aiv_cpu_sgl_write":
+                            continue
                         stages = p["stages"]
                         if (int(stages["worker"]) != int(p["core"]) or
                                 int(stages["spans"]) != int(p["active_requests"]) or
@@ -315,7 +329,9 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
                     device_profile_ms(profiles, args.kernel_profile_clock_mhz)
                     snapshots[i] = deepcopy(profiles)
         if aicpu and args.kernel_profile:
-            timelines = [tuple((int(p["device_start_ns"]), int(p["device_finish_ns"]))
+            timeline_keys = (("kernel_start_cycle", "kernel_finish_cycle") if args.backend == "aiv_cpu_sgl_write"
+                             else ("device_start_ns", "device_finish_ns"))
+            timelines = [tuple((int(p[timeline_keys[0]]), int(p[timeline_keys[1]]))
                                for p in profiles) for profiles in snapshots.values()]
             if len(set(timelines)) != len(timelines):
                 raise AssertionError("different graph nodes returned the same profile timeline")
@@ -399,7 +415,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     execution = execution or BenchmarkExecution(
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
-        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
+        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write", "aiv_cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
         get_capacity=args.request_length, sge_per_wr=args.sge_per_wr, sgl_payload_only=args.sgl_payload_only,
     )
     stream = torch.npu.current_stream()
@@ -415,7 +431,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
                           inputs.fixed[2], output, stream=stream, **options)
 
     def check(plan, count, lease=0):
-        if uses_aicpu(args):
+        if uses_aicpu(args) or args.backend == "aiv_cpu_sgl_write":
             runtime.check_batch_get_status(stream, graph_lease=lease)
         check_output(plan, count)
 
@@ -925,10 +941,10 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
     execution = BenchmarkExecution(
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
-        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
+        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write", "aiv_cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
         put_capacity=min(args.populate_chunk_entries, table_capacity),
         get_capacity=request_length, get_cores=args.parallelism or 0, get_jettys=args.jettys_per_core or 0,
-        put_cores=0 if args.backend == "aiv" else args.parallelism,
+        put_cores=0 if args.backend in ("aiv", "aiv_cpu_sgl_write") else args.parallelism,
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
         max_inflight_total=args.max_inflight_total, sge_per_wr=args.sge_per_wr, sgl_payload_only=args.sgl_payload_only,

@@ -15,6 +15,9 @@ struct Config {
   bool direct_output{false};
   std::uint32_t sge_per_wr{0};
   bool sgl_payload_only{false};
+  // AIV uses the same CPU producer and registration lifecycle with its own
+  // device kernel. kernel_json then names an AIV binary object.
+  bool aiv{false};
 };
 class CpuPushTransport {
  public:
@@ -25,7 +28,7 @@ class CpuPushTransport {
   Status Prepare(const BatchGetExecRequest&, std::optional<bool> expected_capture = std::nullopt);
   Status ExecutePrepared(const BatchGetExecRequest&);
   aicpu_urma::ScatterLaunchView View() const;
-  static Status LaunchPrepared(const BatchGetExecRequest&, const aicpu_urma::ScatterLaunchView&, ExecutionState*);
+  static Status LaunchPrepared(const BatchGetExecRequest&, const aicpu_urma::ScatterLaunchView&, ExecutionState*, bool aiv = false);
   Status Drain();
   bool direct_output() const;
   Status RegisterOutput(const MutableBufferView&);

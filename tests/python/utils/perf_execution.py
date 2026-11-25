@@ -30,7 +30,7 @@ class BenchmarkExecution:
         self.input_binding = ("not-needed" if not reusable_input
                               else "transient" if os.environ.get("KVAF_PERF_REUSE_PUT_INPUT", "1") == "0"
                               else "reused")
-        supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aicpu", "gather"), ("aicpu", "cpu_sgl_write"))
+        supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aiv", "cpu_sgl_write"), ("aicpu", "gather"), ("aicpu", "cpu_sgl_write"))
         self.output_binding = ("not-needed" if not supported
                                else "transient" if os.environ.get("KVAF_PERF_REUSE_GET_OUTPUT", "1") == "0"
                                else "reused")
@@ -47,7 +47,8 @@ class BenchmarkExecution:
             get_budget["kernel_path"] = get_kernel
             if transport == "urma":
                 put_budget["jettys"] = put_jettys
-                get_budget.update(jettys=get_jettys, max_inflight_total=max_inflight_total)
+                if algorithm != "cpu_sgl_write":
+                    get_budget.update(jettys=get_jettys, max_inflight_total=max_inflight_total)
         self.runtime_kwargs = dict(
             transport_mode=transport, default_put=put, default_get=get,
             put_resources=[(put, kvaf.ExecutionResources(**put_budget))],

@@ -26,6 +26,27 @@ class CpuSglOptionsTest(unittest.TestCase):
                 self.assertEqual(child.sge_per_wr, count)
                 self.assertEqual(child.aicpu_workers, 4)
 
+    def test_aiv_sgl_resources_and_child_forwarding(self):
+        args = parse_args(["--backend", "aiv_cpu_sgl_write", "--aiv-cores", "4",
+                           "--sge-per-wr", "8", "--sgl-payload-only"])
+        self.assertIsNone(validate_args(args))
+        child = parse_args(workload_command(args))
+        self.assertEqual((child.backend, child.aiv_cores, child.sge_per_wr), ("aiv_cpu_sgl_write", 4, 8))
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        execution = BenchmarkExecution(kvaf, executor="aiv", algorithm="cpu_sgl_write",
+                                       get_cores=4, sge_per_wr=8, sgl_payload_only=True)
+        self.assertEqual(execution.get_config, ("urma", "aiv", "cpu_sgl_write"))
+        budget = execution.runtime_kwargs["get_resources"][0][1]
+        self.assertEqual(budget["sge_per_wr"], 8)
+        self.assertNotIn("jettys", budget)
+        self.assertNotIn("max_inflight_total", budget)
+        self.assertEqual(execution.output_binding, "reused")
+        for options in (["--aiv-cores", "9"], ["--sort-input-indices"],
+                        ["--output-access-pattern", "random"]):
+            self.assertIsNotNone(validate_args(parse_args(["--backend", "aiv_cpu_sgl_write", *options])))
+
     def test_reject_invalid_limits_and_backends(self):
         for value in (-1, 17):
             args = parse_args(["--backend", "cpu_sgl_write", "--sge-per-wr", str(value)])

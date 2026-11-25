@@ -785,7 +785,7 @@ class NpuPythonRuntime final {
       const kvaf::BatchGetKernelProfile& profile = profiles[core];
       py::dict item;
       item["core"] = core;
-      if (profile.device_start_ns) {
+      {
         const auto& sgl = profile.aicpu_profile.cpu_sgl_write;
         if (sgl.waves) {
           item["cpu_sgl_elapsed_ns"] = sgl.elapsed_ns;
@@ -793,6 +793,15 @@ class NpuPythonRuntime final {
           item["cpu_sgl_waves"] = sgl.waves;
           item["cpu_sgl_tail_cqes"] = sgl.tail_cqes;
         }
+      }
+      if (!profile.device_start_ns && profile.aicpu_profile.enter_ns) {
+        item["sgl_request_cycles"] = profile.aicpu_profile.request_ns;
+        item["sgl_notify_cycles"] = profile.aicpu_profile.notify_ns;
+        item["sgl_ack_cycles"] = profile.aicpu_profile.ack_ns;
+        item["sgl_scatter_copies"] = profile.aicpu_profile.scatter_copies;
+        item["sgl_ready_queries"] = profile.aicpu_profile.ready_queries;
+      }
+      if (profile.device_start_ns) {
         item["device_start_ns"] = profile.device_start_ns;
         item["device_finish_ns"] = profile.device_finish_ns;
         BatchGetProfile detailed{};

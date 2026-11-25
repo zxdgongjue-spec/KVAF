@@ -40,6 +40,28 @@ if(KVAF_ENABLE_NPU_PULL)
   add_subdirectory(algorithms/get/raw_addr/urma_aiv)
 endif()
 
+# Host registration/CPU producer lifecycle is shared by AICPU Scatter/SGL and
+# AIV SGL. AIV-only builds do not link/load an AICPU device package.
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH)
+  add_library(kvaf_cpu_push_get_host STATIC
+    algorithms/get/scatter/urma_aicpu/host/cpu_push_host.cc)
+  target_include_directories(kvaf_cpu_push_get_host PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/algorithms" "${CMAKE_CURRENT_SOURCE_DIR}/providers/common"
+    "${CMAKE_SOURCE_DIR}/runtime/include" "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_compile_definitions(kvaf_cpu_push_get_host PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+  target_link_libraries(kvaf_cpu_push_get_host PUBLIC kvaf_access_operator PRIVATE kvaf_direct_hccp_session)
+  if(KVAF_ENABLE_AICPU_CPU_PUSH)
+    target_compile_definitions(kvaf_cpu_push_get_host PRIVATE KVAF_ENABLE_AICPU_CPU_PUSH=1)
+    target_link_libraries(kvaf_cpu_push_get_host PRIVATE kvaf_umdk_host)
+  endif()
+  if(KVAF_ENABLE_AIV_BATCH_GET)
+    target_sources(kvaf_cpu_push_get_host PRIVATE
+      algorithms/get/cpu_sgl_write/urma_aiv/host/access_operator.cc)
+    target_compile_definitions(kvaf_cpu_push_get_host PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
+    target_link_libraries(kvaf_cpu_push_get_host PRIVATE kvaf_execute_batch_get_host)
+  endif()
+endif()
+
 if(KVAF_ENABLE_AIV_BATCH_GET)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     add_subdirectory(algorithms/put/urma_aiv)

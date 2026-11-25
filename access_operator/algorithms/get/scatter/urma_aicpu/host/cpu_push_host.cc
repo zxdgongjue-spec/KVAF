@@ -1,6 +1,10 @@
 #include "get/scatter/urma_aicpu/include/cpu_push_transport.h"
 #include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_urma/kernel_loader.h"
+#include "cpu_sgl_write_aiv_abi.h"
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#include "get/cpu_sgl_write/urma_aiv/include/cpu_sgl_write_aiv.h"
+#endif
 #include "batch_get_args.h"
 #include "aicpu_batch_get_capture.h"
 #include "aicpu_batch_get_profile.h"
@@ -14,11 +18,12 @@
 #include <cstring>
 #include <map>
 #include <utility>
-#include <urma_api.h>
+
 
 namespace kvaf::cpu_push {
 namespace d = direct_hccp;
 namespace {
+constexpr std::size_t kSegmentBytes = 48;  // Direct-HCCP/UMDK exported segment ABI.
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 }  // namespace
 struct CpuPushTransport::Impl {
@@ -156,15 +161,15 @@ Status CpuPushTransport::RegisterOutput(const MutableBufferView& output) {
       else s.health.failed = true;
       return Error("register output");
     }
-    if (mr.out.key.size < sizeof(urma_seg_t) || mr.out.key.size > kOutputSegmentBytes) {
+    if (mr.out.key.size < kSegmentBytes || mr.out.key.size > kOutputSegmentBytes) {
       s.health.failed = true;
       return Error("unexpected output segment ABI; shutdown required");
     }
     registration.target.base = key.first;
     registration.target.bytes = key.second;
     registration.target.token_value = s.token_value;
-    registration.target.segment_bytes = sizeof(urma_seg_t);
-    std::memcpy(registration.target.segment, mr.out.key.value, sizeof(urma_seg_t));
+    registration.target.segment_bytes = kSegmentBytes;
+    std::memcpy(registration.target.segment, mr.out.key.value, kSegmentBytes);
     found = s.outputs.find(key);
   }
   ++found->second.users;
@@ -333,7 +338,15 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
     if (!ready.ok()) return ready;
   }
   const auto profile = View().profile;
-  return detail::CopyAicpuProfiles(profile.device, profile.host, s.config.workers, profiles);
+  auto copied = detail::CopyAicpuProfiles(profile.device, profile.host, s.config.workers, profiles);
+  if (copied.ok() && s.config.aiv) for (auto& p : *profiles) {
+    // The shared buffer stores raw AIV cycles, never nanoseconds.
+    p.kernel_start_cycle = p.device_start_ns;
+    p.kernel_finish_cycle = p.device_finish_ns;
+    p.drain_wait_cycles = p.aicpu_profile.ack_ns;
+    p.device_start_ns = p.device_finish_ns = 0;
+  }
+  return copied;
 }
 
 Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
@@ -345,8 +358,20 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     return Status::InvalidArgument("sgl_payload_only requires CPU SGL Write");
   if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.config.direct_output) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
-      !aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str()))
-    return Status::InvalidArgument("CPU push requires kernel JSON, PeerLink, local EID and valid shape");
+      s.config.kernel_json.empty())
+    return Status::InvalidArgument("CPU push requires a kernel path, PeerLink, local EID and valid shape");
+  bool loaded = false;
+  if (s.config.aiv) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+    loaded = s.config.direct_output && KvafCpuSglWriteAivLoadKernel(s.config.kernel_json.c_str()) == 0;
+#endif
+  } else {
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+    loaded = aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str());
+#endif
+  }
+  if (!loaded) return Error("load CPU push device kernel");
+  const auto coordination_bytes = s.config.aiv ? sizeof(AivCoordination) : sizeof(Coordination);
   s.source = source;
   peer::PeerRegion region;
   auto result = s.config.peer_link->LookupRegion(source.base, &region);
@@ -365,10 +390,10 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   const auto status_bytes = s.config.workers * sizeof(WorkerStatus);
   if (aclrtMalloc(&s.memory, s.layout.bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMemset(s.memory, s.layout.bytes, 0, s.layout.staging) != ACL_SUCCESS ||
-      aclrtMalloc(&s.coordination, sizeof(Coordination), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+      aclrtMalloc(&s.coordination, coordination_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMalloc(&s.status_device, status_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMallocHost(&s.status_host, status_bytes) != ACL_SUCCESS ||
-      aclrtMemset(s.coordination, sizeof(Coordination), 0, sizeof(Coordination)) != ACL_SUCCESS ||
+      aclrtMemset(s.coordination, coordination_bytes, 0, coordination_bytes) != ACL_SUCCESS ||
       aclrtMemset(s.status_device, status_bytes, 0, status_bytes) != ACL_SUCCESS)
     return Error("allocate workspace");
   // Match the probe's HBM registration contract; the token is session-local.
@@ -382,18 +407,18 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   mr.in.ub.token_id_handle = s.token;
   if (s.api.lmem_register(s.context, &mr, &s.memory_handle) || !s.memory_handle)
     return Error("register HBM workspace");
-  static_assert(sizeof(urma_seg_t) <= peer::kSegKeyBytes);
-  if (mr.out.key.size < sizeof(urma_seg_t) || mr.out.key.size > peer::kSegKeyBytes)
+  static_assert(kSegmentBytes <= peer::kSegKeyBytes);
+  if (mr.out.key.size < kSegmentBytes || mr.out.key.size > peer::kSegKeyBytes)
     return Error("unexpected HBM segment ABI");
-  urma_seg_t segment{};
-  std::memcpy(&segment, mr.out.key.value, sizeof(segment));
+  std::uint64_t segment_base = 0;
+  std::memcpy(&segment_base, mr.out.key.value + 20, sizeof(segment_base));
   peer::OpenCpuPushGetRequest open{};
   open.source_bytes = source.length;
-  open.hbm_base = segment.ubva.va;
+  open.hbm_base = segment_base;
   open.hbm_bytes = s.layout.bytes;
   open.npu_psn = 1;
   open.token_value = token_value;
-  open.segment_bytes = sizeof(segment);
+  open.segment_bytes = kSegmentBytes;
   open.token_bytes = s.config.token_bytes;
   open.workers = s.config.workers;
   open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
@@ -429,9 +454,15 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   s.initialized = true;
   s.views.Bind(s.invocation);
   s.views.Initialize(s.source);
-  std::fprintf(stderr, "[KVAF_AICPU] CPU_PUSH_REFERENCE commit=%s protocol=3 "
-      "copy=%s barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first\n",
-      kReferenceCommit, s.config.direct_output ? "none_direct_output" : "per_row_memcpy_sp");
+  if (s.config.aiv) {
+    std::fprintf(stderr, "[KVAF_AIV] CPU_SGL_WRITE protocol=3 copy=none_direct_output "
+        "request_builder=simt workers=%u jettys=%u workspace_policy=huge_first\n",
+        s.config.workers, kJettyCount);
+  } else {
+    std::fprintf(stderr, "[KVAF_AICPU] CPU_PUSH_REFERENCE commit=%s protocol=3 "
+        "copy=%s barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first\n",
+        kReferenceCommit, s.config.direct_output ? "none_direct_output" : "per_row_memcpy_sp");
+  }
   return Status::OK();
 }
 
@@ -487,10 +518,10 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
   return ready.ok() ? ExecutePrepared(exec) : ready;
 }
 Status CpuPushTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
-  return LaunchPrepared(exec, View(), impl_->invocation);
+  return LaunchPrepared(exec, View(), impl_->invocation, impl_->config.aiv);
 }
 Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
-                                        const aicpu_urma::ScatterLaunchView& view, ExecutionState* state) {
+                                        const aicpu_urma::ScatterLaunchView& view, ExecutionState* state, bool aiv) {
   const auto submit_started = GetHostTimingStart(exec.host_timing);
   auto* invocation = dynamic_cast<aicpu_urma::AicpuGetInvocation*>(state);
   auto valid_view = view.common.Validate(invocation, ExecutionDirection::Get);
@@ -526,7 +557,19 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   if (call.prepared_capturing) call.captured_stream = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0;
   if (profile) profile->prepare_ns = stamp - begin;
-  if (view.direct_output ? LaunchCpuSglWrite(&direct_args, stream) : LaunchCpuPushScatter(&args, stream)) {
+  int launched = -1;
+  if (aiv) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+    launched = KvafCpuSglWriteAivLaunch(&direct_args, stream);
+#endif
+  } else {
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+    launched = view.direct_output
+        ? aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuSglWriteExecutionV1", &direct_args, sizeof(direct_args), stream, args.workers)
+        : aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuPushScatterExecutionV3", &args, sizeof(args), stream, args.workers);
+#endif
+  }
+  if (launched) {
     view.health->failed = true;
     return call.failure = Error("launch kernel");
   }

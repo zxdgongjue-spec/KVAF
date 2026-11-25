@@ -1,6 +1,9 @@
-add_library(kvaf_execute_batch_get_host SHARED batch_get_host.cpp execute_batch_get_loader.cpp)
+add_library(kvaf_execute_batch_get_host SHARED batch_get_host.cpp execute_batch_get_loader.cpp
+  ../../../cpu_sgl_write/urma_aiv/host/loader.cpp)
 target_include_directories(kvaf_execute_batch_get_host
   PUBLIC "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}"
+  PRIVATE "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/algorithms/get/cpu_sgl_write/urma_aiv/include"
+          "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include"
   PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
 target_compile_definitions(kvaf_execute_batch_get_host PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
 target_compile_options(kvaf_execute_batch_get_host PRIVATE -O2 -fno-common -fno-strict-aliasing)

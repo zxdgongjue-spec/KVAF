@@ -123,3 +123,12 @@ c++ -std=c++17 -Icommon/include -Iaccess_operator/include -Imeta_manager/include
   -Wl,--wrap=mmap,--wrap=munmap,--wrap=madvise -o /tmp/kvaf-cpu-ddr-page-modes
 /tmp/kvaf-cpu-ddr-page-modes
 ```
+
+## AIV and AICPU CPU SGL Write checks
+
+`bash tests/diagnostics/run_cpu_sgl_host_checks.sh /tmp/kvaf-sgl-host-checks`
+compiles and runs both actual kernel control-flow models with ASan/UBSan, checks
+AIV-only/AICPU Host syntax using fake ACL declarations, and runs the Python option
+regressions. AIV's model verifies that its only MTE writes are source descriptors;
+the simulated CPU writes payload and publishes done. See
+[CPU SGL Write](../../docs/cpu_sgl_write.md#aiv-cpu-sgl-write) for hardware validation.

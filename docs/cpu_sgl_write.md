@@ -194,3 +194,58 @@ done
 ```bash
 rg 'CPU_SGL_WRITE_(SAMPLE|STAGES)' cpu-service.log
 ```
+
+## AIV CPU SGL Write
+
+AIV 版本使用 `GetExecutionConfig("urma", "aiv", "cpu_sgl_write")`：
+
+```python
+get = kvaf.GetExecutionConfig("urma", "aiv", "cpu_sgl_write")
+resources = kvaf.ExecutionResources(cores=4, sge_per_wr=8)
+# 将 get/resources 放入 default_get/get_resources。
+```
+
+源地址构建参考 `origin/aiv-scatter` 的 `BuildSourcesSimt`：SIMT 绕过私有
+DCache 读取输入，经 UB → GM 写入地址描述符。所有 AIV 核验证输出恒等映射并完成
+描述符写入后，核 0 发布 notify。CPU 复用上文的四路 Jetty、SGL WRITE、output
+segment 导入和 done 协议，直接写调用方连续 output。AIV 不分配 payload staging、
+不轮询 ready，也不执行 payload scatter。`sge_per_wr`、`sgl_payload_only`、有效前缀、
+输出注册复用和故障时先 STOP 再注销 HBM 的规则与 AICPU SGL 相同。
+
+`cores` 支持 1..8，CPU 全局固定四路 Jetty；此算法不接受 `jettys` 或
+`max_inflight_total` 资源配置。每个核独占 epoch/builder cache line，在同一资源的
+多个图节点、图回放和普通调用之间推进 sequence，不依赖 Host 回放代理或 AIV
+跨核标量原子操作。任一核发现非法输入时不通知 CPU；后续排队回放也保留失败。
+控制轮询使用有界 poll budget，不将 AIV cycle 当作 CPU 单调时间。
+
+同步、异步、两种 AccessTable 重载、`begin_get_output` 和 Get 图租约沿用现有接口。
+`batch_get(profile=True)` 的纳秒明细接口不适用于 AIV SGL；使用
+`start_batch_get_kernel_profile` / `batch_get_kernel_profile`，时间戳和 request/notify/ack
+分段为 AIV cycles。CPU payload sample 仍为 CPU 纳秒，两种时钟不能直接相减。
+性能入口的 `--kernel-profile-clock-mhz` 负责换算 AIV cycles，请填写目标设备的实际频率。
+
+AIV 设备入口 `KvafCpuSglWriteAivKernelV1` 编入
+`bin/kvaf_execute_batch_get_kernels.o`。重建 NPU Host/Python 库和该 kernel object；
+CPU 服务使用支持本文现有 SGL 协议的版本即可。`./build.sh npu --without-aicpu`
+也包含此实现，无需安装 AICPU 设备包。
+
+```bash
+./build.sh npu --without-aicpu
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv_cpu_sgl_write --aiv-cores 4 --sge-per-wr 8 --execution both \
+  --request-length 4096 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 1 \
+  --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+  --warmup 10 --iterations 100 --kernel-profile --multi-graph-check
+```
+
+以实际频率设置 `--kernel-profile-clock-mhz`。另测 `--miss-count 7` 和
+`--miss-count 0`（空请求测试去掉 `--multi-graph-check`）；测 CPU 有效载荷窗口时增加 `--sgl-payload-only`，可对比
+`--backend cpu_sgl_write --aicpu-workers 4` 的 CPU 侧统计。
+
+不依赖 SDK 的检查入口为 `bash tests/diagnostics/run_cpu_sgl_host_checks.sh`。
+包含真实 AIV `.asc` 控制流的多线程模型、1/4/8 核、超过单个 UB tile 的请求、
+多轮 sequence、输入变化、部分/空前缀、非法映射和源输入、等待 done、远端失败与超时，
+并检查 MTE 只复制地址描述符。ASan/UBSan 和 Host 声明检查不替代 CANN 编译、
+真实 DMA 可见性、注册退役和图回放的目标设备验证。

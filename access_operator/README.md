@@ -23,6 +23,7 @@ access_operator/
         common/           # 两种 Direct kernel 的组合编译单元
       gather/urma_aicpu/   # CPU Gather + AICPU READ
       scatter/urma_aicpu/  # CPU Push + AICPU Scatter
+      cpu_sgl_write/urma_aiv/  # SIMT descriptors + CPU SGL direct output
       common/aicpu/       # Gather/Scatter 共享 ABI、loader、设备入口和测试
     put/
       urma_aiv/           # URMA AIV Put

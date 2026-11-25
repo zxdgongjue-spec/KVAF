@@ -6,6 +6,7 @@
 #include "batch_get_ticket.h"
 #include "aicpu_urma/control_abi.h"
 #include "cpu_push_get_layout.h"
+#include "cpu_push_kernel_abi.h"
 namespace kvaf {
 constexpr std::uint32_t kGatherMaxSglSize = 6U;
 }  // namespace kvaf
@@ -57,32 +58,9 @@ inline constexpr std::uint64_t GatherWorkspaceBytes(std::uint32_t workers) {
   return kGatherDescriptorOffset + workers * GatherLaneDescriptorBytes(workers);
 }
 static_assert(sizeof(GatherReadArgs) <= 256U);
-struct AicpuBatchGetInput {
-  // GatherRead with indices == 0 reads address_table[i] as a complete source
-  // address; offsets is unused. Other callers use address_table[indices[i]] + offsets[i].
-  // Caller guarantees valid indices, offsets, addresses and output rows, as in
-  // the original kernels; device execution does not scan/validate each entry.
-  std::uint64_t address_table{}, indices{}, offsets{}, miss_count{}, output_indices{};
-  std::uint32_t table_capacity{}, request_capacity{}, token_bytes{};
-  std::uint64_t valid_table{}, canonical_base{}, logical_bytes{}, block_bytes{};
-};
+using AicpuBatchGetInput = cpu_push::BatchGetInput;
 struct UmdkBatchGetArgs {
   AicpuBatchGetInput request;
   GatherReadArgs gather;
 };
 }  // namespace kvaf::aicpu_urma
-
-namespace kvaf::cpu_push {
-struct KernelArgs {
-  aicpu_urma::AicpuBatchGetInput request;
-  std::uint64_t workspace{}, output{}, output_bytes{}, coordination{}, status{}, profile{};
-  std::uint64_t sequence{};  // Assigned in each instance's local copy after claiming a ticket.
-  std::uint32_t workers{}, timeout_ms{kTimeoutMs};
-};
-// Keep the Scatter V3 launch ABI unchanged. The direct-write entry owns its
-// additional exported-output argument.
-struct CpuSglWriteArgs {
-  KernelArgs execution;
-  OutputTarget output_target;
-};
-}  // namespace kvaf::cpu_push

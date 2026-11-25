@@ -28,8 +28,7 @@ Status ValidateExecution(TransportMode mode, GetExecutionConfig c) {
       (c.algorithm != GetAlgorithm::Direct && c.algorithm != GetAlgorithm::Gather &&
        c.algorithm != GetAlgorithm::Scatter && c.algorithm != GetAlgorithm::CpuSglWrite) ||
       (c.transport == Transport::Ubmem && c.algorithm != GetAlgorithm::Direct) ||
-      (c.executor == Executor::Aicpu && c.algorithm == GetAlgorithm::Direct) ||
-      (c.algorithm == GetAlgorithm::CpuSglWrite && c.executor != Executor::Aicpu))
+      (c.executor == Executor::Aicpu && c.algorithm == GetAlgorithm::Direct))
     return Status::InvalidArgument("unsupported Get execution combination for transport mode");
   return Status::OK();
 }

@@ -169,7 +169,7 @@ int main() {
   const GetExecutionConfig config{Transport::Urma, Executor::Aicpu, GetAlgorithm::CpuSglWrite};
   assert(ValidateExecution(TransportMode::Urma, config).ok());
   assert(!ValidateExecution(TransportMode::Ubmem, config).ok());
-  assert(!ValidateExecution(TransportMode::Urma,
+  assert(ValidateExecution(TransportMode::Urma,
       GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::CpuSglWrite}).ok());
   execution::Request request;
   request.op = execution::Op::PrepareCpuPullRegion;

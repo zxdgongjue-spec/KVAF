@@ -47,7 +47,7 @@ class BatchGetCsv:
             payload_bytes_per_call=args.miss_count * args.token_bytes,
             jettys_per_core=args.jettys_per_core if args.backend == "aiv" else None,
             max_inflight_total=args.max_inflight_total if args.backend == "aiv" else None,
-            sge_per_wr=args.sge_per_wr if args.backend == "cpu_sgl_write" else None,
+            sge_per_wr=args.sge_per_wr if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write") else None,
         )
 
     def add_summary(self, execution, measurements):

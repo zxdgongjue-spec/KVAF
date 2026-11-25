@@ -7,8 +7,8 @@ import sys
 from .npu_eids import parse_npu_eids
 
 
-BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter", "cpu_sgl_write")
-DEFAULT_PARALLELISM = {"aiv": None, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5, "cpu_sgl_write": 5}
+BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter", "cpu_sgl_write", "aiv_cpu_sgl_write")
+DEFAULT_PARALLELISM = {"aiv": None, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5, "cpu_sgl_write": 5, "aiv_cpu_sgl_write": 4}
 MAX_JETTYS_PER_CORE = 64
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
@@ -95,7 +95,7 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 disables the limit)")
     group.add_argument("--sge-per-wr", type=int,
                        default=environment_int("KVAF_BATCH_GET_PERF_SGE_PER_WR", 0),
-                       help="maximum source SGEs per WRITE WR; cpu_sgl_write only (0=auto, 1..16)")
+                       help="maximum source SGEs per WRITE WR; cpu_sgl_write/aiv_cpu_sgl_write (0=auto, 1..16)")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")
@@ -157,7 +157,7 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 def validate_workload(args):
     if not 0 <= args.sge_per_wr <= 16:
         return "sge-per-wr must be in [0, 16] (0 selects the device limit)"
-    if args.sge_per_wr and args.backend != "cpu_sgl_write":
+    if args.sge_per_wr and args.backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
         return "sge-per-wr is configurable only for --backend cpu_sgl_write"
     if not 1 <= args.request_length <= 65536:
         return "request-length must be in [1, 65536]"
@@ -171,10 +171,10 @@ def validate_workload(args):
         return "configured table size must fit uint64"
     if not 0 <= args.miss_count <= args.request_length:
         return "miss-count must be between zero and request-length"
-    maximum = 8 if uses_aicpu(args) else 48
+    maximum = 8 if uses_aicpu(args) or args.backend == "aiv_cpu_sgl_write" else 48
     if args.parallelism is not None and not 1 <= args.parallelism <= maximum:
         return f"{parallelism_field(args.backend).replace('_', '-')} must be in [1, {maximum}]"
-    if uses_aicpu(args) and max(args.token_bytes * 65536, args.token_bytes * args.tokens_per_block) > 0xFFFFFFFF:
+    if (uses_aicpu(args) or args.backend == "aiv_cpu_sgl_write") and max(args.token_bytes * 65536, args.token_bytes * args.tokens_per_block) > 0xFFFFFFFF:
         return "AICPU token workspace and block bytes must fit uint32"
     if args.transport == "ubmem" and args.peer_ub_device:
         return "peer-ub-device applies only to URMA"
@@ -188,7 +188,7 @@ def validate_workload(args):
             return "max-inflight-total must fit uint32"
         if args.parallelism is not None and args.max_inflight_total and args.max_inflight_total < 2 * args.parallelism:
             return "max-inflight-total must be zero or at least twice aiv-cores"
-    if args.backend == "cpu_sgl_write":
+    if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
         if args.output_access_pattern != "contiguous":
             return "cpu_sgl_write requires --output-access-pattern contiguous"
         if args.sort_input_indices:
@@ -215,7 +215,7 @@ def workload_command(args):
         if args.jettys_per_core is not None:
             command += ["--jettys-per-core", str(args.jettys_per_core)]
         command += ["--max-inflight-total", str(args.max_inflight_total)]
-    if args.backend == "cpu_sgl_write":
+    if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
         command += ["--sge-per-wr", str(args.sge_per_wr)]
     if args.npu_eids:
         command += ["--npu-eids", ",".join(args.npu_eids)]
@@ -238,7 +238,7 @@ def configure_backend_help(parser, argv=None):
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
-    if backend != "cpu_sgl_write":
+    if backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
         hidden.update(("sge_per_wr", "sgl_payload_only"))
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))

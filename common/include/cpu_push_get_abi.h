@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include "batch_get_profile.h"
+#include "batch_get_profile_abi.h"
 
 namespace kvaf::cpu_push {
 // V3 ports the a12bb16 V24 per-row pipeline and removes the V2 sort workspace.

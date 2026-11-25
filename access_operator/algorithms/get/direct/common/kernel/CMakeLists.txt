@@ -7,7 +7,8 @@ list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_ALGORITHM_INCLUDE_DIR}")
 
 set(KVAF_UBMEM_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../ubmem_aiv/kernel/execute_batch_get_ubmem.asc")
 set(KVAF_OPERATOR_INCLUDE "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/include")
-list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_OPERATOR_INCLUDE}")
+list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_OPERATOR_INCLUDE}"
+  "-I${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include")
 
 add_custom_command(
   OUTPUT "${KVAF_EXECUTE_KERNEL_OBJECT}"
@@ -15,11 +16,17 @@ add_custom_command(
           ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
   COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_EXECUTE_KERNEL_TMP}"
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
-  DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_URMA_SOURCE}" "${KVAF_UBMEM_SOURCE}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cpu_sgl_write/urma_aiv/kernel/cpu_sgl_write_aiv.asc"
+          "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_sgl_write_aiv_abi.h"
+          "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_push_kernel_abi.h"
+          "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/cpu_push_get_abi.h"
+          "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include/batch_get_profile_abi.h"
+          "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_URMA_SOURCE}" "${KVAF_UBMEM_SOURCE}"
           "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
           "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_schedule.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+          "${KVAF_SIMT_API_DIR}/simt_api/device_functions.h"
   VERBATIM)
 add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
 add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD
