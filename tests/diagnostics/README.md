@@ -142,6 +142,8 @@ with GM in a distinct address space, catching unsupported local/GM struct copies
 that the executable model cannot detect. AIV's model verifies that its only MTE writes are source descriptors;
 the simulated CPU writes payload and publishes done. See
 [CPU SGL Write](../../docs/cpu_sgl_write.md#aiv-cpu-sgl-write) for hardware validation.
+The syntax check also rejects the Host-only `Progress()` ABI helper in AIV
+source; device code encodes the same sequence/progress token directly.
 
 The same runner includes the independent `cpu_sgl_push` AIV/AICPU models.
 The AIV model consumes actual USER_CTL WQEs, checks splitting and SQ/CQ wrap,

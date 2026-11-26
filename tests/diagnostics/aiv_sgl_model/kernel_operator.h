@@ -12,6 +12,13 @@
 #if defined(KVAF_CPU_SGL_AIV_ADDRESS_SPACE_CHECK)
 // Clang can enforce GM/local type separation without the CANN toolchain.
 #define __gm__ __attribute__((address_space(1)))
+// The executable model erases __aicore__. Reject this Host-only ABI helper
+// explicitly in the device-source syntax check so that restriction stays tested.
+namespace kvaf::cpu_push {
+inline constexpr std::uint64_t Progress(std::uint64_t, std::uint32_t)
+    __attribute__((unavailable("Host-only Progress() cannot be called from AIV code")));
+}
+#include "cpu_push_get_abi.h"
 #else
 #define __gm__
 #endif
