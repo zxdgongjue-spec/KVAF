@@ -456,7 +456,7 @@ struct Fixture {
     assert(h->pipeline_chunk_bytes == ChunkBytes(worker) && h->span_bytes == token && h->ready_bytes == 0);
     const auto header_bytes = kvaf::GatherPrefixHeaderBytes(args.first_chunk_divisor != 0);
     if (args.first_chunk_divisor) {
-      const auto* config = reinterpret_cast<const kvaf::GatherChunkConfig*>(local + sizeof(*h));
+      const auto* config = reinterpret_cast<const kvaf::AivGatherChunkConfig*>(local + sizeof(*h));
       assert(config->first_chunk_divisor == args.first_chunk_divisor &&
              config->tail_chunks == args.cooperative_chunks && !config->reserved);
     }

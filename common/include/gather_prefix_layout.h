@@ -37,11 +37,11 @@ inline constexpr std::uint32_t kGatherBootstrapTailChunks = 4;
 // GDR6 appends an explicit 16-byte layout config after the unchanged 48-byte
 // prefix header. Sequence/ready offsets and source span records stay unchanged.
 inline constexpr std::uint64_t kGatherConfiguredMagic = 0x4b56414647445236ULL;
-struct GatherChunkConfig {
+struct AivGatherChunkConfig {
   std::uint32_t first_chunk_divisor, tail_chunks;
   std::uint64_t reserved;
 };
-static_assert(sizeof(GatherChunkConfig) == 16);
+static_assert(sizeof(AivGatherChunkConfig) == 16);
 inline constexpr std::uint32_t kGatherMaxCooperativeChunks = 32;
 inline constexpr std::uint32_t kGatherMaxProgressChunks = kGatherMaxCooperativeChunks + 1;
 inline constexpr std::uint32_t kGatherScratchBytes = 64;
@@ -59,7 +59,7 @@ KVAF_PREFIX_INLINE bool GatherCooperativeLayoutValid(std::uint32_t chunks, std::
       GatherCooperativeCountValid(chunks);
 }
 KVAF_PREFIX_INLINE std::uint32_t GatherPrefixHeaderBytes(bool configurable) {
-  return sizeof(peer::GatherDescriptorHeader) + (configurable ? sizeof(GatherChunkConfig) : 0U);
+  return sizeof(peer::GatherDescriptorHeader) + (configurable ? sizeof(AivGatherChunkConfig) : 0U);
 }
 KVAF_PREFIX_INLINE std::uint64_t GatherFirstChunkBytes(
     std::uint64_t total_bytes, std::uint32_t first_divisor) {

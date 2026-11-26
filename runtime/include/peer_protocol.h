@@ -22,6 +22,9 @@ constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
 constexpr uint32_t kMaxGatherSpans = 65536U;
 constexpr uint32_t kChannelSharedTp = 1U;
+// StatusResponse::reserved bits returned by a successful kEnableGatherLanes.
+constexpr uint32_t kGatherLanesPullGroups = 1U;
+constexpr uint32_t kGatherLanesChunkedPullGroups = 2U;
 constexpr uint32_t kDeviceNameBytes = 64U;
 
 enum class Command : uint16_t {
@@ -38,10 +41,11 @@ enum class Command : uint16_t {
   kPrepareGatherWorkspace = 14U,
   kGetCacheCandidateCount = 15U,  // Service-affinity view used by ordinary cache providers.
   kPrepareGatherWindow = 16U,
-  kOpenAivCpuGatherPushGet = 17U,
+  kPrepareGatherRoute = 17U,
   kEnableAivGatherLanes = 18U,
   kStopGatherLanes = 19U,
   kOpenCpuPushMailbox = 20U,
+  kOpenAivCpuGatherPushGet = 21U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
@@ -156,6 +160,15 @@ struct PrepareGatherWindowResponse {
   AllocateRegionResponse workspace;
 };
 
+// A second registration of the session's existing Gather workspace.
+struct PrepareGatherRouteRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint32_t candidate;
+};
+
+// CreateChannel reserved bit 0 is shared TP. Bits 1..31 encode candidate+1
+// for registered Gather routes (zero retains the primary region).
 struct CreateChannelRequest {
   MessageHeader header;
   uint64_t session_id;

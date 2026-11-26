@@ -51,7 +51,7 @@ constexpr UrmaAivParallelism DefaultUrmaAivParallelism(bool get, bool peer_local
 }
 struct ExecutionResources {
   // Zero cores/Jettys select provider defaults: local URMA AIV Get 2 x 2,
-  // remote Get 4 x 1, Put 2 x 2. UBMEM AIV uses 16 cores, AICPU Put 1 / Get 5. An absent
+  // remote Get 4 x 1, Put 2 x 2. UBMEM AIV uses 16 cores, AICPU Put 1 / Get 6. An absent
   // in-flight budget uses 2048; explicit zero uses SQ/CQ capacity for URMA AIV Get.
   // Get derives total capacity from each invocation's buffers; request_capacity
   // is a warmup hint for Get and a provider limit for Put.
@@ -67,6 +67,9 @@ struct ExecutionResources {
   // An absent value selects 512 for miss_count <= 8192, otherwise 64, on device
   // for every launch/replay. Explicit [1, 4096] values override that policy.
   std::optional<std::uint32_t> gather_read_wave_wrs;
+  // URMA AICPU Gather only: address groups per publication. Explicit >
+  // KVAF_GATHER_ADDRESS_GROUPS_PER_POST > default 3. Any positive value is valid.
+  std::optional<std::uint32_t> gather_address_groups_per_post;
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

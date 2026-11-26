@@ -29,7 +29,7 @@ NPU 主机加载实际 CANN 环境后，在仓库根目录执行：
 `npu` 默认构建全部后端和 Python binding，并安装 AICPU 包。
 使用新的 CPU 服务和 NPU 客户端进程。默认产物位于 `build-npu/python/kvaf` 与
 `build-npu/bin`。AIV Get / Put 入口分别为 V3 / V2；AICPU Control 为 V5，
-Gather / Scatter Execution 为 V3。不能混用旧 Host 或设备包。
+Gather / Scatter Execution 为 V5。不能混用旧 Host 或设备包。
 
 ## 四种 Get 共用一个入口
 
@@ -115,7 +115,7 @@ BASH
 
 每个后端均应输出 `BATCH_GET_MULTI_GRAPH_PASS`、`BATCH_GET_GRAPH_RESOURCES_PASS`
 和 `BATCH_GET_GRAPH_PASS`。核数/worker 使用该后端默认值；需要对比性能时保持原配置一致。
-AICPU Scatter 使用原生 ACL 图接口。其他后端默认使用 Torch Graph，也可指定 `--graph-api acl`。
+所有后端默认使用 ACL 图接口。AICPU Scatter 固定使用原生 ACL 图，其他后端可追加 `--graph-api torch` 验证 Torch 图。
 
 ## Put 使用同步性能入口
 

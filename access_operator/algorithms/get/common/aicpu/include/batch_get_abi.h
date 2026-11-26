@@ -1,7 +1,10 @@
 #pragma once
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
 #include "gather_workspace.h"
+#include "gather_pull_plan.h"
 #include "batch_get_profile.h"
 #include "batch_get_ticket.h"
 #include "aicpu_urma/control_abi.h"
@@ -32,12 +35,41 @@ enum GatherReadError : std::uint64_t {
 
 struct alignas(64) GatherReadStatus {
   std::uint64_t magic, result, phase, ack_seen, cqe_word, sequence;
+  std::uint64_t ready_profile_stamp;
+  std::uint32_t ready_profile_first, ready_profile_second;
   std::uint64_t completed_requests, failed_request;
 };
+static_assert(sizeof(GatherReadStatus) == 128, "Gather worker status stride changed");
+// Tag the paired profile timestamp. Previous status formats stored the untagged timestamp here.
+constexpr std::uint64_t kGatherReadyProgressCookie = 0xa7b18d3252504731ULL;
+inline std::optional<GatherReadyObservation> GatherReadyProgress(const GatherReadStatus& status,
+                                                                 const BatchGetWorkerProfile& sample) {
+  if (status.magic != kGatherStatusMagic || status.result || !sample.enter_ns || !sample.ready_queries ||
+      status.ready_profile_stamp != (sample.enter_ns ^ kGatherReadyProgressCookie)) return std::nullopt;
+  return GatherReadyObservation{status.ready_profile_first, status.ready_profile_second};
+}
+constexpr std::uint64_t kGatherPullProfileCookie = 0xb3a3d0ba50554c31ULL;
+inline void StampGatherPullPlan(GatherReadStatus& status, const BatchGetWorkerProfile& sample,
+                               std::uint32_t advances, std::uint32_t groups) {
+  status.ready_profile_first = advances;
+  status.ready_profile_second = groups;
+  status.ready_profile_stamp = sample.enter_ns ^ kGatherPullProfileCookie;
+}
+inline std::optional<GatherPullObservation> GatherPullProgress(const GatherReadStatus& status,
+                                                              const BatchGetWorkerProfile& sample) {
+  if (status.magic != kGatherStatusMagic || status.result || !sample.enter_ns || !sample.ready_queries ||
+      status.ready_profile_stamp != (sample.enter_ns ^ kGatherPullProfileCookie)) return std::nullopt;
+  return GatherPullObservation{status.ready_profile_first, status.ready_profile_second};
+}
 struct alignas(64) GatherExecutionControl {
-  std::uint64_t claimed{}, failed{}, reserved[6]{};
+  std::uint64_t claimed{}, failed{};
+  GatherChunkConfig chunks{};
+  std::uint64_t reserved64{};
+  std::uint32_t address_groups_per_post{kGatherDefaultAddressGroupsPerPost}, reserved32{};
+  std::uint64_t reserved[3]{};
   alignas(64) std::uint64_t window_sequence[kGatherMaxWorkers]{};
 };
+static_assert(sizeof(GatherExecutionControl) == 128, "Gather execution control stride changed");
 struct GatherReadArgs {
   UmdkContext context;
   std::uint64_t core_status{0U};
@@ -55,6 +87,7 @@ struct GatherReadArgs {
   std::uint64_t execution_control{0U};
   // Zero selects the policy from each launch's total device miss_count.
   std::uint32_t read_wave_wrs{kGatherDefaultReadWaveWrs};
+  std::uint32_t pull_groups{};
 };
 // One stable registered HBM workspace, independent of caller output allocations.
 constexpr std::uint64_t kGatherDescriptorOffset = kGatherMaxWorkers * 64U;
@@ -62,8 +95,7 @@ inline constexpr std::uint64_t GatherWorkspaceBytes(
     std::uint32_t workers, std::uint32_t capacity = kDefaultGetWindow) {
   return kGatherDescriptorOffset + workers * GatherLaneDescriptorBytes(workers, capacity);
 }
-static_assert(sizeof(GatherReadArgs) <= 256U);
-static_assert(sizeof(GatherReadArgs) == 160U, "Gather V5 argument ABI changed");
+static_assert(sizeof(GatherReadArgs) == 160U, "Gather argument layout changed");
 struct AicpuBatchGetInput {
   // GatherRead with indices == 0 reads address_table[i] as a complete source
   // address; offsets is unused. Other callers use address_table[indices[i]] + offsets[i].

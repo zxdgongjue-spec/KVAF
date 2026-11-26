@@ -6,9 +6,13 @@
 namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kUmdkControlMagic = 0x4b564146554d444bULL;
-// Setup slot for the control queue; data worker indices remain 0..7.
+// Legacy slots 0..7 are data and 8..15 are control; extra data queues start at 16.
 constexpr std::uint32_t kUmdkControlQueueIndex = 8;
-enum class UmdkQueueProfile : std::uint32_t { Gather = 0, Put = 1 };
+enum class UmdkQueueProfile : std::uint32_t { Gather = 0, Put = 1, GatherStriped = 2 };
+constexpr std::uint32_t kUmdkMaxDataJettys = 8;
+constexpr std::uint32_t UmdkDataSlot(std::uint32_t ordinal) {
+  return ordinal < kUmdkControlQueueIndex ? ordinal : ordinal + kUmdkControlQueueIndex;
+}
 inline constexpr std::uint32_t UmdkDataQueueCount(UmdkQueueProfile profile, std::uint32_t workers) {
   return profile == UmdkQueueProfile::Put ? 0U : workers;
 }
@@ -51,6 +55,7 @@ struct UmdkControlArgs {
   std::uint32_t transfer_count;
   // Selected by NpuRuntime; device/index are resolved internally from this EID.
   std::uint8_t local_eid[16];
+  std::uint32_t data_jettys;  // V5 tail padding, read only for GatherStriped.
 };
 static_assert(sizeof(UmdkControlArgs) == 680 && offsetof(UmdkControlArgs, session) == 16 &&
               offsetof(UmdkControlArgs, local_eid) == 660, "UMDK control/Put ABI changed");

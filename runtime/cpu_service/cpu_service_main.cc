@@ -16,7 +16,7 @@ void PrintUsage(const char* program) {
                "[--memory-page-mode default|thp|hugetlb-<size>] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates in the service CPU affinity scope are discovered automatically. "
-               "Gather threads default to 10, "
+               "Gather threads default to 12, "
                "mode to active; URMA memory page mode defaults to thp.\n"
                "HugeTLB sizes use binary units (k/m/g/t/p/e), e.g. hugetlb-2m, hugetlb-32m, hugetlb-1g. "
                "See /sys/kernel/mm/hugepages for sizes supported by the kernel.\n"

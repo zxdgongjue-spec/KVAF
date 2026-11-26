@@ -8,7 +8,7 @@ from .npu_eids import parse_npu_eids
 
 
 BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter")
-DEFAULT_PARALLELISM = {"aiv": None, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
+DEFAULT_PARALLELISM = {"aiv": None, "ubmem": 16, "gather_read": 6, "cpu_push_scatter": 6}
 MAX_JETTYS_PER_CORE = 64
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
@@ -97,7 +97,7 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--aiv-cores", **count_options,
                        help="AIV cores per device (1..48; defaults: local URMA 2, remote URMA 4, ubmem 16)")
     group.add_argument("--aicpu-workers", **count_options,
-                       help="AICPU workers per device; Gather 1..8, Scatter up to device AICPU core count")
+                       help="AICPU workers per device (default: 6); Gather 1..8, Scatter up to device AICPU core count")
     # Preserve old commands while keeping distinct hardware concepts in help.
     group.add_argument("--workers", dest="compat_workers", **count_options, help=argparse.SUPPRESS)
     group.add_argument("--jettys-per-core", type=int, default=None,
@@ -117,8 +117,9 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")
+    group.add_argument("--jettys-per-worker", type=int, default=1, help="data Jettys per Gather worker (1..8)")
     group.add_argument("--peer-ub-device", default="", metavar="DEVICE[,DEVICE...]",
-                       help="CPU UB device or ordered remote Direct Get FE list (URMA). "
+                       help="CPU UB device or ordered remote AIV/Gather Get FE list (URMA). "
                             "Automatic remote FE count: KVAF_DEFAULT_PEER_FE_COUNT (default 2).")
     return group
 
@@ -168,6 +169,10 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
             args.jettys_per_core = environment_int("KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", None)
         if args.max_inflight_total is None:
             args.max_inflight_total = environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048)
+    if args.backend != "gather_read" and args.jettys_per_worker != 1:
+        parser.error("--jettys-per-worker applies to gather_read")
+    if not 1 <= args.jettys_per_worker <= 8:
+        parser.error("--jettys-per-worker must be in [1, 8]")
     if args.miss_count is None:
         args.miss_count = args.request_length
 
@@ -243,6 +248,8 @@ def workload_command(args):
         if args.jettys_per_core is not None:
             command += ["--jettys-per-core", str(args.jettys_per_core)]
         command += ["--max-inflight-total", str(args.max_inflight_total)]
+    if args.backend == "gather_read":
+        command += ["--jettys-per-worker", str(args.jettys_per_worker)]
     if args.npu_eids:
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:
@@ -267,6 +274,8 @@ def configure_backend_help(parser, argv=None):
     aicpu = backend in ("gather_read", "cpu_push_scatter")
     hidden = set()
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
+    if backend != "gather_read":
+        hidden.add("jettys_per_worker")
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
     if backend != "gather_read":

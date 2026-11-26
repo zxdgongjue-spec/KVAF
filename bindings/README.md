@@ -70,7 +70,7 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 
 `put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
 预算按 provider 配置。`cores=0` 时，URMA AIV Put 用 2 核、Get 在本机用 2 核、远端 A+K 用 4 核，UBMEM AIV
-Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 5 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
+Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 6 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
 Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 按 SQ/CQ 容量自动分组，非零须至少为
 `2 * cores`。`request_capacity` 默认 65536；所有 Get 仅把它作为预热提示，
 总请求量由调用方张量和 ABI 决定，不受此配置限制。Put 仍受配置容量及 65536 上限约束。
@@ -82,6 +82,8 @@ Gather 还可设置 `gather_read_wave_wrs=64`，限制每 worker 每波的数据
 1..4096。默认 `None` 在每次 kernel 执行时按设备总 `miss_count` 自动选择：不超过 8192 用
 512 WR，否则用 64 WR；同一张图可随计数变化自动切换。显式值始终覆盖自动策略。
 该参数独立于内存预算，改变自动/固定配置后需重建执行资源和捕获图。
+地址发送粒度用 `gather_address_groups_per_post=N`，接受任意正整数；
+优先级为显式配置 > `KVAF_GATHER_ADDRESS_GROUPS_PER_POST` > 默认值 3。
 这些字段均配置在 NPU 侧 `ExecutionResources`，由 `NpuRuntime(get_resources=...)` 接收。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
 `bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
@@ -98,7 +100,7 @@ AICPU 首次准备时从 CANN 安装目录定位包，不接受资源项 kernel 
 `shutdown_ddr()` 只关闭 DDR 模块，NPU raw Pull 连接继续可用。
 `npu_eids=[]` 使用首个自动发现的候选；显式列表不回退到自动发现，AIV Get 按自身的
 `cores * jettys` 预算使用整组 EID 条带，Put/AICPU 使用首项。`peer_ub_device` 可固定
-CPU 侧设备。远端 URMA AIV Direct Get 默认选两个不同的 CPU FE，可在 NPU 进程设置
+CPU 侧设备。远端 URMA AIV Direct Get 与 AICPU Gather Get 共用选路，默认选两个不同的 CPU FE，可在 NPU 进程设置
 `KVAF_DEFAULT_PEER_FE_COUNT=1` 改为一个，也可用 `peer_ub_device="devC,devA,devB"`
 按顺序显式选路。每次 `batch_get` 仍提交整个请求。详见[远端多 FE](../runtime/README.md#远端-ak-的多-fe-batchget)。
 UBmem 不使用 EID，CPU 内存分配依赖 Ascend HAL 与驱动。

@@ -236,6 +236,8 @@ struct BatchGetKernelProfile {
   std::uint64_t ubmem_address_cycles{0};
   std::uint64_t ubmem_submit_cycles{0};
   std::uint64_t ubmem_drain_cycles{0};
+  std::optional<GatherReadyObservation> gather_ready_progress{};
+  std::optional<GatherPullObservation> gather_pull_progress{};
 };
 
 // Gather timeline; CPU wait and payload READ overlap when chunk mode is active.

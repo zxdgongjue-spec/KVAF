@@ -7,15 +7,20 @@
 
 #include "gather_span.h"
 #include "gather_prefix_layout.h"
+#include "gather_workspace.h"
 
 namespace kvaf::peer {
 
 struct alignas(64) GatherControl {
-  std::uint64_t notify, ack, command, suffix;
+  std::uint64_t notify, ack, command, suffix_sequence;
   std::uint64_t reserved[4];
 };
 static_assert(sizeof(GatherControl) == 64U);
-static_assert(offsetof(GatherControl, suffix) == kGatherSuffixOffset);
+static_assert(offsetof(GatherControl, suffix_sequence) == kGatherSuffixOffset);
+
+constexpr std::uint64_t kGatherHead256Magic = 0x4b56414648443236ULL;
+constexpr std::uint64_t kGatherSizedChunksMagic = 0x4b56414653435a31ULL;
+constexpr std::uint32_t kGatherHeadRows = 256U;
 constexpr std::uint64_t kGatherErrorBit = std::uint64_t{1U} << 63U;
 
 inline std::uint64_t GatherStartedAck(std::uint64_t sequence) { return ~sequence; }

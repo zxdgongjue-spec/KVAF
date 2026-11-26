@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -342,6 +343,10 @@ class SharedUrmaMemory {
     }
     return ready_ ? Status::OK() : Status::Internal("shared CPU URMA discovery failed; close pool");
   }
+  UrmaResources* RouteResources(std::uint32_t candidate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ready_ && !closing_ ? resources.Get(candidate) : nullptr;
+  }
   Status Acquire(std::uint32_t candidate, void* memory, std::uint64_t bytes,
                  UrmaResources** context, std::shared_ptr<CpuDdrRegistration>* lease) {
     CpuDdrRegistrationPool::Key key;
@@ -572,23 +577,20 @@ class CpuGatherWorker {
           if (profile_enabled_)
             std::memcpy(&profile_header, memory_ + (address - base_), sizeof(profile_header));
           BatchGetProfileScope timer(profile_enabled_ ? &copy_ns : nullptr);
-          executor_.Copy();
+          valid = executor_.Copy();
         }
       } catch (const std::exception& error) {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
         valid = false;
       }
       const auto ack_start = profile_enabled_ ? BatchGetProfileNowNs() : 0U;
-      if (!valid && address % 64U == 0U &&
+      peer::GatherDescriptorHeader* header = nullptr;
+      if (valid || (address % 64U == 0U &&
           peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
-                            sizeof(peer::GatherDescriptorHeader))) {
-        auto* progress = reinterpret_cast<std::uint64_t*>(
-            memory_ + address - base_ + offsetof(peer::GatherDescriptorHeader, ready_bytes));
-        __atomic_store_n(progress, peer::kGatherErrorBit, __ATOMIC_RELEASE);
+                            sizeof(*header)))) {
+        header = reinterpret_cast<peer::GatherDescriptorHeader*>(memory_ + (address - base_));
       }
-      __atomic_store_n(&control_->ack,
-                      sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
-      peer::GatherBarrier();
+      peer::FinishGatherCopy(*control_, sequence, valid, header);
       if (profile_enabled_) {
         const auto service_end = BatchGetProfileNowNs();
         // Preallocated, bounded storage: logging here could delay observation
@@ -631,7 +633,14 @@ class CpuGatherWorker {
   std::thread worker_;
 };
 
+struct GatherRoute {
+  UrmaResources* resources{};
+  std::unique_ptr<CpuDdrRegistration> registration;
+  std::vector<Channel> channels;
+};
+
 struct GatherWorkspace {
+  std::map<uint32_t, GatherRoute> routes;
   void* memory = nullptr;
   std::size_t mapped_bytes = 0U;
   uint64_t bytes = 0U, base = 0U;
@@ -834,6 +843,40 @@ class CpuService {
     return Result::kOk;
   }
 
+  Result PrepareGatherRoute(uint64_t session, uint32_t candidate, AllocateRegionResponse* response) {
+    const auto found = regions_.find(session);
+    if (found == regions_.end() || !found->second->gather_workspace) return Result::kNotFound;
+    auto& region = *found->second;
+    auto& workspace = *region.gather_workspace;
+    if (!workspace.base) return Result::kInvalidRequest;
+    auto* resources = region.resources;
+    if (candidate != region.candidate_id)
+      resources = shared_memory_ ? shared_memory_->RouteResources(candidate) : resource_pool_->Get(candidate);
+    if (!resources) return Result::kNotFound;
+    auto& route = workspace.routes[candidate];
+    auto* registration = workspace.registration.get();
+    if (candidate != region.candidate_id) {
+      if (!route.resources) {
+        if (route.registration && !route.registration->Close().ok()) return Result::kResourceError;
+        route.registration = std::make_unique<CpuDdrRegistration>();
+        if (!route.registration->Register(resources->context(), workspace.memory, workspace.bytes,
+                                          region.registration->token_value()).ok()) return Result::kResourceError;
+      }
+      registration = route.registration.get();
+    }
+    route.resources = resources;
+    const auto d = registration->Describe(session);
+    response->session_id = session;
+    response->peer_base = d.registered_address;
+    response->peer_length = workspace.bytes;
+    response->token_id = d.token_id;
+    response->token_value = d.token_value;
+    response->segment_key_bytes = d.key_bytes;
+    std::copy_n(d.eid.data(), kEidBytes, response->peer_eid);
+    std::copy_n(d.key.data(), d.key_bytes, response->segment_key);
+    return Result::kOk;
+  }
+
   Result PrepareGatherWindow(const peer::PrepareGatherWindowRequest& request,
                              peer::PrepareGatherWindowResponse* response) {
     if (!response) return Result::kInvalidRequest;
@@ -876,7 +919,7 @@ class CpuService {
         std::all_of(request.local_eid, request.local_eid + kEidBytes,
                     [](uint8_t byte) { return byte == 0U; }) ||
         request.peer_token_value == 0U || request.local_tp_handle == 0U || request.local_psn == 0U ||
-        (request.reserved & ~peer::kChannelSharedTp) != 0U) {
+        (request.reserved > 1U && !(request.reserved & peer::kChannelSharedTp))) {
       Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_key_bytes=%u/%u token=0x%x peer_tp=0x%llx "
           "peer_psn=0x%x\n",
           request.local_qp_key_bytes, kJettyKeyBytes, kNpuJettyKeyBytes, request.peer_token_value,
@@ -898,19 +941,31 @@ class CpuService {
       std::fprintf(stderr, "%02x", byte);
     }
     std::fprintf(stderr, "\n");
+    auto* resources = region.resources;
+    auto* collection = &region.channels;
+    const auto selector = request.reserved >> 1U;
+    if (selector) {
+      if (!region.gather_workspace) return Result::kInvalidRequest;
+      auto& routes = region.gather_workspace->routes;
+      auto it = routes.find(selector - 1U);
+      if (it == routes.end() || !it->second.resources) return Result::kInvalidRequest;
+      resources = it->second.resources;
+      collection = &it->second.channels;
+    }
+    auto& channels = *collection;
     Channel channel{};
     auto failed = [&] {
-      if (!channel.Close()) region.channels.push_back(std::move(channel));
+      if (!channel.Close()) channels.push_back(std::move(channel));
       return Result::kResourceError;
     };
     const bool share_tp = (request.reserved & peer::kChannelSharedTp) != 0U;
     const bool created = share_tp
-        ? channel.CreateLocal(region.resources->context(), region.registration->token_value())
-        : CreateLocalJetty(region.resources, region.registration->token_value(), &channel.local_jfc,
+        ? channel.CreateLocal(resources->context(), region.registration->token_value())
+        : CreateLocalJetty(resources, region.registration->token_value(), &channel.local_jfc,
                             &channel.local_jfr, &channel.local_jetty);
     if (!created) return failed();
     const auto* shared = share_tp ? cpu_runtime_detail::FindSharedChannelTp(
-        region.channels, request.local_eid, request.local_tp_handle) : nullptr;
+        channels, request.local_eid, request.local_tp_handle) : nullptr;
     if (shared != nullptr) {
       if (shared->peer_psn != request.local_psn) return failed();
       channel.tp = *shared;
@@ -920,9 +975,9 @@ class CpuService {
       channel.tp.peer = request.local_tp_handle;
       channel.tp.peer_psn = request.local_psn;
       channel.tp.local_psn = NextPsn();
-      if (!region.resources->GetCtpForPeer(request.local_eid, &channel.tp.local)) return failed();
+      if (!resources->GetCtpForPeer(request.local_eid, &channel.tp.local)) return failed();
     }
-    if (!ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value,
+    if (!ImportRemoteJetty(resources, request.local_qp_key, request.peer_token_value,
                            channel.tp.local, channel.tp.peer, channel.tp.local_psn,
                            channel.tp.peer_psn, &channel.remote_jetty))
       return failed();
@@ -935,8 +990,8 @@ class CpuService {
     response->peer_psn = channel.tp.local_psn;
     response->reserved = share_tp ? peer::kChannelSharedTp : 0U;
     const bool tp_reused = shared != nullptr;
-    region.channels.push_back(std::move(channel));
-    const auto& connected = region.channels.back();
+    channels.push_back(std::move(channel));
+    const auto& connected = channels.back();
     Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
         "cpu_psn=0x%x cpu_cq_id=%u cpu_jfr_id=%u peer_tp=0x%llx tp_shared=%u tp_reused=%u\n",
         region.id, connected.local_jetty->jetty_id.id, connected.remote_jetty->id.id,
@@ -1221,6 +1276,14 @@ class CpuService {
     }
     if (region->gather_workspace) {
       auto& workspace = *region->gather_workspace;
+      for (auto& entry : workspace.routes) {
+        auto& route = entry.second;
+        while (!route.channels.empty()) {
+          if (!route.channels.back().Close()) return false;
+          route.channels.pop_back();
+        }
+        if (route.registration && !route.registration->Close().ok()) return false;
+      }
       if (workspace.registration && !workspace.registration->Close().ok()) return false;
       workspace.registration.reset();
       if (!ReleaseMemory(workspace.memory, workspace.mapped_bytes)) return false;
@@ -1281,11 +1344,12 @@ bool WriteAll(MemoryIo* io, const void* data, std::size_t bytes) {
 
 template <class IO>
 void SendStatus(IO fd, Command command, Result result,
-                uint16_t version = peer::kProtocolVersion) {
+                uint16_t version = peer::kProtocolVersion, uint32_t capabilities = 0U) {
   StatusResponse response{};
   response.header = MakeHeader(command, sizeof(response), version);
   response.header.command = ResponseCommand(command);
   response.result = static_cast<int32_t>(result);
+  if (result == Result::kOk) response.reserved = capabilities;
   (void)WriteAll(fd, &response, sizeof(response));
 }
 
@@ -1307,6 +1371,18 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       response.header.command = ResponseCommand(command);
       response.result = static_cast<int32_t>(
           service->Allocate(request.ddr_bytes, request.slot_size, request.candidate_id, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kPrepareGatherRoute: {
+      peer::PrepareGatherRouteRequest q{};
+      AllocateRegionResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(Result::kInvalidRequest);
+      if (IsValidHeader(header, command, sizeof(q)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&q) + sizeof(header), sizeof(q) - sizeof(header)))
+        response.result = static_cast<int32_t>(service->PrepareGatherRoute(q.session_id, q.candidate, &response));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
@@ -1427,9 +1503,11 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
         SendStatus(fd, command, Result::kInvalidRequest);
         return;
       }
-      SendStatus(fd, command,
-                 service->EnableGatherLanes(request.session_id, request.control_address,
-                                            request.lanes, command == Command::kEnableAivGatherLanes));
+      const bool aiv = command == Command::kEnableAivGatherLanes;
+      const auto result = service->EnableGatherLanes(request.session_id, request.control_address,
+                                                      request.lanes, aiv);
+      SendStatus(fd, command, result, header.version, aiv ? 0U :
+                 peer::kGatherLanesPullGroups | peer::kGatherLanesChunkedPullGroups);
       return;
     }
 
@@ -1590,6 +1668,7 @@ Status UrmaCpuBackend::Call(const std::vector<std::uint8_t>& input,
     case Command::kEnableDirectGather:
     case Command::kEnableGatherLanes:
     case Command::kEnableAivGatherLanes:
+    case Command::kPrepareGatherRoute:
     case Command::kPrepareGatherWorkspace:
     case Command::kPrepareGatherWindow:
     case Command::kOpenCpuPushMailbox:

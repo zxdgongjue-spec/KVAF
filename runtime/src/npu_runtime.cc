@@ -183,6 +183,8 @@ struct NpuRuntime::Impl {
       }
       if (!selected || !selected->max_inflight_total) budget.max_inflight_total = 0;
     }
+    if (get && executor == Executor::Aicpu && algorithm == GetAlgorithm::Gather && !(selected && selected->jettys))
+      budget.jettys = 1;
     return budget;
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
@@ -197,8 +199,8 @@ struct NpuRuntime::Impl {
     }
     if (explicit_resources) {
       const auto& r = *explicit_resources;
-      if (r.jettys && (e != Executor::Aiv || t != Transport::Urma))
-        throw std::invalid_argument("Jetty budget is configurable only for URMA AIV");
+      if (r.jettys && (t != Transport::Urma || (e != Executor::Aiv && !(get && algorithm == GetAlgorithm::Gather))))
+        throw std::invalid_argument("Jetty budget requires URMA AIV or AICPU Gather");
       if (r.max_inflight_total && (!get || e != Executor::Aiv || t != Transport::Urma))
         throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
       if (r.cpu_threads && (!get || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
@@ -214,9 +216,14 @@ struct NpuRuntime::Impl {
       if (r.gather_read_wave_wrs && (!get || t != Transport::Urma || e != Executor::Aicpu ||
                                       algorithm != GetAlgorithm::Gather))
         throw std::invalid_argument("gather_read_wave_wrs requires AICPU Gather Get");
+      if (r.gather_address_groups_per_post && (!get || t != Transport::Urma || e != Executor::Aicpu ||
+                                               algorithm != GetAlgorithm::Gather))
+        throw std::invalid_argument("gather_address_groups_per_post requires AICPU Gather Get");
     }
     if (budget.gather_read_wave_wrs && !ValidGatherReadWaveWrs(*budget.gather_read_wave_wrs))
       throw std::invalid_argument("gather_read_wave_wrs must be in [1, 4096]");
+    if (budget.gather_address_groups_per_post && !*budget.gather_address_groups_per_post)
+      throw std::invalid_argument("gather_address_groups_per_post must be a positive integer");
     const bool aicpu_scatter = get && IsAicpuScatterGet({t, e, algorithm});
     if (!budget.cores || (!aicpu_scatter && budget.cores > (e == Executor::Aicpu ? 8U : 48U)) ||
         !budget.request_capacity ||
@@ -266,19 +273,29 @@ struct NpuRuntime::Impl {
       throw std::invalid_argument("ordinary cache Get requires a token layout");
     ValidateProviderResources(transport, executor, algorithm, get, budget);
     std::vector<peer::PeerCandidateInfo> candidates;
+    std::vector<std::uint32_t> gather_candidates;
     if (transport == Transport::Urma) {
       EnsureCacheEids();
-      if (get && executor == Executor::Aiv && algorithm == GetAlgorithm::Direct) {
-        const auto workers = static_cast<uint64_t>(budget.cores) * budget.jettys;
-        const auto s = cpu_fes.ForDirectGet(workers, &candidates);
-        if (!s.ok()) throw std::invalid_argument(s.message());
-        std::fprintf(stderr, "[KVAF] DIRECT_GET_FE_SELECTION requested=%u candidates=%zu active=%zu jettys=%llu\n",
-                     cpu_fes.requested_count, cpu_fes.direct_get.size(), candidates.size(),
+      const bool gather = get && executor == Executor::Aicpu && algorithm == GetAlgorithm::Gather;
+      const bool direct = get && executor == Executor::Aiv && algorithm == GetAlgorithm::Direct;
+      if (gather || direct) {
+        if (gather && (!budget.jettys || budget.jettys > 8))
+          throw std::invalid_argument("Gather supports 1..8 data Jettys per worker");
+        const auto workers = std::uint64_t{budget.cores} * (direct ? budget.jettys : 1U);
+        std::vector<peer::PeerCandidateInfo> active;
+        const auto status = cpu_fes.ForWorkers(workers, &active);
+        if (!status.ok()) throw std::invalid_argument(status.message());
+        std::fprintf(stderr, "[KVAF] GET_FE_SELECTION algorithm=%s requested=%u candidates=%zu active=%zu workers=%llu\n",
+                     gather ? "gather" : "direct", cpu_fes.requested_count, cpu_fes.read_fes.size(), active.size(),
                      static_cast<unsigned long long>(workers));
-        for (std::size_t i = 0; i < candidates.size(); ++i)
-          std::fprintf(stderr, "[KVAF] DIRECT_GET_FE path=%zu ub_device=%s eid_index=%u cpu_eid=%s\n",
-                       i, candidates[i].device_name.c_str(), candidates[i].eid_index,
-                       detail::EidToHex(candidates[i].eid).c_str());
+        if (gather) {
+          // All Gather lanes share one execution and one staging allocation.
+          // Additional FEs register that same workspace, rather than opening more gather pools.
+          candidates.push_back(active.front());
+          for (const auto& candidate : active) gather_candidates.push_back(candidate.candidate_id);
+        } else {
+          candidates = std::move(active);
+        }
       } else {
         candidates.push_back(cpu_fes.primary);
       }
@@ -293,8 +310,8 @@ struct NpuRuntime::Impl {
     if (!eids.empty()) q.local_eid = eids.front();
     return std::make_unique<SessionAccessOperator>(
         peer_link, q, std::move(candidates),
-        [this, transport, executor, algorithm, get](const PeerExecutionResources::Links& links) {
-          return MakeLocalProvider(transport, executor, algorithm, get, links);
+        [this, transport, executor, algorithm, get, gather_candidates](const PeerExecutionResources::Links& links) {
+          return MakeLocalProvider(transport, executor, algorithm, get, links, gather_candidates);
         },
         budget.request_capacity);
   }
@@ -339,7 +356,8 @@ struct NpuRuntime::Impl {
   }
   std::unique_ptr<AccessOperator> MakeLocalProvider(Transport transport, Executor executor,
                                                     GetAlgorithm algorithm, bool get,
-                                                    const PeerExecutionResources::Links& links) {
+                                                    const PeerExecutionResources::Links& links,
+                                                    const std::vector<std::uint32_t>& gather_candidates) {
     const auto& link = links.front();
     const auto budget = Resources(transport, executor, algorithm, get);
     const auto eids = ProviderEids(transport, executor, get, budget);
@@ -380,8 +398,11 @@ struct NpuRuntime::Impl {
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        eids.front(), get, budget.gather_ddr_bytes, budget.scatter_hbm_bytes,
-        budget.gather_read_wave_wrs.value_or(kGatherDefaultReadWaveWrs)});
+        eids.front(), get, budget.jettys, gather_candidates,
+        {},
+        budget.gather_ddr_bytes, budget.scatter_hbm_bytes,
+        budget.gather_read_wave_wrs.value_or(kGatherDefaultReadWaveWrs),
+        budget.gather_address_groups_per_post});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif

@@ -370,11 +370,11 @@ URMA AIV，in-flight 用于 URMA AIV Get，CPU 线程预算用于 AICPU Gather�
 | URMA AIV Direct Get（本机） | 2 | 2 | 2048 | 构建目录 Get `.o` |
 | URMA AIV Direct Get（远端 A+K） | 4 | 1 | 2048 | 构建目录 Get `.o` |
 | UBMEM AIV Direct Get | 16 | 不适用 | 不适用 | 构建目录 Get `.o` |
-| AICPU Gather Get | 5 | 内部管理 | 不适用 | CANN 安装包 |
-| AICPU Scatter Get | 5 | 内部管理 | 不适用 | CANN 安装包 |
+| AICPU Gather Get | 6 | 内部管理 | 不适用 | CANN 安装包 |
+| AICPU Scatter Get | 6 | 内部管理 | 不适用 | CANN 安装包 |
 
 本分支新增的 `request_capacity` 默认 65536。Gather 的 `cpu_threads=0` 沿用 CPU 服务
-配置，与 main 一样服务默认 10 个线程；服务启动参数 `--gather-threads` 可覆盖。
+配置，服务默认 12 个线程；服务启动参数 `--gather-threads` 可覆盖。
 
 预热不提交 key、不搬运应用 payload，也不注册未提供的应用 buffer。Put/Get 预热同时准备
 对应配置的驻留执行状态，完成后归还短期执行租约。`batch_get` 默认异步；调用方可用同

@@ -68,7 +68,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kernel-profile", action="store_true",
                         help="add stage/worker details, including UBMEM address/MTE/drain timings; kernel bandwidth is always reported")
     parser.add_argument("--output-dir", type=Path, help="directory for summary.csv and, with --kernel-profile, "
-                        "profile.csv (default: reports/batch-get/<timestamp>-<backend>-d<device>)")
+                        "profile.csv and the gather_read worker_timeline.csv, kernel_breakdown.csv "
+                        "(default: reports/batch-get/<timestamp>-<backend>-d<device>)")
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
                             environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
@@ -80,8 +81,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--execution", choices=("eager", "graph", "both"), default="eager")
     parser.add_argument("--graph", dest="execution", action="store_const", const="graph",
                         help="shorthand for --execution graph")
-    parser.add_argument("--graph-api", choices=("acl", "torch"),
-                        help="graph API (AICPU Scatter requires acl, other backends default to torch)")
+    parser.add_argument("--graph-api", choices=("acl", "torch"), default="acl",
+                        help="graph API (default: ACL native submission for all backends)")
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
     parser.add_argument("--multi-graph-check", action="store_true",
@@ -101,8 +102,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if args.graph_api == "torch":
             parser.error("AICPU Scatter graph execution requires --graph-api acl")
         args.graph_api = "acl"
-    elif args.graph_api is None:
-        args.graph_api = "torch"
     return args
 
 
@@ -181,6 +180,37 @@ def print_aicpu_details(args, execution, samples, details=None):
               "read_setup_us", "wr_build_us", "ready_wait_us", "post_us", "cq_wait_us", "scatter_us", "ack_us")
     if any("stages" not in worker for sample in samples for worker in sample):
         raise AssertionError("missing detailed AICPU profiling; rebuild the matching Host/device package")
+    if args.backend == "gather_read":
+        paired = [p["stages"]["request_us"] + p["stages"]["ready_wait_us"]
+                  for sample in samples for p in sample]
+        print_profile_row("BATCH_GET_REQUEST_READY", dict(execution=execution, aggregation="all_worker_samples"),
+                          dict(mean_us=f"{statistics.mean(paired):.6f}", p99_us=f"{percentile(paired, .99):.6f}"),
+                          details, "worker_samples", "request_plus_ready_wait")
+        stages = [p["stages"] for sample in samples for p in sample]
+        queries = sum(s["ready_queries"] for s in stages)
+        posts = sum(s["post_calls"] for s in stages)
+        metrics = dict(ready_queries_mean=f"{queries / len(stages):.3f}",
+                       post_calls_mean=f"{posts / len(stages):.3f}")
+        active = [s for s in stages if s["post_calls"]]
+        if active and all("first_post_wrs" in s for s in active):
+            metrics["first_post_wrs_mean"] = f"{statistics.mean(s['first_post_wrs'] for s in active):.3f}"
+        if queries:
+            metrics["exposed_ready_us_per_query"] = f"{sum(s['ready_wait_us'] for s in stages) / queries:.3f}"
+        if posts:
+            metrics["read_wrs_per_post"] = f"{sum(s['read_wqes'] for s in stages) / posts:.3f}"
+        queried = [s for s in stages if s["ready_queries"]]
+        if queried and all("first_ready_bytes" in s and "ready_repeat_queries" in s for s in queried):
+            metrics["first_ready_kib_mean"] = f"{statistics.mean(s['first_ready_bytes'] for s in queried) / 1024:.3f}"
+            metrics["first_ready_zero_pct"] = f"{100 * sum(s['first_ready_bytes'] == 0 for s in queried) / len(queried):.1f}"
+            metrics["ready_repeat_queries_mean"] = f"{statistics.mean(s['ready_repeat_queries'] for s in queried):.3f}"
+        grouped = [s for s in active if "planned_groups" in s and "ready_advances" in s]
+        if grouped:
+            metrics["pull_worker_samples"] = len(grouped)
+            metrics["planned_groups_mean"] = f"{statistics.mean(s['planned_groups'] for s in grouped):.3f}"
+            metrics["ready_advances_mean"] = f"{statistics.mean(s['ready_advances'] for s in grouped):.3f}"
+            metrics["ready_no_advance_mean"] = f"{statistics.mean(s['ready_queries'] - s['ready_advances'] for s in grouped):.3f}"
+        print_profile_row("BATCH_GET_READ_COUNTS", dict(execution=execution, aggregation="all_worker_samples"),
+                          metrics, details, "worker_samples", "read_counts")
     print(f"BATCH_GET_PROFILE_CONTRACT backend={args.backend} execution={execution} "
           "aggregation=per_sample_worker_max stages_overlap=1 profiling_overhead_included=1")
     for field in fields:
@@ -195,6 +225,47 @@ def print_aicpu_details(args, execution, samples, details=None):
                    for field in fields}
         print_profile_row("BATCH_GET_PROFILE_WORKER", dict(backend=args.backend, execution=execution, worker=worker),
                           metrics, details, "worker", worker)
+
+
+GATHER_OUTER = ("request", "source_write", "notify", "read", "ack")
+GATHER_READ = ("read_setup", "wr_build", "ready_wait", "post", "cq_wait")
+
+
+def gather_kernel_breakdown(execution, number, sample):
+    # max() picks the first (lowest worker ID) on a tied finish.
+    worker = max(range(len(sample)), key=lambda i: int(sample[i]["device_finish_ns"]))
+    p = sample[worker]
+    first = min(int(item["device_start_ns"]) for item in sample)
+    start, end = int(p["device_start_ns"]), int(p["device_finish_ns"])
+    # The binding exports integer device nanoseconds as microseconds divided by 1000.
+    ns = {stage: round(p["stages"][stage + "_us"] * 1000) for stage in GATHER_OUTER + GATHER_READ}
+    outer_other = end - start - sum(ns[key] for key in GATHER_OUTER)
+    read_other = ns["read"] - sum(ns[key] for key in GATHER_READ)
+    if min(outer_other, read_other) < 0:
+        raise AssertionError(f"Gather timing scopes exceed their parent: {execution=} {number=} {worker=} "
+                             f"outer_other_ns={outer_other} read_other_ns={read_other}")
+    return dict(execution=execution, sample=number, last_worker=worker, kernel_ns=end-first,
+                publish_ns=ns["source_write"] + ns["notify"],
+                start_offset_ns=start-first, **{k + "_ns": v for k, v in ns.items()},
+                outer_other_ns=outer_other, read_other_ns=read_other,
+                ready_queries=p["stages"]["ready_queries"],
+                first_ready_bytes=p["stages"].get("first_ready_bytes"),
+                ready_repeat_queries=p["stages"].get("ready_repeat_queries"),
+                planned_groups=p["stages"].get("planned_groups"),
+                ready_advances=p["stages"].get("ready_advances"))
+
+
+def print_gather_kernel_breakdown(execution, profiles, report):
+    rows = [gather_kernel_breakdown(execution, number, sample)
+            for number, sample in enumerate(profiles, 1)]
+    for scope, fields in (("kernel", ("kernel", "start_offset", "request", "publish", "read", "ack", "outer_other")),
+                          ("read", ("read", *GATHER_READ, "read_other"))):
+        means = {field + "_us": f"{statistics.mean(row[field + '_ns'] for row in rows) / 1000:.6f}"
+                 for field in fields}
+        print(f"BATCH_GET_BREAKDOWN execution={execution} scope={scope} aggregation=last_finisher_mean "
+              f"samples={len(rows)} {format_fields(means)}")
+    if report is not None:
+        report.breakdown_rows.extend(rows)
 
 
 def print_measurements(args, execution, samples, profiles, report=None, *, e2e_timing_source="host_perf_counter"):
@@ -236,12 +307,37 @@ def print_measurements(args, execution, samples, profiles, report=None, *, e2e_t
         details = [] if report is not None and report.profile_path is not None else None
         if uses_aicpu(args):
             print_aicpu_details(args, execution, profiles, details)
+            if args.backend == "gather_read":
+                print_gather_kernel_breakdown(execution, profiles, report)
+                rows = gather_worker_timeline(execution, profiles)
+                last_counts = [0] * args.parallelism
+                for row in rows:
+                    last_counts[row["worker"]] += row["last"]
+                counts = " ".join(f"worker_{w}={count}" for w, count in enumerate(last_counts))
+                print(f"BATCH_GET_LAST_FINISH execution={execution} samples={len(profiles)} {counts}")
+                if report is not None:
+                    report.timeline_rows.extend(rows)
         else:
             print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.parallelism,
                                  args.jettys_per_core, args.request_length, args.miss_count,
                                  args.token_bytes, args.transport, details)
         if details is not None:
             report.add_profile(execution, details)
+
+
+def gather_worker_timeline(execution, profiles):
+    """Measure offsets from each sample's first worker entry. Tied finishers each count."""
+    rows = []
+    for number, sample in enumerate(profiles, 1):
+        first = min(int(p["device_start_ns"]) for p in sample)
+        last = max(int(p["device_finish_ns"]) for p in sample)
+        for worker, p in enumerate(sample):
+            start = int(p["device_start_ns"])
+            finish = int(p["device_finish_ns"])
+            rows.append(dict(execution=execution, sample=number, worker=worker,
+                             start_us=(start - first) / 1000, finish_us=(finish - first) / 1000,
+                             ready_wait_us=p["stages"]["ready_wait_us"], last=int(finish == last)))
+    return rows
 
 
 def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
@@ -381,6 +477,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
         get_capacity=args.request_length,
+        gather_data_jettys=args.jettys_per_worker,
         gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0), scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
         gather_read_wave_wrs=getattr(args, "gather_read_wave_wrs", None),
     )
@@ -410,17 +507,13 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             check(plan, count, graph.leases[0])
 
         validate_graph_inputs(graph, inputs, check_captured, args.miss_count, args.graph_replays)
-        native_submit = args.backend == "cpu_push_scatter"
-        if native_submit:
+        if args.graph_api == "acl":
             timed_replay = graph.replay_timed
             timing_source = "acl_event_native"
         else:
+            timing_source = "torch_npu_event"
             start_event = torch.npu.Event(enable_timing=True)
             end_event = torch.npu.Event(enable_timing=True)
-            start_event.record(stream)
-            end_event.record(stream)
-            end_event.synchronize()
-            timing_source = "torch_npu_event"
 
             def timed_replay():
                 start_event.record(stream)
@@ -429,17 +522,13 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
                 end_event.synchronize()
                 return float(start_event.elapsed_time(end_event))
 
-        warmup = max(1, args.warmup) if native_submit else args.warmup
-        for _ in range(warmup):
+        timed_replay()  # Create and warm reusable timing Events outside measurement.
+        for iteration in range(args.warmup):
             inputs.prepare(args.miss_count)
-            if native_submit:
-                timed_replay()  # Allocate the native timing events before measurement.
-            else:
-                graph.replay()
-                graph.synchronize()
+            timed_replay()
             check_captured(inputs.fixed, args.miss_count)
         durations, profiles = [], []
-        for _ in range(args.iterations):
+        for iteration in range(args.iterations):
             inputs.prepare(args.miss_count)
             durations.append(timed_replay())
             check_captured(inputs.fixed, args.miss_count)
@@ -891,6 +980,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         put_capacity=min(args.populate_chunk_entries, table_capacity),
         get_capacity=request_length, get_cores=args.parallelism or 0, get_jettys=args.jettys_per_core or 0,
         put_cores=0 if args.backend == "aiv" else args.parallelism,
+        gather_data_jettys=args.jettys_per_worker,
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
         max_inflight_total=args.max_inflight_total,
@@ -921,6 +1011,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             "sync-call": "synchronous_batch_get",
             "async-drain": "async_submit_to_drain",
         }[args.get_timing]
+        gather_links = (f"jettys_per_worker={args.jettys_per_worker} control_jettys_per_worker=1 "
+                        ) if args.backend == "gather_read" else ""
         print(
             "BATCH_GET_PERF_CONFIG "
             f"execution_mode={args.execution_mode} "
@@ -935,6 +1027,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"{format_fields(gather_read_wave_settings(args))} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
+            f"{gather_links}"
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "

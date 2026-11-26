@@ -19,6 +19,7 @@
 #endif
 
 #include "cpu_gather.h"
+#include "gather_pull_plan.h"
 
 namespace kvaf::peer {
 
@@ -39,6 +40,9 @@ inline void GatherSpinPause() {
   std::this_thread::yield();
 #endif
 }
+
+// Sole completion publisher, called after Copy() has joined this request's helpers.
+void FinishGatherCopy(GatherControl& control, std::uint64_t sequence, bool success, GatherDescriptorHeader* header);
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 enum class GatherReadMode { kAicpu, kAiv };
@@ -108,7 +112,7 @@ class CpuGatherExecutor {
 #endif
   }
 
-  void Copy();
+  bool Copy();
   // Enable before the first PrepareDirect. Disabled execution reads no clocks.
   void EnableProfiling() { thread_profiles_.resize(max_threads_); }
   std::size_t MaxThreads() const { return max_threads_; }
@@ -131,8 +135,13 @@ class CpuGatherExecutor {
     staging_ = workspace_memory_ + (staging - workspace_base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
-    if (pipeline_ready_ != nullptr && read_mode_ == GatherReadMode::kAicpu) {
-      chunk_done_.assign(GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_), 0U);
+    if (pull_groups_) {
+      chunk_done_.assign(group_plan_.GroupCount(), 0U);
+    } else if (pipeline_ready_ && read_mode_ == GatherReadMode::kAicpu) {
+      const auto remaining = total_bytes_ - first_chunk_bytes_;
+      const auto chunks = (first_chunk_bytes_ != 0U) + remaining / pipeline_chunk_bytes_ +
+                          (remaining % pipeline_chunk_bytes_ != 0U);
+      chunk_done_.assign(chunks, 0U);
       next_chunk_.store(0U, std::memory_order_relaxed);
     } else if (cooperative_) {
       cooperative_count_ = GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_);
@@ -172,9 +181,9 @@ class CpuGatherExecutor {
     return ((address + 63U) & ~std::uintptr_t{63U}) - reinterpret_cast<std::uintptr_t>(staging_);
   }
 
-  std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
-  std::uint64_t CopyReadyRange(std::uint64_t offset, std::uint64_t end) const;
-  bool WaitSuffix() const;
+  std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end);
+  std::uint64_t CopyPublishedRange(std::uint64_t offset, std::uint64_t end) const;
+  bool WaitPublishedAddresses(std::uint64_t end);
 
   std::uint64_t ProcessSource(std::size_t worker);
   std::uint64_t CopyDynamicChunks();
@@ -187,6 +196,13 @@ class CpuGatherExecutor {
         std::chrono::steady_clock::now().time_since_epoch()).count();
   }
   void CopyWorker(std::size_t worker);
+  bool GroupStopped() const;
+  bool CopyStripe(std::size_t worker, std::uint64_t begin, std::uint64_t end, std::uint64_t& copied);
+  std::uint64_t CopyGroups(std::size_t worker);
+  std::uint64_t CopySizedChunks(std::size_t worker);
+  std::uint64_t ChunkBoundary(std::size_t index) const {
+    return index ? std::min(total_bytes_, first_chunk_bytes_ + (index - 1) * pipeline_chunk_bytes_) : 0;
+  }
   void RunHelper(std::size_t worker);
 
   static std::vector<int> AllowedCpus(std::size_t offset) {
@@ -221,16 +237,20 @@ class CpuGatherExecutor {
   std::atomic<std::uint64_t> generation_{0U};
   // The sender retains this descriptor until all copy threads finish and ACK is published.
   const GatherSpan* spans_{nullptr};
-  const std::uint64_t* descriptor_suffix_{nullptr};
-  const std::atomic<bool>* request_stop_{nullptr};
-  std::uint64_t sequence_{}, head_bytes_{};
-  mutable std::atomic<bool> copy_failed_{false};
   std::uint32_t span_count_{0U}, span_bytes_{0U};
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
+  const std::uint64_t* suffix_sequence_{nullptr};
+  const std::atomic<bool>* request_stop_{nullptr};
+  GatherPullPlan group_plan_{};
+  bool pull_groups_{};
+  bool chunked_addresses_{};
+  std::uint64_t sequence_{}, head_bytes_{};
+  std::atomic<bool> suffix_failed_{false};
+  std::uint64_t first_chunk_bytes_{};
   std::uint32_t pipeline_chunk_bytes_{0U};
   // AICPU helpers claim and publish completed uniform chunks independently.
   std::vector<std::uint32_t> chunk_done_;
