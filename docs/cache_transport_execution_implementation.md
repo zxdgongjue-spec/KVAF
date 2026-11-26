@@ -315,7 +315,7 @@ runtime = kvaf.NpuRuntime(
 | `transport` | `transport_mode` 规定池的传输范围，各次配置选择具体 transport |
 | 全局核数、Jetty、in-flight 和 Get/Put kernel 路径 | 放入对应配置的 `ExecutionResources`，分别列入 `put_resources/get_resources` |
 | `enabled_put_configs/enabled_get_configs` | 无需填写，按构建能力和 transport 模式选择；首次准备时检查具体资源 |
-| `adaptive_ub_*` | 仅旧构造器的 URMA AIV Direct 模式兼容显式测速选路。新构造器按拓扑选路，可用 `npu_eids/peer_ub_device` 固定路由。 |
+| `adaptive_ub_*` | 已移除。首次使用按拓扑选路，可用 `npu_eids/peer_ub_device` 固定路由。 |
 
 以下片段使用已创建的 NPU Tensor、stream 和缓存内容。当前构建支持的算法自动可用，
 无需 enabled 列表；默认值只决定未传 execution 时选哪个算法，资源配置在首次使用时检查：
@@ -947,7 +947,7 @@ CPU 服务进程。库名和 `build-npu/bin` 产物位置保留；AICPU 构建�
 | AICPU Control | 新 Host 要求 `KvafAicpuUmdkControlSessionsV5`，支持 QueueProfile |
 | AICPU Gather / Scatter | `KvafAicpuGatherReadExecutionV5` / `KvafAicpuCpuPushScatterExecutionV6` |
 | Control 兼容入口 | 旧 Control/V3/V4 保留原 Gather 队列布局；新 Host 不静默降级 |
-| CPU 服务 | 请求级能力协商拒绝不兼容服务；`--gather-affinity` 已移除，使用当前线程调度参数 |
+| CPU 服务 | 请求级能力协商拒绝不兼容服务。`--gather-affinity` 控制 AIV Gather Read 与 AIV Gather→Push 的内部绑核 |
 
 QueueProfile 使用原结构的 4 字节 padding，不改变其余字段偏移或 Put ABI；不能据此
 混装旧设备包，因为新 Host 依赖 V5 能力。控制协议的兼容性也不替代全部组件一起更新。

@@ -45,7 +45,8 @@ class ExecutionDispatcher final : public AccessOperator {
   Status CopyGetProfiles(std::optional<GetExecutionConfig>, std::vector<BatchGetKernelProfile>*,
                          std::uint64_t graph_lease = 0);
   Status CheckGetStatus(std::optional<GetExecutionConfig>, void* stream, std::uint64_t graph_lease = 0);
-  Status WithSequentialGet(GetAlgorithm, bool prepare, const std::function<Status(AccessOperator&)>&);
+  Status CopyGetProfileDetails(GetExecutionConfig, bool drain_pending,
+                               const std::function<Status(const AccessOperator&)>&);
   const ExecutionPolicy& policy() const { return policy_; }
  private:
   PutExecutionContext* FindPutInstanceLocked(PutExecutionConfig) const;
@@ -63,6 +64,7 @@ class ExecutionDispatcher final : public AccessOperator {
   bool HasGraphNodesLocked(const GetExecutionContext*) const;
   Status DrainGetLocked();
   Status FindGraphNode(GetExecutionContext*, std::uint64_t, GetGraphNode**);
+  Status CheckGetProfileReadableLocked(GetExecutionContext*, bool drain_pending);
   Status FinishOutputLocked(GetExecutionContext&);
   Status ValidateInputLocked(const BatchPutRequest&, const BatchPutExecutionOptions&,
                              PutExecutionConfig) const;

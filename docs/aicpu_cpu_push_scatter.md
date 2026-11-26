@@ -97,13 +97,12 @@ CPU 端启动同一个服务：
 
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 21111 \
-  --gather-threads 8 --gather-mode active
+  --listen 0.0.0.0 --port 21111
 ```
 
-两个 `--gather-*` 参数只影响 Gather，供下面的双模式对照使用；单独运行 Scatter 时
-可省略，它们不控制 CPU Push 的线程数。CPU Push 由所属服务线程提交，AICPU worker
-数由客户端 资源项 `cores` / `--aicpu-workers` 控制。
+CPU Push 由所属服务线程提交，AICPU worker 数由客户端资源项 `cores` 或
+`--aicpu-workers` 控制。执行后续 Gather 对照时，可按负载设置 `--gather-threads` 和
+`--gather-mode`。这两个参数以及 `--gather-affinity` 不参与此处的 SGL Push 调度。
 示例设备号和本机服务地址按部署调整；跨主机时替换为 CPU 服务的可达地址。
 首次准备 Scatter 时的日志应包含：
 

@@ -28,7 +28,6 @@ enum KvafGatherProbe : uint32_t {
   KVAF_GATHER_PROBE_FIRST_READ = 4,
 };
 constexpr uint32_t KVAF_GATHER_WRS_PER_POST = 128;
-constexpr uint32_t KVAF_GATHER_GROUP_WRS = 32;
 enum : uint64_t {
   KVAF_GATHER_AFTER_ACK = 20, KVAF_GATHER_AFTER_WQE = 21,
   KVAF_GATHER_AFTER_SQ = 22, KVAF_GATHER_AFTER_FIRST_READ = 23,
@@ -61,6 +60,6 @@ struct KvafGatherBatchGetArgs {
   uint32_t first_chunk_divisor;
   // Trusted requests may notify the CPU before the descriptor suffix is ready.
   uint32_t head_start;
-  uint32_t grouped_addresses{};
+  uint32_t reserved{};  // Must be zero. Preserves the V12 argument layout.
 };
 static_assert(sizeof(KvafGatherBatchGetArgs) == 256);

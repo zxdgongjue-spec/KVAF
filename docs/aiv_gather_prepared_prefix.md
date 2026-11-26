@@ -39,18 +39,15 @@ CPU 线程数仍按整批 payload 决定，复制和相邻源合并均在 1024 �
 ready_bytes 仍只表示已完成的 payload。超时/停止会中止等待，并在全部 helper 退出后
 返回错误。probe 保留完整清单后 notify；READ 阶段仍在全部清单发布后进入。
 
-## 分组推进
+## 与 AICPU Gather 的调度边界
 
-N 端设置 `KVAF_AIV_GATHER_GROUPED=1`，AIV Gather Read 使用和 AICPU 相同的分组地址与 Ready 协议。
-AIV 每 lane 先发送对应 32 条 READ 的源地址并通知 CPU，后续最多合并三组源地址提交。
-CPU 线程协作复制每组并发布连续 Ready。AIV 准备并提交已有 Ready 的 READ，同时按进度发送后续地址。
-最终 Ready 只有在 CPU 发布成功 ACK 后才可见。
+AIV Gather Read 沿用首段通知、连续 Ready 前缀和 WQE 提前准备。K 端和 AICPU Gather
+共用 `CpuGatherWorker`、lane 线程预算和分片复制。AICPU 保留地址分组发布，可用
+`gather_address_groups_per_post` 和 `gather_read_wave_wrs` 分别配置地址发布合批和在途 READ WR。
 
-该模式默认关闭。开启后自动启用 READ 提前准备，并替代
-`KVAF_AIV_GATHER_CHUNK_BYTES`、`KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR` 和
-`KVAF_AIV_GATHER_COOPERATIVE_CHUNKS` 的调度配置。
-适用条件为 `token_bytes × SGL <= 65536` 且未启用探针。
-`GATHER_OPTIONS pipeline=grouped` 表示已启用，K 端服务与 N 端 Host 和 AIV kernel 须同步更新。
+AIV 的分组实验在已测负载上出现端到端退化，已移除。原实现的后续地址发布依赖 K 端的 Ready
+进度，且每次发布都需要描述符搬运和带完成等待的控制 WRITE。这些工作与数据 READ 的推进
+交织在同一条控制队列上。AIV 的首块大小和协作前缀继续由原有前缀参数决定。
 
 ## 输出连续与 SGE 合并
 

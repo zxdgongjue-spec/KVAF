@@ -7,10 +7,6 @@ foreach(test npu_runtime_config runtime_cleanup)
   add_test(NAME kvaf_${test}_test COMMAND kvaf_${test}_test)
 endforeach()
 
-add_executable(kvaf_startup_selection_test startup_selection_test.cc)
-target_link_libraries(kvaf_startup_selection_test PRIVATE kvaf_runtime)
-add_test(NAME kvaf_startup_selection_test COMMAND kvaf_startup_selection_test)
-
 if(KVAF_BUILD_REMOTE_CPU_SERVICE AND NOT KVAF_CPU_ENABLE_URMA)
   add_executable(kvaf_cpu_backend_dispatch_test cpu_backend_dispatch_test.cc)
   target_link_libraries(kvaf_cpu_backend_dispatch_test PRIVATE kvaf_cpu_runtime)

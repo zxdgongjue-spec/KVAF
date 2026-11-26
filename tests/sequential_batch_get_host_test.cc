@@ -263,9 +263,8 @@ Status PeerLink::CreateChannel(uint64_t, const uint8_t*, uint32_t, const uint8_t
                                uint32_t*, uint64_t*, uint32_t*, bool) {
   return Status::NotImplemented("host test uses the transport stub");
 }
-Status PeerLink::EnableGatherLanesWithCapabilities(uint64_t, uint64_t, uint32_t,
-                                                   uint32_t& capabilities, bool) const {
-  capabilities = kGatherLanesChunkedPullGroups;
+Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t, bool aiv) const {
+  assert(aiv);
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
@@ -446,7 +445,7 @@ int main() {
   for (const char* probe : {"ack", "wqe", "sq", "first_read"}) {
     setenv("KVAF_AIV_GATHER_PROBE", probe, 1);
     auto owner = CreateSequentialBatchGet(algorithm, config); assert(owner->Initialize(region).ok());
-    assert(owner->SetGatherBatchGetProfiling(true).code() == StatusCode::kInvalidState);
+    assert(owner->SetBatchGetKernelProfiling(true).code() == StatusCode::kInvalidState);
     exec.execution.synchronize = false;
     const auto before = launches;
     assert(owner->ExecuteBatchGet(exec).code() == StatusCode::kInvalidArgument && launches == before);
@@ -623,11 +622,11 @@ int main() {
   {
     auto owner = CreateSequentialBatchGet(algorithm, config);
     GatherBatchGetProfile snapshot;
-    assert(owner->SetGatherBatchGetProfiling(true).code() == StatusCode::kNotInitialized);
+    assert(owner->SetBatchGetKernelProfiling(true).code() == StatusCode::kNotInitialized);
     assert(owner->Initialize(region).ok());
     assert(owner->CopyGatherBatchGetProfile(&snapshot).code() == StatusCode::kInvalidState);
     assert(owner->CopyGatherBatchGetProfile(nullptr).code() == StatusCode::kInvalidArgument);
-    assert(owner->SetGatherBatchGetProfiling(true).ok() && allocations == 6);
+    assert(owner->SetBatchGetKernelProfiling(true).ok() && allocations == 6);
     exec.execution.synchronize = false;
     const auto before = launches;
     assert(owner->ExecuteBatchGet(exec).code() == StatusCode::kInvalidArgument && launches == before);
@@ -645,11 +644,11 @@ int main() {
       assert(snapshot.total_ns >= snapshot.prepare_ns + snapshot.launch_ns +
           snapshot.status_enqueue_ns + snapshot.wait_ns + snapshot.finish_ns);
     }
-    assert(owner->SetGatherBatchGetProfiling(false).ok());
+    assert(owner->SetBatchGetKernelProfiling(false).ok());
     assert(owner->ExecuteBatchGet(exec).ok());
     assert(owner->CopyGatherBatchGetProfile(&snapshot).code() == StatusCode::kInvalidState);
     assert(snapshot.cores.empty());
-    assert(owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->SetBatchGetKernelProfiling(true).ok());
     count = 0;
     assert(owner->ExecuteBatchGet(exec).ok() && owner->CopyGatherBatchGetProfile(&snapshot).ok());
     for (const auto& p : snapshot.cores) assert(p.requests == 0);
@@ -662,7 +661,7 @@ int main() {
   setenv("KVAF_AIV_GATHER_CHUNK_BYTES", "0", 1);
   for (profile_fault = 1; profile_fault <= 13; ++profile_fault) {
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     const auto failure = owner->ExecuteBatchGet(exec);
     assert(failure.code() == StatusCode::kInternal);
     assert(failure.message().find(std::string("reason=") + profile_reasons[profile_fault] + " ") != std::string::npos);
@@ -684,12 +683,12 @@ int main() {
   profile_fault = 0;
   {
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     fail_sync = true;
     assert(owner->ExecuteBatchGet(exec).code() == StatusCode::kDeviceError);
     GatherBatchGetProfile snapshot;
     assert(!owner->CopyGatherBatchGetProfile(&snapshot).ok());
-    assert(owner->SetGatherBatchGetProfiling(false).ok()); // Cleanup preserves original failure.
+    assert(owner->SetBatchGetKernelProfiling(false).ok()); // Cleanup preserves original failure.
     assert(!owner->Shutdown().ok() && allocations == 6);
     fail_sync = false;
     assert(owner->Shutdown().ok() && !allocations && !refs);
@@ -763,7 +762,7 @@ int main() {
   }
   {
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     const auto copies = status_copies, clears = async_memsets;
     exec.execution.synchronize = true;
     assert(owner->ExecuteBatchGet(exec).ok());
@@ -814,7 +813,7 @@ int main() {
   unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
   for (profile_fault = 14; profile_fault <= 17; ++profile_fault) {
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     assert(owner->ExecuteBatchGet(exec).code() == StatusCode::kInternal);
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
@@ -845,7 +844,7 @@ int main() {
   for (const char* setting : {"0", "1"}) {
     setenv("KVAF_AIV_GATHER_PREPARE_AHEAD", setting, 1);
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     unsetenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
     assert(owner->ExecuteBatchGet(exec).ok() && last_prepare_ahead == uint32_t(*setting - '0'));
     GatherBatchGetProfile profile;
@@ -861,7 +860,7 @@ int main() {
   for (const char* count : {"2", "4", "8", "16", "32"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     unsetenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
     assert(owner->ExecuteBatchGet(exec).ok());
     assert(last_cooperative_chunks == std::strtoul(count, nullptr, 10));
@@ -877,7 +876,7 @@ int main() {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", tails, 1);
     setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", first, 1);
     auto owner = CreateSequentialBatchGet(algorithm, config);
-    assert(owner->Initialize(region).ok() && owner->SetGatherBatchGetProfiling(true).ok());
+    assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     unsetenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
     assert(owner->ExecuteBatchGet(exec).ok() && last_first_divisor == std::strtoul(first, nullptr, 10) &&
            last_cooperative_chunks == std::strtoul(tails, nullptr, 10));

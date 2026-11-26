@@ -3,11 +3,14 @@
 #include "sequential_batch_get_abi.h"
 
 namespace kvaf::sequential_detail {
+struct InputOptions {
+  uint32_t cores, token_bytes;
+};
 inline Status Error(const char* what) {
   return Status::Internal(std::string("AIV sequential BatchGet: ") + what);
 }
 inline uint64_t Ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
-inline void FillInput(const BatchGetRequest& r, const AccessOperatorConfig& config,
+inline void FillInput(const BatchGetRequest& r, uint32_t cores, uint64_t token_bytes,
                       KvafExecuteBatchGetKernelArgs* a) {
   const auto& table = r.device_access_table;
   const auto count = r.indices.bytes / 4;
@@ -17,13 +20,13 @@ inline void FillInput(const BatchGetRequest& r, const AccessOperatorConfig& conf
   a->indices = Ptr(r.indices.data); a->offsets = Ptr(r.offsets.data);
   a->miss_count = Ptr(r.miss_count.data); a->output_indices = Ptr(r.output_indices.data);
   a->output = Ptr(r.output.data); a->table_capacity = entries; a->request_capacity = count;
-  a->output_rows = r.output.bytes / r.output_block_bytes;
-  a->token_bytes = r.output_block_bytes; a->tokens_per_block = r.tokens_per_block;
-  a->block_count = config.npu_core_count; a->jettys_per_core = 2;
+  a->output_rows = r.output.bytes / token_bytes;
+  a->token_bytes = token_bytes; a->tokens_per_block = r.tokens_per_block;
+  a->block_count = cores; a->jettys_per_core = 2;
   // Intentionally never copy the direct-read inflight budget into this ABI.
 }
-inline Status Input(const BatchGetExecRequest& exec, const AccessOperatorConfig& config,
-             KvafExecuteBatchGetKernelArgs* a) {
+inline Status Input(const BatchGetExecRequest& exec, InputOptions options,
+                    KvafExecuteBatchGetKernelArgs* a) {
   if (!exec.request || !exec.execution.stream) return Status::InvalidArgument("BatchGet needs request and stream");
   const auto& r = *exec.request;
   const auto& table = r.device_access_table;
@@ -38,12 +41,12 @@ inline Status Input(const BatchGetExecRequest& exec, const AccessOperatorConfig&
       r.output_indices.device != DeviceKind::kNpu || r.miss_count.device != DeviceKind::kNpu ||
       r.output.device != DeviceKind::kNpu || table.addresses.device != DeviceKind::kNpu ||
       table.valid.device != DeviceKind::kNpu || count > KVAF_SEQ_MAX_REQUESTS || entries > UINT32_MAX ||
-      !r.output_block_bytes || r.output_block_bytes != config.batch_get_token_bytes ||
+      !r.output_block_bytes || r.output_block_bytes != options.token_bytes ||
       !r.tokens_per_block || r.tokens_per_block > UINT32_MAX ||
       r.output.bytes % r.output_block_bytes || r.output.bytes / r.output_block_bytes > UINT32_MAX ||
       Ptr(r.output.data) > UINT64_MAX - r.output.bytes)
     return Status::InvalidArgument("invalid sequential BatchGet Tensor layout/capacity");
-  FillInput(r, config, a);
+  FillInput(r, options.cores, options.token_bytes, a);
   return Status::OK();
 }
 }

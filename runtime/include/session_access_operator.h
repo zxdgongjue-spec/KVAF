@@ -55,17 +55,13 @@ class SessionAccessOperator final : public AccessOperator {
     return op ? op->SetBatchGetKernelProfiling(enabled, detailed)
               : Status::NotInitialized("session not initialized");
   }
-  Status SetScatterProfiling(bool enabled) override {
-    return resources_->operation()->SetScatterProfiling(enabled);
-  }
   Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* out) const override {
-    return resources_->operation()->CopyScatterProfiles(out);
-  }
-  Status SetGatherBatchGetProfiling(bool enabled) override {
-    return resources_->operation()->SetGatherBatchGetProfiling(enabled);
+    auto* op = resources_->operation();
+    return op ? op->CopyScatterProfiles(out) : Status::NotInitialized("session not initialized");
   }
   Status CopyGatherBatchGetProfile(GatherBatchGetProfile* out) const override {
-    return resources_->operation()->CopyGatherBatchGetProfile(out);
+    auto* op = resources_->operation();
+    return op ? op->CopyGatherBatchGetProfile(out) : Status::NotInitialized("session not initialized");
   }
   Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const override {
     auto* op = resources_->operation();

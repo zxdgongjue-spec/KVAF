@@ -71,48 +71,14 @@ cd /path/to/kvaf
 
 统一构建默认使用 `RelWithDebInfo`，可通过 `--build-type` 覆盖。
 
-CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
-`--gather-mode adaptive|active|passive` 显式覆盖。
-
-URMA DDR 区域支持 `default`、`thp` 和 `hugetlb-<size>`，默认使用 `thp`。
-`<size>` 使用 `k/m/g/t/p/e` 二进制单位，换算成字节后必须是 2 的幂。
-例如 `hugetlb-64k`、`hugetlb-2m`、`hugetlb-16m`、`hugetlb-32m`、`hugetlb-512m`、
-`hugetlb-1g` 和 `hugetlb-16g`。在 CPU 侧宿主机查看内核支持的实际页大小，例如
-`hugepages-32768kB` 对应 `hugetlb-32m`。
-
-```bash
-ls /sys/kernel/mm/hugepages
-ls /sys/devices/system/node/node3/hugepages
-```
-
-```bash
-# 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
-# 是否全部合并仍由 Linux THP 决定。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999
-
-# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode default
-
-# 显式使用 2 MiB、32 MiB 或 1 GiB HugeTLB 页，按宿主机页池选择。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-32m
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
-```
-
-显式 HugeTLB 模式需要在目标 NUMA 节点预留对应大小的页。实际映射按页大小向上取整，
-客户端可用容量和 URMA 注册长度仍为请求长度。内核不支持所选页大小或页池不足时，DDR 申请会返回错误。
-`DDR_ALLOCATED` 日志记录 `page_mode` 和 `backing_bytes`。`urma+ubmem` 混合模式的共享 DDR 由 UBmem 分配器提供。
+CPU Gather 默认线程总预算为 12，等待模式为 `active`，内部绑核默认为 `on`。
+`--gather-threads` 和 `--gather-mode` 适用于 Gather Read 和 AIV Gather→Push。
+`--gather-affinity on|off` 控制这两条 AIV 路径的内部绑核。AICPU Gather Read 的 CPU 线程
+遵循进程亲和性。纯 SGL Push 的执行路径不读取这三个 Gather 参数。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
-`numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的
-CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。默认 THP 模式还应通过
-`/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
-合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
+`numactl --cpunodebind=N --membind=N ...`。也可用 `taskset -c CPU_LIST` 限定允许的 CPU。
+AIV Gather 和 AIV Gather→Push 开启内部绑核时，在这个允许范围内为 worker 选核。
 
 服务启动时记录 CPU 亲和性。普通 URMA 缓存操作使用匹配的 `--cpunodebind N --membind N` 时，通过 Linux CPU topology 确定节点所属的 CPU Chip，只枚举该 Chip 上所有 FE 的非零 EID。
 未绑定时枚举所有 UB 设备。候选按设备名和 EID index 排序。服务端 `--ub-device NAME` 选该设备首项，
@@ -122,6 +88,82 @@ CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范�
 无法确定归属或属于其他 Chip 的设备记为 `NUMA_DEVICE_SKIPPED`。
 CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
+
+### URMA DDR 大页配置
+
+`--memory-page-mode` 是 `kvaf_cpu_service` 的启动参数，控制 URMA 分配的 CPU DDR。
+`urma+ubmem` 模式下的共享缓存 DDR 由 UBmem 分配器提供。
+
+| CPU 服务参数 | 分配方式 |
+| --- | --- |
+| 省略参数或 `--memory-page-mode thp` | 默认模式。按 2 MiB 对齐，用 `MADV_HUGEPAGE` 请求透明大页，并在注册前主动触页。实际合并量可查看 `/proc/<pid>/smaps` 中的 `AnonHugePages`。 |
+| `--memory-page-mode default` | 按 4 KiB 对齐申请普通内存。内核仍可按系统策略使用 THP。 |
+| `--memory-page-mode hugetlb-<size>` | 从所选大小的 Linux HugeTLB 页池分配。页大小须受宿主机内核支持。 |
+
+以下以 **NUMA 1 上的 1 GiB HugeTLB** 为例。所有 shell 命令都在 CPU 服务所在的 Linux 宿主机执行。
+
+#### 1. 确认 NUMA 节点和页大小
+
+根据 CPU 侧 UB device 的拓扑选择节点。已知设备的 PCI BDF 时，可查看
+`/sys/bus/pci/devices/<BDF>/numa_node`。用 `numactl --hardware` 查看节点和内存，
+将示例中的 `node1` 改成实际节点对应的目录，再查看该节点支持的页池。
+
+```bash
+numactl --hardware
+ls /sys/devices/system/node/node1/hugepages
+```
+
+下表列出当前回归测试覆盖的全部页大小。按目标节点实际存在的页池选择参数。
+`<size>` 使用小写二进制单位 `k/m/g/t/p/e`，换算成字节后须是 2 的幂。
+
+| 页大小 | 页池目录 | `--memory-page-mode` 的值 |
+| --- | --- | --- |
+| 64 KiB | `hugepages-64kB` | `hugetlb-64k` |
+| 2 MiB | `hugepages-2048kB` | `hugetlb-2m` |
+| 16 MiB | `hugepages-16384kB` | `hugetlb-16m` |
+| 32 MiB | `hugepages-32768kB` | `hugetlb-32m` |
+| 512 MiB | `hugepages-524288kB` | `hugetlb-512m` |
+| 1 GiB | `hugepages-1048576kB` | `hugetlb-1g` |
+| 16 GiB | `hugepages-16777216kB` | `hugetlb-16g` |
+
+#### 2. 计算并预留大页
+
+每块 DDR 所需的页数向上取整，再把页数加起来。例如，328 MiB 的 DDR 需要 1 个 1 GiB 大页。
+使用 AICPU Gather 时，还要为它的 DDR 工作区预留大页。[工作区配置](../docs/aicpu_get_windows.md#配置)
+
+以下命令以 root 身份执行。向 `nr_hugepages` 写入 `2`，表示将 NUMA 1 的 1 GiB 页池目标总数
+设为 2 页，共 2 GiB。写入值低于现有页数时会缩减页池。
+
+```bash
+echo 2 > /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+cat /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+cat /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/free_hugepages
+```
+
+回读 `nr_hugepages` 应为 `2`。如果写入成功但回读小于 `2`，说明未能预留到目标页数，通常是
+节点上的连续物理内存不足。可在 Linux 启动时预留后再次检查。`free_hugepages` 是当前空闲页数，
+应至少达到本次 DDR 申请所需的页数。
+[Linux HugeTLB 页池说明](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html)
+
+#### 3. 启动 CPU 服务并核对分配
+
+在仓库根目录启动服务，将 CPU 和内存绑定到预留大页的同一节点，并传入对应的页模式。
+
+```bash
+numactl --cpunodebind=1 --membind=1 \
+  ./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
+```
+
+使用其他节点时，同时修改页池目录和 `numactl` 的节点编号。使用其他页大小时，同时修改页池目录、
+所需页数和启动参数中的页模式。
+NPU 客户端照常通过 `initialize(ddr_bytes, slot_size)` 或 `initialize_ddr(ddr_bytes, slot_size)`
+指定缓存容量。客户端申请 DDR 时，CPU 服务才会从页池取页。检查 CPU 服务的 `DDR_ALLOCATED`
+日志确认 `page_mode=hugetlb-1g`，上述示例的映射长度为 `backing_bytes=1073741824`（1 GiB）。
+客户端可用容量和传给 URMA 的注册长度仍以申请值为准。UDMA/IOMMU 的页表粒度取决于驱动和硬件。
+页池不足或内核不支持所选页大小时，显式 HugeTLB 分配会失败。
+
+### NPU 连接方式
 
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 

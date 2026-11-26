@@ -301,7 +301,6 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 
 Gather 与 WRITE 的交错需要在 **K 端启动 CPU 服务前** 设置
 `export KVAF_CPU_GATHER_INTERLEAVE=1`；仅在 N 端设置不会改变远端服务的配置。
-Gather 线程数量、亲和性和等待方式由 K 端服务参数决定。
 上述命令未指定 payload Jetty 数，因此在没有 `KVAF_SCATTER_JETTYS_PER_CORE` 环境覆盖时
 使用 4 条共享 payload Jetty。
 
@@ -310,6 +309,35 @@ Gather 线程数量、亲和性和等待方式由 K 端服务参数决定。
 kernel profiling 只保留末节点的阶段数据，不能将末节点 `last_call_aiv_wall_us` 从整图单次
 平均耗时中相减，得到平均 `call_outside_aiv_us`。阶段耗时定位使用末节点 profile；
 单次 eager 的完整耗时拆解使用下面的无图对照。
+
+### K 端参数与对照
+
+| 路径 | `--gather-threads` | `--gather-mode` | `--gather-affinity` |
+| --- | --- | --- | --- |
+| AICPU Gather Read | 生效，可由该执行配置的 `cpu_threads` 覆盖 | 生效 | 内部绑核开关不生效，线程继承进程 CPU 亲和性 |
+| AIV Gather Read | 生效，线程预算按 AIV lane 拆分 | 生效 | 生效 |
+| AICPU Push Scatter 或 AIV SGL Push Scatter | 不用于本链路 | 不用于本链路 | 不用于本链路 |
+| AIV Gather→Push Scatter（`KVAF_SCATTER_CPU_GATHER=1`） | 生效，是复制线程预算上限 | 生效 | 生效，覆盖 Push 主循环所在的 Gather worker 0 及复制 helper |
+
+`active` 让上一次参与复制的 helper 在再次派工前持续自旋。`adaptive` 先自旋，
+达到约 100 µs 后允许休眠。`passive` 使用条件变量等待派工。纯 SGL Push 仍受同服务
+其他 session 的 CPU 和内存竞争影响。
+
+对于 656 B × 8192 miss 的 AIV Gather→Push，可从下面的 K 端配置开始对照。
+现有数据没有对同一负载的线程数、等待方式和绑核做受控对比，因此这组是起测配置。
+
+```bash
+KVAF_CPU_GATHER_INTERLEAVE=1 ./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28890 \
+  --gather-threads 32 --gather-mode adaptive --gather-affinity on \
+  --memory-page-mode thp
+```
+
+固定 N 端配置及 K 端设备、NUMA 和页模式，每次只改一个量。先比较 `active` 与
+`adaptive`，再比较 `12/16/32` 线程和绑核 `on/off`，最后用 `INTERLEAVE=0/1` 检查交错的净收益。
+端到端结果比较 P50/P99，阶段 profile 用于判断 Gather 等待、WRITE 和 Scatter 的变化。
+纯 SGL Push 可省略上面三个 Gather 参数。AIV Push 的 `KVAF_CPU_PUSH_POST_BATCH_WRS`
+默认是 128，可先固定用于对照。
 
 ### 单次 eager 对照
 

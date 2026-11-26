@@ -762,27 +762,25 @@ bool NpuRuntime::pending_raw_addr() const {
 }
 
 Status NpuRuntime::SetScatterProfiling(bool enabled) {
-  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before Scatter profiling");
-  return impl_->dispatcher->WithSequentialGet(GetAlgorithm::Scatter, true,
-      [enabled](AccessOperator& op) { return op.SetScatterProfiling(enabled); });
+  return SetBatchGetKernelProfiling(enabled, false,
+      GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter});
 }
 
 Status NpuRuntime::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* out) const {
   if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before Scatter profiling");
-  return impl_->dispatcher->WithSequentialGet(GetAlgorithm::Scatter, false,
-      [out](AccessOperator& op) { return op.CopyScatterProfiles(out); });
+  return impl_->dispatcher->CopyGetProfileDetails({Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter}, true,
+      [out](const AccessOperator& op) { return op.CopyScatterProfiles(out); });
 }
 
 Status NpuRuntime::SetGatherBatchGetProfiling(bool enabled) {
-  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before Gather profiling");
-  return impl_->dispatcher->WithSequentialGet(GetAlgorithm::Gather, true,
-      [enabled](AccessOperator& op) { return op.SetGatherBatchGetProfiling(enabled); });
+  return SetBatchGetKernelProfiling(enabled, false,
+      GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Gather});
 }
 
 Status NpuRuntime::CopyGatherBatchGetProfile(GatherBatchGetProfile* out) const {
   if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before Gather profiling");
-  return impl_->dispatcher->WithSequentialGet(GetAlgorithm::Gather, false,
-      [out](AccessOperator& op) { return op.CopyGatherBatchGetProfile(out); });
+  return impl_->dispatcher->CopyGetProfileDetails({Transport::Urma, Executor::Aiv, GetAlgorithm::Gather}, false,
+      [out](const AccessOperator& op) { return op.CopyGatherBatchGetProfile(out); });
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

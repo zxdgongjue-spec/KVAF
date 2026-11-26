@@ -598,34 +598,6 @@ Status ExecutionDispatcher::DrainGetLocked() {
   }
   return s;
 }
-Status ExecutionDispatcher::WithSequentialGet(
-    GetAlgorithm algorithm, bool prepare, const std::function<Status(AccessOperator&)>& action) {
-  std::shared_lock<std::shared_mutex> life(lifecycle_);
-  std::lock_guard<std::mutex> lock(get_mutex_);
-  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  const GetExecutionConfig config{Transport::Urma, Executor::Aiv, algorithm};
-  if (!prepare) {
-    auto* instance = FindGetInstanceLocked(config);
-    if (!instance) return Status::NotInitialized("sequential Get has not been prepared");
-    if (instance->cleanup_only) return Status::Busy("Get instance requires cleanup");
-    // Scatter snapshots also complete asynchronous Scatter calls. Retire the
-    // invocation here so the dispatcher and provider agree on completion.
-    if (algorithm == GetAlgorithm::Scatter && pending_get_ == instance) {
-      const auto status = DrainGetLocked();
-      if (!status.ok()) return status;
-    }
-    return action(*instance->view().operation());
-  }
-  auto status = DrainGetLocked();
-  if (!status.ok()) return status;
-  GetExecutionContext* instance = nullptr;
-  status = PrepareGetInstanceLocked(config, nullptr, {}, &instance);
-  if (!status.ok()) return status;
-  status = action(*instance->view().operation());
-  instance->ClearRequest();
-  return status;
-}
-
 Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) {
   const auto started = get_trace_ ? TraceNowNs() : 0;
   std::shared_lock<std::shared_mutex> life(lifecycle_);
@@ -802,6 +774,30 @@ Status ExecutionDispatcher::FindGraphNode(GetExecutionContext* instance, std::ui
     return Status::InvalidState("Get graph has no queryable capture");
   return Status::OK();
 }
+Status ExecutionDispatcher::CheckGetProfileReadableLocked(GetExecutionContext* instance,
+                                                           bool drain_pending) {
+  if (!instance || instance->cleanup_only)
+    return Status::NotInitialized("Get instance has no readable profile");
+  if (pending_get_ == instance) {
+    return drain_pending ? DrainGetLocked()
+                         : Status::Busy("complete Get with DrainGet before reading its profile");
+  }
+  return Status::OK();
+}
+
+Status ExecutionDispatcher::CopyGetProfileDetails(
+    GetExecutionConfig config, bool drain_pending, const std::function<Status(const AccessOperator&)>& read) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, config, &resolved);
+  if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  s = CheckGetProfileReadableLocked(instance, drain_pending);
+  return s.ok() ? read(*instance->view().operation()) : s;
+}
+
 Status ExecutionDispatcher::CopyGetProfiles(std::optional<GetExecutionConfig> config,
                                              std::vector<BatchGetKernelProfile>* profiles,
                                              std::uint64_t graph_lease) {
@@ -823,10 +819,8 @@ Status ExecutionDispatcher::CopyGetProfiles(std::optional<GetExecutionConfig> co
       return view.operation()->CopyBatchGetKernelProfiles(profiles);
     });
   }
-  if (!instance || instance->cleanup_only)
-    return Status::NotInitialized("Get instance has no readable profile");
-  if (pending_get_ == instance)
-    return Status::Busy("complete Get with DrainGet before reading its profile");
+  s = CheckGetProfileReadableLocked(instance, false);
+  if (!s.ok()) return s;
   if (!instance->last_graph_profile.empty()) {
     *profiles = instance->last_graph_profile;
     return Status::OK();

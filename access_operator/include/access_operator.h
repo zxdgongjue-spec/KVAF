@@ -122,14 +122,8 @@ class AccessOperator {
   virtual Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>*) const {
     return Status::NotImplemented("provider does not support Get profiling");
   }
-  virtual Status SetScatterProfiling(bool) {
-    return Status::NotImplemented("Scatter profiling requires AIV Scatter");
-  }
   virtual Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>*) const {
     return Status::NotImplemented("Scatter profiling requires AIV Scatter");
-  }
-  virtual Status SetGatherBatchGetProfiling(bool) {
-    return Status::NotImplemented("Gather profiling requires AIV Gather");
   }
   virtual Status CopyGatherBatchGetProfile(GatherBatchGetProfile*) const {
     return Status::NotImplemented("Gather profiling requires AIV Gather");

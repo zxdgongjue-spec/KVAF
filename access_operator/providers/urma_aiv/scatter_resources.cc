@@ -338,9 +338,81 @@ bool ScatterBatchGet::GetGraphNeedsRecovery() const {
   return node_ && node_->recovery_fenced;
 }
 Status ScatterBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
-  return Launch(exec, {*resources_, *resources_->eager, node_});
+  auto* timing = exec.host_timing;
+  BatchGetProfileScope total(timing ? &timing->total_ns : nullptr);
+  auto& s = *resources_;
+  auto& invocation = *s.eager;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto state = s.CheckExecutionState();
+  if (!state.ok()) return state;
+  const bool attach_graph = exec.execution.graph_lease != 0;
+  if (s.graph.leases && !attach_graph)
+    return Status::InvalidState("release Scatter graph leases before another eager BatchGet");
+  if (!exec.request || !exec.execution.stream)
+    return Status::InvalidArgument("BatchGet needs a request and stream");
+  const auto prepare = GetHostTimingStart(timing);
+  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  aclmdlRI external_capture = nullptr;
+  if (attach_graph || !exec.execution.trusted_npu_request) {
+    bool capturing = false;
+    const auto status = s.QueryCapture(stream, &capturing, &external_capture);
+    if (!status.ok()) return status;
+    if (attach_graph) {
+      if (!capturing || !node_ || !node_->prepared || node_->captured ||
+          s.graph.retiring || invocation.pending || exec.execution.synchronize)
+        return Status::InvalidState("capture Scatter with an unused graph lease");
+      if (!external_capture || stream != s.graph.stream ||
+          (s.graph.id && external_capture != s.graph.id))
+        return Status::InvalidState("capture all Scatter leases in the same graph and stream");
+      if (s.graph.nodes >= UINT32_MAX - s.sequence)
+        return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+    } else if (capturing) {
+      return Status::InvalidState("use a Get graph lease for Scatter capture");
+    }
+  }
+  auto result = s.Drain(timing);
+  if (!result.ok()) return result;
+  auto args = s.args;
+  const ScatterLaunchView view{s.config.npu_core_count, s.config.batch_get_token_bytes,
+                               s.payload_jettys_per_core, Ptr(s.status_device), s.mailbox_context};
+  result = PrepareScatterBatchGetArguments(exec, view, args);
+  if (!result.ok()) return result;
+  if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+  GetHostTimingRecord(timing, &GetProviderTiming::prepare_ns, prepare);
+  if (attach_graph) {
+    args.sequence = 0;
+    args.reserved |= kScatterDeviceSequence;
+    s.graph.id = external_capture;
+    node_->captured = true;
+    ++s.graph.nodes;
+    if (KvafScatterBatchGetLaunch(&args, stream)) {
+      s.failed = true;
+      return Status::CompletionUnknown("Scatter graph launch failed; destroy and discard the graph");
+    }
+    s.profile_ready = false;
+    return Status::OK();
+  }
+  args.sequence = ++s.sequence;
+  s.profile_ready = false;
+  invocation.pending = stream;
+  // Every launched core overwrites its complete status. Drain checks this
+  // request's monotonically increasing sequence, so an old status cannot pass.
+  // Avoid submitting a separate device memset task before every kernel.
+  const auto launch = GetHostTimingStart(timing);
+  const auto launch_result = KvafScatterBatchGetLaunch(&args, invocation.pending);
+  if (timing) {
+    const auto elapsed = GetHostTimingStart(timing) - launch;
+    timing->submit_ns += elapsed;
+    timing->aiv_kernel_launch_ns += elapsed;
+  }
+  if (launch_result) {
+    s.failed = true; return Error("enqueue failed; resources retained");
+  }
+  s.profile_ready = ScatterProfileEnabled(args.reserved);
+  return exec.execution.synchronize ? s.Drain(timing) : Status::OK();
 }
-Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
+
+Status ScatterBatchGet::SetBatchGetKernelProfiling(bool enabled) {
   auto& s = *resources_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.initialized) return Status::NotInitialized("scatter is not initialized");

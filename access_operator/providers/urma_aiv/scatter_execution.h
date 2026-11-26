@@ -25,7 +25,7 @@ class ScatterBatchGet final : public SequentialBatchGet {
   Status ExecuteBatchGet(const BatchGetExecRequest& exec) override;
   Status DrainGet() override;
   Status Shutdown() override;
-  Status SetScatterProfiling(bool enabled) override;
+  Status SetBatchGetKernelProfiling(bool enabled) override;
   Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const override;
   std::unique_ptr<ExecutionState> CreateExecutionState() override;
   Status BindExecutionState(ExecutionState*) override;
@@ -41,12 +41,6 @@ class ScatterBatchGet final : public SequentialBatchGet {
     aclrtStream pending{};
     bool prepared{}, captured{}, recovery_fenced{};
   };
-  struct LaunchView {
-    Resources& resources;
-    Invocation& invocation;
-    Invocation* node;
-  };
-  static Status Launch(const BatchGetExecRequest&, LaunchView);
   std::unique_ptr<Resources> standalone_;
   Resources* resources_;
   Invocation* node_{};

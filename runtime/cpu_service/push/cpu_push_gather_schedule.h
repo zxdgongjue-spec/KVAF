@@ -7,8 +7,7 @@
 #include "cpu_push_get_layout.h"
 
 namespace kvaf::cpu_push {
-// A wave can gather disjoint ranges. In an interleaved wave each range belongs
-// to the Jetty at the same index.
+// Each range in an interleaved Gather wave belongs to the Jetty at the same index.
 using GatherWave = std::array<Range, kMaxJettyCount>;
 
 inline std::vector<GatherWave> InterleavedGatherWaves(std::uint32_t count,

@@ -349,23 +349,17 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   };
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   auto* provider_timing = host_timing ? &host_timing->provider : nullptr;
-  if (execution.trusted_npu_request && !execution.graph_lease) {
-    if (!initialized_ || closing_) return Status::NotInitialized("Runtime has not been initialized");
-    if (request.indices.device != DeviceKind::kNpu || !execution.stream)
-      return Status::InvalidArgument("trusted BatchGet requires NPU inputs and a stream");
-    mark(&BatchGetHostTiming::core_validate_ns);
-    const auto status = access_operator_.ExecuteBatchGet({{}, &request, execution, provider_timing});
-    mark(&BatchGetHostTiming::core_dispatch_ns);
-    return status;
-  }
   if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (execution.config && !access_operator_.TracksGetCompletion())
     return Status::NotImplemented("this operator does not support execution configuration or resource leases");
+  const bool trusted = execution.trusted_npu_request && !execution.graph_lease;
+  if (trusted && (request.indices.device != DeviceKind::kNpu || !execution.stream))
+    return Status::InvalidArgument("trusted BatchGet requires NPU inputs and a stream");
   mark(&BatchGetHostTiming::core_lifecycle_ns);
   std::shared_ptr<AccessTableState> table_ref;
-  {
+  if (request.access_table.opaque != 0) {
     std::lock_guard<std::mutex> lock(table_mutex_);
     const auto it = access_tables_.find(request.access_table.opaque);
     if (it != access_tables_.end()) table_ref = it->second;
@@ -384,78 +378,80 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     if (!drained.ok()) return drained;
   }
   mark(&BatchGetHostTiming::core_previous_drain_ns);
-  if (!request.indices.has_elements<std::int32_t>() ||
-      !request.offsets.has_elements<std::int32_t>() ||
-      !request.output_indices.has_elements<std::int32_t>() ||
-      request.indices.bytes != request.offsets.bytes ||
-      request.indices.bytes != request.output_indices.bytes) {
-    return Status::InvalidArgument(
-        "indices, offsets, and output_indices must be equally sized int32 buffers");
-  }
-  const std::size_t request_count =
-      request.indices.bytes / sizeof(std::int32_t);
-  if (!request.miss_count.has_elements<std::int32_t>() ||
-      request.miss_count.bytes != sizeof(std::int32_t) ||
-      request.miss_count.device != request.indices.device) {
-    return Status::InvalidArgument(
-        "miss_count must be a single int32 on the BatchGet device");
-  }
-  if (!request.output.valid() ||
-      request.output_block_bytes == 0 ||
-      request.output.bytes % request.output_block_bytes != 0) {
-    return Status::InvalidArgument("output must contain whole non-empty output blocks");
-  }
-  if (request.indices.device != request.offsets.device ||
-      request.indices.device != request.output_indices.device ||
-      request.indices.device != request.output.device) {
-    return Status::InvalidArgument("BatchGet input and output buffers must share a device");
-  }
+  if (!trusted) {
+    if (!request.indices.has_elements<std::int32_t>() ||
+        !request.offsets.has_elements<std::int32_t>() ||
+        !request.output_indices.has_elements<std::int32_t>() ||
+        request.indices.bytes != request.offsets.bytes ||
+        request.indices.bytes != request.output_indices.bytes) {
+      return Status::InvalidArgument(
+          "indices, offsets, and output_indices must be equally sized int32 buffers");
+    }
+    const std::size_t request_count =
+        request.indices.bytes / sizeof(std::int32_t);
+    if (!request.miss_count.has_elements<std::int32_t>() ||
+        request.miss_count.bytes != sizeof(std::int32_t) ||
+        request.miss_count.device != request.indices.device) {
+      return Status::InvalidArgument(
+          "miss_count must be a single int32 on the BatchGet device");
+    }
+    if (!request.output.valid() ||
+        request.output_block_bytes == 0 ||
+        request.output.bytes % request.output_block_bytes != 0) {
+      return Status::InvalidArgument("output must contain whole non-empty output blocks");
+    }
+    if (request.indices.device != request.offsets.device ||
+        request.indices.device != request.output_indices.device ||
+        request.indices.device != request.output.device) {
+      return Status::InvalidArgument("BatchGet input and output buffers must share a device");
+    }
 
-  if (request.indices.device == DeviceKind::kCpu) {
-    const std::int32_t miss_count =
-        *static_cast<const std::int32_t*>(request.miss_count.data);
-    if (miss_count < 0 || static_cast<std::size_t>(miss_count) > request_count) {
-      return Status::InvalidArgument(
-          "miss_count must be between zero and the BatchGet request capacity");
+    if (request.indices.device == DeviceKind::kCpu) {
+      const std::int32_t miss_count =
+          *static_cast<const std::int32_t*>(request.miss_count.data);
+      if (miss_count < 0 || static_cast<std::size_t>(miss_count) > request_count) {
+        return Status::InvalidArgument(
+            "miss_count must be between zero and the BatchGet request capacity");
+      }
     }
-  }
 
-  if (request.indices.device == DeviceKind::kNpu) {
-    if (request.tokens_per_block == 0 ||
-        request.output_block_bytes >
-            std::numeric_limits<std::uint64_t>::max() /
-                request.tokens_per_block) {
-      return Status::InvalidArgument(
-          "NPU BatchGet requires a valid tokens_per_block layout");
-    }
-    const std::uint64_t address_table_entry_bytes =
-        request.tokens_per_block * request.output_block_bytes;
-    if (request.device_access_table.empty() ||
-        request.device_access_table.addresses.data == nullptr ||
-        request.device_access_table.valid.data == nullptr ||
-        request.device_access_table.addresses.bytes == 0 ||
-        request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
-        request.device_access_table.valid.bytes !=
-            request.device_access_table.addresses.bytes / sizeof(Address) ||
-        request.device_access_table.addresses.device != DeviceKind::kNpu ||
-        request.device_access_table.valid.device != DeviceKind::kNpu) {
-      return Status::InvalidArgument(
-          "NPU BatchGet requires matching caller-provided device AccessTable buffers");
-    }
-    if (table != nullptr &&
-        (!table->has_uniform_valid_length ||
-         (table->has_valid_entries &&
-          table->uniform_valid_length != address_table_entry_bytes))) {
-      return Status::InvalidArgument(
-          "NPU BatchGet AccessTable entries do not match the configured layout");
-    }
-  } else {
-    if (table == nullptr) {
-      return Status::InvalidArgument("CPU BatchGet requires an AccessTable handle");
-    }
-    if (!request.device_access_table.empty()) {
-      return Status::InvalidArgument(
-          "CPU BatchGet must not provide device AccessTable buffers");
+    if (request.indices.device == DeviceKind::kNpu) {
+      if (request.tokens_per_block == 0 ||
+          request.output_block_bytes >
+              std::numeric_limits<std::uint64_t>::max() /
+                  request.tokens_per_block) {
+        return Status::InvalidArgument(
+            "NPU BatchGet requires a valid tokens_per_block layout");
+      }
+      const std::uint64_t address_table_entry_bytes =
+          request.tokens_per_block * request.output_block_bytes;
+      if (request.device_access_table.empty() ||
+          request.device_access_table.addresses.data == nullptr ||
+          request.device_access_table.valid.data == nullptr ||
+          request.device_access_table.addresses.bytes == 0 ||
+          request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
+          request.device_access_table.valid.bytes !=
+              request.device_access_table.addresses.bytes / sizeof(Address) ||
+          request.device_access_table.addresses.device != DeviceKind::kNpu ||
+          request.device_access_table.valid.device != DeviceKind::kNpu) {
+        return Status::InvalidArgument(
+            "NPU BatchGet requires matching caller-provided device AccessTable buffers");
+      }
+      if (table != nullptr &&
+          (!table->has_uniform_valid_length ||
+           (table->has_valid_entries &&
+            table->uniform_valid_length != address_table_entry_bytes))) {
+        return Status::InvalidArgument(
+            "NPU BatchGet AccessTable entries do not match the configured layout");
+      }
+    } else {
+      if (table == nullptr) {
+        return Status::InvalidArgument("CPU BatchGet requires an AccessTable handle");
+      }
+      if (!request.device_access_table.empty()) {
+        return Status::InvalidArgument(
+            "CPU BatchGet must not provide device AccessTable buffers");
+      }
     }
   }
 
