@@ -72,7 +72,7 @@ cd /path/to/kvaf
 统一构建默认使用 `RelWithDebInfo`，可通过 `--build-type` 覆盖。
 
 CPU Gather 默认线程总预算为 12，等待模式为 `active`，内部绑核默认为 `on`。
-`--gather-threads` 和 `--gather-mode` 适用于 Gather Read 和 AIV Gather→Push。
+`--gather-threads N` 和 `--gather-mode adaptive|active|passive` 适用于 Gather Read 和 AIV Gather→Push。
 `--gather-affinity on|off` 控制这两条 AIV 路径的内部绑核。AICPU Gather Read 的 CPU 线程
 遵循进程亲和性。纯 SGL Push 的执行路径不读取这三个 Gather 参数。
 
