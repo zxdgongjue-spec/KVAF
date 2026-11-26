@@ -26,12 +26,16 @@ target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
 target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
 add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
 
+set(get_dir ${PROJECT_SOURCE_DIR}/access_operator/algorithms/get)
+set(sequential_aiv_includes ${get_dir}/common/aiv/include ${get_dir}/common/aiv/kernel
+  ${get_dir}/gather/urma_aiv/include ${get_dir}/scatter/urma_aiv/include)
 add_executable(kvaf_sequential_batch_get_kernel_model_test
   sequential_batch_get_kernel_model_test.cc
   ${PROJECT_SOURCE_DIR}/runtime/cpu_service/gather/cpu_gather_executor.cc
-  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_push_gather_executor.cc)
+  ${PROJECT_SOURCE_DIR}/runtime/cpu_service/push/cpu_push_gather_executor.cc)
 target_include_directories(kvaf_sequential_batch_get_kernel_model_test PRIVATE
-  aiv_model ${PROJECT_SOURCE_DIR}/access_operator/algorithms/get/direct/urma_aiv/include
+  aiv_model ${get_dir}/direct/urma_aiv/include ${sequential_aiv_includes}
+  ${PROJECT_SOURCE_DIR}/runtime/cpu_service/push
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
 target_compile_options(kvaf_sequential_batch_get_kernel_model_test PRIVATE
   $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
@@ -51,21 +55,24 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_kernel_build.py"
             "${CMAKE_COMMAND}")
   set(sequential_host_dir ${PROJECT_SOURCE_DIR}/access_operator/algorithms/get/direct/urma_aiv)
-  set(sequential_host_includes fake_acl ${sequential_host_dir}/include
+  set(sequential_host_includes fake_acl ${sequential_host_dir}/include ${sequential_aiv_includes}
+    ${get_dir}/common/aiv/host ${PROJECT_SOURCE_DIR}/access_operator/providers/urma_aiv
     ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/runtime/include
     ${PROJECT_SOURCE_DIR}/common/include)
   add_executable(kvaf_sequential_loader_test sequential_batch_get_loader_test.cc
     ${sequential_host_dir}/host/execute_batch_get_loader.cpp
-    ${sequential_host_dir}/host/execute_scatter_batch_get_loader.cpp
-    ${sequential_host_dir}/host/execute_gather_batch_get_loader.cpp)
+    ${get_dir}/scatter/urma_aiv/host/execute_scatter_batch_get_loader.cpp
+    ${get_dir}/gather/urma_aiv/host/execute_gather_batch_get_loader.cpp)
   target_include_directories(kvaf_sequential_loader_test PRIVATE ${sequential_host_includes})
   foreach(scenario compat legacy explicit custom relative missing wrong_symbol)
     add_test(NAME kvaf_sequential_loader_${scenario} COMMAND kvaf_sequential_loader_test ${scenario})
   endforeach()
   add_executable(kvaf_sequential_host_test sequential_batch_get_host_test.cc
-    ${sequential_host_dir}/host/sequential_batch_get.cpp
-    ${sequential_host_dir}/host/scatter_batch_get.cpp
-    ${sequential_host_dir}/host/gather_batch_get.cpp)
+    ${PROJECT_SOURCE_DIR}/access_operator/providers/urma_aiv/sequential_batch_get.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/providers/urma_aiv/scatter_resources.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/providers/urma_aiv/gather_resources.cc
+    ${get_dir}/scatter/urma_aiv/host/scatter_batch_get.cpp
+    ${get_dir}/gather/urma_aiv/host/gather_batch_get.cpp)
   target_include_directories(kvaf_sequential_host_test PRIVATE ${sequential_host_includes})
   target_compile_options(kvaf_sequential_host_test PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
   add_test(NAME kvaf_sequential_host_test COMMAND kvaf_sequential_host_test)

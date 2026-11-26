@@ -559,14 +559,15 @@ def main(argv=None) -> int:
     device = f"npu:{device_id}"
     block_bytes = TOKEN_BYTES * TOKENS_PER_BLOCK
     payload_bytes = REQUEST_COUNT * TOKEN_BYTES
+    put = kvaf.PutExecutionConfig("urma", "aiv")
+    get = kvaf.GetExecutionConfig("urma", "aiv", "gather")
     runtime = kvaf.NpuRuntime(
-        kernel, TOKEN_BYTES, TOKENS_PER_BLOCK,
-        device_id=device_id, npu_core_count=cores,
-        batch_put_kernel_object_path=put_kernel,
+        TOKEN_BYTES, TOKENS_PER_BLOCK, device_id=device_id, default_put=put, default_get=get,
         npu_eids=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
-        aiv_batch_get_mode="gather_read", aiv_gather_sgl_size=GATHER_SGL_SIZE,
-        batch_get_max_inflight_total=0,
-        trusted_gather_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1",
+        put_resources=[(put, kvaf.ExecutionResources(cores=cores, jettys=2, kernel_path=put_kernel))],
+        get_resources=[(get, kvaf.ExecutionResources(
+            cores=cores, kernel_path=kernel, gather_sgl_size=GATHER_SGL_SIZE,
+            trusted_get_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1"))],
     )
     metadata = csv_metadata(cores, device_id, kernel, put_kernel, args.acl_graph, profile_samples)
     layout = metadata["output_layout"]

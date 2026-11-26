@@ -353,18 +353,21 @@ def run_case(args):
     os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
     os.environ["KVAF_SCATTER_JETTY_CURSORS"] = str(args.jetty_cursors)
     os.environ["KVAF_SCATTER_OVERLAP_HEAD_CQ"] = str(args.overlap_head_cq)
-    if args.jettys_per_core is not None:
-        os.environ["KVAF_SCATTER_JETTYS_PER_CORE"] = str(args.jettys_per_core)
     os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
     cpu_gather = os.environ.get("KVAF_SCATTER_CPU_GATHER", "0") == "1"
     cpu_transfer = "CPU_GATHER_CONTIGUOUS_WRITE" if cpu_gather else "CPU_SGL_WRITE"
     graph_mode = args.acl_graph
     calls = graph_call_count(args)
-    runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
-        device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=2,
-        batch_put_kernel_object_path=str(put_kernel), npu_eids=args.npu_eids,
+    put = kvaf.PutExecutionConfig("urma", "aiv")
+    get = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
+    runtime = kvaf.NpuRuntime(
+        args.token_bytes, args.tokens_per_block, device_id=device_id,
+        default_put=put, default_get=get, npu_eids=args.npu_eids,
         peer_ub_device=args.peer_ub_device,
-        aiv_batch_get_mode="cpu_push_scatter")
+        put_resources=[(put, kvaf.ExecutionResources(cores=args.aiv_cores, jettys=2, kernel_path=str(put_kernel)))],
+        get_resources=[(get, kvaf.ExecutionResources(cores=args.aiv_cores, kernel_path=str(kernel),
+                                                    jettys=args.jettys_per_core or 0, trusted_get_inputs=True))],
+    )
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "worker"}
     cpu_jettys = scatter_payload_jettys(args)

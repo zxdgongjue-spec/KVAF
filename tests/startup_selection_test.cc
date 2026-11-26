@@ -1,4 +1,4 @@
-#include "startup_selection.h"
+#include "diagnostics/startup_selection.h"
 
 #include <cstdlib>
 #include <iostream>

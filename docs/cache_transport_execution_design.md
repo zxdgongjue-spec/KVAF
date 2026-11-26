@@ -10,11 +10,11 @@
 
 | 模式 | 初始化时的 DDR 分配 | 已接入的 Put | 已接入的 Get |
 |---|---|---|---|
-| `urma` | 普通 DDR | URMA AIV、URMA AICPU | URMA AIV Direct、AICPU Gather、AICPU Scatter |
+| `urma` | 普通 DDR | URMA AIV、URMA AICPU | URMA AIV Direct、AICPU Gather、AICPU Scatter。AIV Gather/Scatter 已接入，待真机验收 |
 | `ubmem` | UBMEM DDR | UBMEM AIV | UBMEM AIV Direct |
-| `urma+ubmem` | UBMEM DDR，一次分配 | 上述三种 | 上述四种 |
+| `urma+ubmem` | UBMEM DDR，一次分配 | 上述三种 | 两种模式的 Get 并集，新增组合按验证指南验收 |
 
-当前共有 **3 种 Put × 4 种 Get，即 12 对普通访问组合**。URMA AIV Gather/Scatter 仍只预留配置，首次请求时返回 provider 不可用；原设计的 6 种 Get、18 对组合属于后续目标。`Ubmem + Aicpu`、`Ubmem + Gather/Scatter`、`Urma + Aicpu + Direct` 不属于支持集合。
+执行配置可选 3 种 Put 和 6 种 Get，AIV Gather/Scatter 的 Put/Get 配对及恢复按验证指南单独验收。`Ubmem + Aicpu`、`Ubmem + Gather/Scatter`、`Urma + Aicpu + Direct` 不属于支持集合。
 
 | 阶段 | 当前职责 |
 |---|---|
@@ -54,6 +54,8 @@ struct GetExecutionConfig {
 | Put | URMA AICPU | AICPU WRITE，HBM → DDR |
 | Put | UBMEM AIV | AIV 向映射 DDR 搬运 |
 | Get | URMA AIV Direct | AIV READ，DDR → output |
+| Get | URMA AIV Gather | CPU 聚合到 DDR staging，AIV READ 到 output |
+| Get | URMA AIV Scatter | CPU SGL 或连续 WRITE 到 HBM staging，AIV scatter 到 output |
 | Get | URMA AICPU Gather | CPU 聚合到 DDR staging，AICPU READ 到 output |
 | Get | URMA AICPU Scatter | CPU SGL WRITE 到 HBM staging，AICPU scatter 到 output |
 | Get | UBMEM AIV Direct | AIV 从映射 DDR 搬运到 output |
@@ -68,9 +70,9 @@ struct GetExecutionConfig {
 | Ubmem | UBMEM AIV | UBMEM AIV Direct |
 | UrmaAndUbmem | URMA AIV | URMA AIV Direct |
 
-上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。URMA AIV Get 在本机默认 2 核、每核 2 个 Jetty，在远端 A+K 默认 4 核、每核 1 个 Jetty，在途上限为 2048。URMA AIV Put 默认 2 核、每核 2 个 Jetty。UBMEM AIV Put/Get 默认 16 核，AICPU Put 默认 1 个 worker，AICPU Gather/Scatter Get 默认 5 个。资源项可以逐配置覆盖。
+上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 在 AIV Get 构建中注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。URMA AIV Direct Get 在本机默认 2 核、每核 2 个 Jetty，在远端 A+K 默认 4 核、每核 1 个 Jetty，在途上限为 2048。AIV Gather 每核使用一个控制 Jetty 和一个数据 Jetty，Scatter 默认使用 4 条共享 payload Jetty。URMA AIV Put 默认 2 核、每核 2 个 Jetty。UBMEM AIV Put/Get 默认 16 核，AICPU Put 默认 1 个 worker，AICPU Gather/Scatter Get 默认 5 个。资源项可以逐配置覆盖。
 
-AIV/UBMEM 的空 `kernel_path` 使用构建时记录的绝对路径：Get 为 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为 `<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。标准 `./build.sh npu` 使用 `build-npu`，自定义 `--build-dir` 自动生效，不依赖应用当前目录。非空路径严格覆盖默认值；默认或显式文件均在首次准备时检查，缺失时返回错误。移动构建产物后需显式覆盖路径或重新构建。AICPU 保持首次使用时从 CANN 安装目录解析包。
+AIV/UBMEM 的空 `kernel_path` 使用构建时记录的绝对路径：Direct Get 为 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，AIV Gather/Scatter 分别为同目录的 `kvaf_gather_batch_get_kernels.o` 和 `kvaf_scatter_batch_get_kernels.o`，Put 为 `<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。标准 `./build.sh npu` 使用 `build-npu`，自定义 `--build-dir` 自动生效，不依赖应用当前目录。非空路径严格覆盖默认值；默认或显式文件均在首次准备时检查，缺失时返回错误。移动构建产物后需显式覆盖路径或重新构建。AICPU 保持首次使用时从 CANN 安装目录解析包。
 
 C++ 以 `NpuRuntimeOptions(token_bytes, tokens_per_block)` 描述布局；Python 以 `NpuRuntime(batch_get_token_bytes, batch_get_tokens_per_block, *, ...)` 构造，设备、transport 模式、默认配置和资源预算使用关键字参数。旧 `aicpu_batch_get_mode`、`per_call_execution` 及全局核数/队列/kernel 配置不再接受。`default_put/default_get` 只决定省略本次配置时选哪个算法，不启用资源，也不限制其他已构建算法的调用。
 
@@ -345,9 +347,11 @@ runtime.batch_get(
 
 ## 11 Graph、关闭与 Pull 边界
 
-### 11.1 四种 Get 的 graph 契约
+### 11.1 Get 的 graph 契约
 
-四种已接入 Get 均可通过 Python `runtime.graph_resources()` 管理图依赖：URMA AIV Direct、UBMEM AIV Direct、URMA AICPU Gather、URMA AICPU Scatter。一个资源对象对应一张外部模型图；内部仍为每次 Get 分配独立节点租约，无需用户提供节点清单。底层显式 `begin_get_graph/end_get_graph` 保留。
+四种已接入 Get 均可通过 Python `runtime.graph_resources()` 管理图依赖：URMA AIV Direct、UBMEM AIV Direct、URMA AICPU Gather、URMA AICPU Scatter。一个资源对象对应一张外部模型图；内部仍为每次 Get 分配独立节点租约，无需用户提供节点清单。底层显式 `begin_get_graph/end_get_graph` 保留。新增 AIV Gather 的单节点图和 AIV Scatter 的同图多节点通过同一租约接口准备。
+两者在图租约有效期内独占相应 provider 的驻留工作区。Gather 图禁止 kernel profiling 与探针。
+这些约束及失败恢复验收范围见实现与验证文档。
 
 ```text
 resources.prepare(stream)
@@ -365,8 +369,8 @@ resources.capture(stream) + 外部 torch/ACL capture
 - 只收集 `prepare` scope 中的一次目标 forward；其他预热无需放入该 scope。真实执行，不是只记录调用；相同输出出现两次也产生两个独立节点。未在预热中出现的分支不能在捕获中补注册。miss_count 的值不属于准备契约，可在原存储中更新。
 - 单张图的准备、捕获、回放、结束使用固定 stream；不同图允许不同 stream。调用方负责共享队列/工作区不会重叠执行，必要时自行同步或建立依赖；KVAF 不包装 replay、不自动插入跨 stream event、不检测任意外部图的在途状态。
 - 捕获前完成模块、注册、workspace 与 slot 准备；捕获/回放不触发首次建链、动态设备注册/分配或 Host Drain。捕获调用须异步且不携带逐调用 Host profile。AICPU 用设备 ticket 推进通信序号。
-- 图存活时允许串行普通 Get、Drain 和输出绑定；普通调用使用自己的状态，不能覆盖节点完成报告。图引用固定该实例的已准备容量及资源地址；会破坏这些依赖的扩容、恢复、profiling 切换应拒绝，其他实例不因存在无关图而被全局阻止。Runtime 关闭仍须先结束全部图。
-- URMA AIV Direct/Gather 的图与普通 Get 在同一通信上下文中复用匹配范围的输出注册，分别持有引用，最后一个引用释放才注销。UBMEM/Scatter 不因此增加输出 MR。这个共享不扩展到不同算法的不同通信上下文。
+- 原有四种 Get 在图存活期间仍允许串行普通 Get 和 Drain，并继续遵循各 provider 的输出绑定约束。普通调用使用自己的状态，图节点完成报告独立保留。图引用固定该实例的已准备容量及资源地址；会破坏这些依赖的扩容、恢复、profiling 切换应拒绝，其他实例不因存在无关图而被全局阻止。Runtime 关闭仍须先结束全部图。
+- URMA AIV Direct 的图与普通 Get 可以在同一通信上下文复用匹配范围的输出注册，并分别持有引用。AIV Gather 的图节点持有其输出注册，失败时由 owner 保留至 DMA 安全停止。UBMEM 和 Scatter 继续使用各自的内存访问方式。
 - caller 保持图使用的表、输入输出和 stream 有效，不得 resize/替换存储。Python 保留 Tensor 和 storage，RuntimeCore 保留节点的 AccessTable 引用；引用保活不等于允许原地改变 allocation。捕获异常也必须先退出捕获并销毁外部图，再显式 close/discard；不能依靠析构推断外部 replay 已停止。
 - 图内可按各次配置使用不同 Get 算法；Put 不进入图。同方向并发回放仍不受支持，代码支持范围与真机验收结果分开记录。
 
@@ -403,7 +407,8 @@ CPU Pull / NPU Pull 已接入。CPU Pull 写同一 DDR，使用独立源注册�
 | AICPU 公共包、Gather 工作区延后；按构建支持替代 enabled 集合 | `e35a14d` 已实现 | 初始化与首次使用边界见第 1、2 节 |
 | 统一 Dispatcher 路径、移除 legacy/旧构造参数及启动探测 | `ed61a31` 已实现；本地检查通过，本轮真机与性能待验收 | 旧版本性能基线须使用对应提交的构建及脚本 |
 | NPU/AICPU 跨算法 context、HBM 注册与远端导入共享 | 尚未实现完整公共模型 | §14 的身份、所有权及协议扩展仍是后续设计 |
-| AIV Gather/Scatter；Put graph；同方向并发执行 | 不在当前能力集合 | 需要独立实现和验收，不由资源共享/驻留自动获得 |
+| AIV Gather/Scatter | 代码已接入统一框架，待真机验收 | 独立 owner 和调用状态，现有固定 workspace 及图租约约束见实现文档 |
+| Put graph；同方向并发执行 | 不在当前能力集合 | 需要独立实现和验收 |
 
 生产目录已由 `904d12d` 按 algorithms、providers、transports 及 Runtime 职责重组，库名、kernel 符号和 `build-npu/bin` 产物路径保持原约定。调度器及资源管理器位于 `runtime/execution/`；`runtime/src/runtime.cc` 仍在原处。
 

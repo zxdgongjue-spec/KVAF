@@ -281,7 +281,8 @@ entry，`offsets[i]` 给出 entry 内
 ## A5 / CANN BatchGet 性能测试
 
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 构建 AIV kernel/host 库、
-`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。统一构建命令包含四种 Get 后端：
+`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。统一构建包含 AIV Gather 和 Scatter。
+以下使用原有 Get 的统一性能入口测 URMA AIV Direct。
 
 ```bash
 ./build.sh npu
@@ -295,6 +296,7 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 CPU service 须预先启动。替换 `--backend` 及对应的 `--aiv-cores` / `--aicpu-workers` 可测 UBMEM、Gather、Scatter，
 具体参数及计时范围见[统一 Get 性能测试](../docs/batch_get_performance.md)。
+AIV Gather/Scatter 的独立测试入口和能力边界见 [AIV 路径说明](../docs/aiv_batch_get_stage1.md)。
 普通 Get 的数据预检和输出校验随性能入口执行，位于性能计时外；Pull 功能和
 Host 故障注入验证见 [诊断入口](../tests/diagnostics/README.md)。
 默认关闭 kernel profiling；上例显式使用 `--kernel-profile` 开启设备打点与报告读取，

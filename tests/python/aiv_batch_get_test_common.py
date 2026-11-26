@@ -97,15 +97,16 @@ def run(mode: str) -> int:
     counts += list(reversed(counts))
     if gather_probe:
         counts = [capacity]
+    put = kvaf.PutExecutionConfig("urma", "aiv")
+    is_gather = mode == "gather_read"
+    get = kvaf.GetExecutionConfig("urma", "aiv", "gather" if is_gather else "scatter")
     runtime = kvaf.NpuRuntime(
-        kernel, token, tokens_per_block, device_id=device_id,
-        npu_core_count=cores, batch_put_kernel_object_path=put_kernel,
+        token, tokens_per_block, device_id=device_id, default_put=put, default_get=get,
         npu_eids=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
-        aiv_batch_get_mode=mode,
-        aiv_gather_sgl_size=(int(os.environ.get("KVAF_AIV_GATHER_SGL_SIZE", "6"))
-                             if mode == "gather_read" else 6),
-        # This direct_read-only setting must not throttle sequential modes.
-        batch_get_max_inflight_total=1,
+        put_resources=[(put, kvaf.ExecutionResources(cores=cores, jettys=2, kernel_path=put_kernel))],
+        get_resources=[(get, kvaf.ExecutionResources(
+            cores=cores, kernel_path=kernel, trusted_get_inputs=True,
+            gather_sgl_size=int(os.environ.get("KVAF_AIV_GATHER_SGL_SIZE", "6")) if is_gather else None))],
     )
     runtime.link_to(endpoint)
     retained = []

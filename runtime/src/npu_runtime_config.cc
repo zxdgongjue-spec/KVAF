@@ -38,6 +38,8 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
     resources.scatter_hbm_bytes = configured->scatter_hbm_bytes;
     resources.gather_read_wave_wrs = configured->gather_read_wave_wrs;
     resources.gather_address_groups_per_post = configured->gather_address_groups_per_post;
+    resources.gather_sgl_size = configured->gather_sgl_size;
+    resources.trusted_get_inputs = configured->trusted_get_inputs;
     if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
   }
   return resources;
@@ -54,7 +56,8 @@ Status SelectProviderEids(Transport transport, Executor executor, bool get,
   }
   if (candidates.empty()) return Status::NotInitialized("URMA local EIDs are not initialized");
   if (get && executor == Executor::Aiv && explicit_eids) {
-    const auto workers = static_cast<std::uint64_t>(resources.cores) * resources.jettys;
+    const auto workers = static_cast<std::uint64_t>(resources.cores) *
+        (resources.jettys ? resources.jettys : 1U);
     if (candidates.size() > workers)
       return Status::InvalidArgument("npu_eids count exceeds selected AIV Get cores * jettys workers");
     *selected = candidates;

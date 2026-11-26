@@ -26,13 +26,9 @@ BatchGet 路径，复用参考分支的 CPU 服务、数据布局和控制协议
 
 ## 2. 接口和数据语义
 
-`NpuRuntime` 已增加初始化选项：
-
-```python
-aiv_batch_get_mode="direct_read"       # 当前 AIV 路径，保持默认行为
-aiv_batch_get_mode="cpu_push_scatter"  # CPU 回推，AIV 本地 scatter
-aiv_batch_get_mode="gather_read"       # CPU gather，AIV READ 到输出
-```
+`NpuRuntime` 的 `default_get` 或单次调用的 `execution` 接收
+`GetExecutionConfig("urma", "aiv", algorithm)`。算法可选 `direct`、`scatter` 和 `gather`，
+资源由 `get_resources` 按配置独立提供。
 
 保留现有 DeviceAccessTable 和 addresses/valid 两种 Tensor 重载。三种模式采用
 相同的有效前缀和输出映射：

@@ -3,6 +3,9 @@
 #include "sequential_batch_get_abi.h"
 
 namespace kvaf::sequential_detail {
+inline Status Error(const char* what) {
+  return Status::Internal(std::string("AIV sequential BatchGet: ") + what);
+}
 inline uint64_t Ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
 inline void FillInput(const BatchGetRequest& r, const AccessOperatorConfig& config,
                       KvafExecuteBatchGetKernelArgs* a) {

@@ -3,10 +3,10 @@
 #include <utility>
 
 namespace kvaf {
-std::unique_ptr<SequentialBatchGet> CreateSequentialBatchGet(AccessOperatorConfig config) {
-  if (config.aiv_batch_get_mode == "cpu_push_scatter")
+std::unique_ptr<SequentialBatchGet> CreateSequentialBatchGet(GetAlgorithm algorithm, AccessOperatorConfig config) {
+  if (algorithm == GetAlgorithm::Scatter)
     return CreateScatterBatchGet(std::move(config));
-  if (config.aiv_batch_get_mode == "gather_read")
+  if (algorithm == GetAlgorithm::Gather)
     return CreateGatherBatchGet(std::move(config));
   return nullptr;
 }

@@ -7,10 +7,10 @@ KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备�
 当前支持 AIV URMA、AIV UBmem、AICPU Put/Gather 和 AICPU Put/Scatter。
 CPU 端使用同一个服务程序，NPU 端默认构建一份包含全部后端的 Python 包，
 通过 `NpuRuntime` 配置默认实现和各 provider 预算；每次调用可通过 `execution` 选择算法，
-每种 Get 的资源和执行状态首次准备后驻留复用。四种 Get 均可在同一 stream 上保留多张图，
-每张图可通过多个节点租约捕获多个 Get。
+每种 Get 的资源和执行状态首次准备后驻留复用。URMA AIV Gather 和 Scatter 已接入同一套
+Dispatcher 及资源管理框架，当前版本的真机验收待完成，两条路径有各自的图租约边界。
 
-实现边界、四种 Get 图模式与部署步骤见 [实现与使用](docs/cache_transport_execution_implementation.md)，
+实现边界、Get 图模式与部署步骤见 [实现与使用](docs/cache_transport_execution_implementation.md)，
 性能入口与验证范围见 [验证指南](docs/cache_transport_execution_validation.md)。
 
 
@@ -64,7 +64,8 @@ kvaf/
 
 具体算法的 Host、ABI、kernel 分布见 [AccessOperator 目录](access_operator/README.md#目录)，
 Runtime 的内部划分见 [Runtime 源码目录](runtime/README.md#源码目录)。AIV Gather/Scatter
-尚未实现；CPU Pull 与 NPU Pull 已接入，控制和源注册实现位于 `runtime/src/`。
+的 CPU 侧实现位于 `runtime/cpu_service/gather/` 和 `runtime/cpu_service/push/`。
+CPU Pull 与 NPU Pull 的控制和源注册实现位于 `runtime/src/`。
 
 ```text
 调用方 / vLLM Adapter（仓外）
@@ -144,13 +145,16 @@ NPU Pull 使用独立 HBM 建链，不要求连接 CPU 服务或初始化 DDR。
 | 操作 | transport | executor | Get algorithm |
 | --- | --- | --- | --- |
 | AIV URMA Put/Get | `"urma"` | `"aiv"` | `"direct"` |
+| AIV URMA Gather Get（待真机验收） | `"urma"` | `"aiv"` | `"gather"` |
+| AIV URMA Scatter Get（待真机验收） | `"urma"` | `"aiv"` | `"scatter"` |
 | AICPU Put/Gather | `"urma"` | `"aicpu"` | `"gather"` |
 | AICPU Put/Scatter | `"urma"` | `"aicpu"` | `"scatter"` |
 | AIV UBmem Put/Get | `"ubmem"` | `"aiv"` | `"direct"` |
 
 Put 和 Get 分别使用 `PutExecutionConfig`、`GetExecutionConfig`，可独立选择。
 未指定默认配置时选择当前构建可用的实现；显式指定的未构建 provider 在首次使用时报错，
-不自动替换算法。AIV Gather/Scatter 尚未实现；没有 enable 列表或第二条 legacy 执行路径。
+不自动替换算法。AIV Gather/Scatter 也通过 `default_get` 或单次 `execution` 选择，
+分别使用与配置配对的 `get_resources`。
 
 ## 环境要求
 

@@ -25,7 +25,8 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
                        std::optional<std::uint32_t> inflight, std::string kernel,
                        std::uint32_t cpu_threads, std::uint64_t gather_ddr,
                        std::uint64_t scatter_hbm, std::optional<std::uint32_t> gather_wave,
-                       std::optional<std::uint32_t> address_groups) {
+                       std::optional<std::uint32_t> address_groups,
+                       std::optional<std::uint32_t> gather_sgl, bool trusted_get_inputs) {
              ExecutionResources r;
              r.cores = cores;
              r.jettys = jettys;
@@ -37,6 +38,8 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
              r.scatter_hbm_bytes = scatter_hbm;
              r.gather_read_wave_wrs = gather_wave;
              r.gather_address_groups_per_post = address_groups;
+             r.gather_sgl_size = gather_sgl;
+             r.trusted_get_inputs = trusted_get_inputs;
              return r;
            }),
            py::kw_only(), py::arg("cores") = 0, py::arg("jettys") = 0,
@@ -44,7 +47,10 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
            py::arg("kernel_path") = "", py::arg("cpu_threads") = 0,
            py::arg("gather_ddr_bytes") = 0, py::arg("scatter_hbm_bytes") = 0,
            py::arg("gather_read_wave_wrs") = py::none(),
-           py::arg("gather_address_groups_per_post") = py::none())
+           py::arg("gather_address_groups_per_post") = py::none(),
+           py::arg("gather_sgl_size") = py::none(), py::arg("trusted_get_inputs") = false)
+      .def_readonly("gather_sgl_size", &ExecutionResources::gather_sgl_size)
+      .def_readonly("trusted_get_inputs", &ExecutionResources::trusted_get_inputs)
       .def_readonly("gather_read_wave_wrs", &ExecutionResources::gather_read_wave_wrs)
       .def_readonly("gather_address_groups_per_post", &ExecutionResources::gather_address_groups_per_post)
       .def_readonly("gather_ddr_bytes", &ExecutionResources::gather_ddr_bytes)

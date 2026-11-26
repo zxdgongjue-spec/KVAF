@@ -21,9 +21,10 @@ access_operator/
         urma_aiv/         # URMA Direct Host、ABI、AIV kernel
         ubmem_aiv/        # UBMEM Direct AIV kernel
         common/           # 两种 Direct kernel 的组合编译单元
-      gather/urma_aicpu/   # CPU Gather + AICPU READ
-      scatter/urma_aicpu/  # CPU Push + AICPU Scatter
-      common/aicpu/       # Gather/Scatter 共享 ABI、loader、设备入口和测试
+      gather/            # urma_aiv/、urma_aicpu/ 的 Gather Host、ABI 和 kernel
+      scatter/           # urma_aiv/、urma_aicpu/ 的 Scatter Host、ABI 和 kernel
+      common/aiv/        # AIV Gather/Scatter 共用的状态 ABI 和设备辅助函数
+      common/aicpu/      # AICPU 共用 ABI、loader、设备入口和测试
     put/
       urma_aiv/           # URMA AIV Put
       urma_aicpu/         # URMA AICPU Put
@@ -55,12 +56,12 @@ CMake target、库名和导出符号保持不变。AIV 产物仍在 `build-npu/b
 AICPU 构建包位于 `build-npu/access_operator/transports/aicpu_urma/`，统一构建与
 安装脚本已使用该路径。验证入口仍在仓库根目录的 `tests/run_*.sh`。
 
-后续 AIV Gather/Scatter 可分别接入 `algorithms/get/gather/urma_aiv/` 和
-`algorithms/get/scatter/urma_aiv/`，当前尚未创建这些目录。CPU Pull 已接入，executor、
-源注册和 CPU READ 服务位于 `runtime/src/`，不作为普通 Get provider，也不经过
-普通 Put/Get 的 `execution` 选择。NPU raw READ kernel 位于 `algorithms/get/raw_addr/urma_aiv/`。
+AIV Gather/Scatter 的 provider 工厂位于 `providers/urma_aiv/`。两者各自把通信资源 owner
+交给框架，分别在 Invocation 中绑定 eager 和图节点状态。CPU 侧按 `runtime/cpu_service/gather/`
+和 `runtime/cpu_service/push/` 组织。独立 Pull 仍使用 `runtime/src/` 的控制和注册路径，
+NPU raw READ kernel 位于 `algorithms/get/raw_addr/urma_aiv/`。
 
-四种 Get 的显式图租约、常驻实例和资源边界见
+Get 的显式图租约、常驻实例和资源边界见
 [实现与使用](../docs/cache_transport_execution_implementation.md)，运行方式见
 [功能与性能验证](../docs/cache_transport_execution_validation.md)。Put 保持同步调用。
 

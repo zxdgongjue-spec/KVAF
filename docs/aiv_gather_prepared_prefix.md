@@ -18,7 +18,7 @@ HBM workspace 只存清单和每 lane 64 B scratch；UB 存清单/WQE，不存 p
 
 | 阶段 | 保留的优化及约束 |
 | --- | --- |
-| Python | 默认 `trusted_gather_inputs=True`；复用 method/vectorcall 和 current_stream callable。每次重读七个 data_ptr、容量和当前 stream，不缓存跨调用的 Tensor 指针或 stream。 |
+| Python | `ExecutionResources(trusted_get_inputs=True)` 启用受信路径；复用 method/vectorcall 和 current_stream callable。每次重读七个 data_ptr、容量和当前 stream，不缓存跨调用的 Tensor 指针或 stream。 |
 | Runtime/Host | trusted 请求快速分发；同 stream 普通异步调用连续排队，不逐次 Drain 或 D2H status；切流、显式 Drain、BatchPut 前和 shutdown 仍 fence。output MR/entity 缓存保留到 transport shutdown。 |
 | 初始化与输入 | workspace/queues 使用 `HUGE_FIRST` 并允许普通页回退；不逐次 Host 清零 status/profile。Scalar 只刷新请求数，SIMT 输入不做全量 Scalar Flush；大 token 回退只刷新有效 lane 的 output_indices。 |
 | descriptor | 128 个 SIMT 线程生成清单，两个 24 KiB UB bank 交替；每段 MTE3 完成后立即 WRITE 下发，与后续构造/搬运重叠，无逐行 Scalar 写出/Flush。 |
@@ -28,8 +28,8 @@ HBM workspace 只存清单和每 lane 64 B scratch；UB 存清单/WQE，不存 p
 | 进度与提前准备 | ready 查询与 WQE 工作重叠；可提前准备两个 UB bank，按完整 WR 就绪范围部分提交；跨 chunk 保留 bank 和在途 READ。最终 ACK 查询与最后数据 READ 重叠。 |
 | 诊断 | 保留 CPU/Host/AIV profile、CSV 和 ack/wqe/sq/first_read 探针；profile 关闭时不读诊断计时器。 |
 
-trusted 调用方保证 Tensor 连续、设备/类型/容量正确及存活到 stream 完成；仅支持 eager。
-`trusted_gather_inputs=False` 保留完整检查；C++ 通过
+受信输入的调用方保证 Tensor 连续、设备/类型/容量正确及存活到 stream 完成。
+Python 默认使用带校验的入口；C++ 通过
 `BatchGetExecutionOptions::trusted_npu_request` 选择同一合同。
 
 trusted 普通请求的每 lane 超过 1024 行时，先发布前 1024 行清单和首次 notify；

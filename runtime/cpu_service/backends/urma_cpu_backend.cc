@@ -12,7 +12,7 @@
 #include "cpu_gather_executor.h"
 #include "gather_workspace.h"
 #include "cpu_service/push/cpu_push_get_worker.h"
-#include "aiv_cpu_push_get_worker.h"
+#include "cpu_service/push/aiv_cpu_push_get_worker.h"
 #include "cpu_pull_urma.h"
 
 #include <dlfcn.h>

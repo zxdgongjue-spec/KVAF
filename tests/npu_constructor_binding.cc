@@ -2,23 +2,19 @@
 
 namespace py = pybind11;
 
-// Exercise the production pybind argument registration without CANN or a device.
+// Exercise the production pybind registration without CANN or a device.
 struct ConstructorProbe {
   py::tuple values;
-  ConstructorProbe(std::string get, std::uint32_t bytes, std::uint32_t tokens,
-                   std::uint32_t device, std::uint32_t cores, std::string put,
-                   std::uint32_t jettys, std::vector<std::string> eids, bool adaptive,
-                   std::uint32_t misses, std::string peer, std::vector<std::string> peers,
-                   std::uint32_t inflight, const std::string& transport, std::string mode,
-                   std::string aiv_mode, std::uint32_t gather_sgl_size,
-                   bool trusted_gather_inputs)
-      : values(py::make_tuple(get, bytes, tokens, device, cores, put, jettys, eids,
-                              adaptive, misses, peer, peers, inflight, transport, mode,
-                              aiv_mode, gather_sgl_size, trusted_gather_inputs)) {}
+  ConstructorProbe(py::object bytes, py::object tokens, std::uint32_t device,
+                   const std::string& transport, py::object default_put, py::object default_get,
+                   py::object put_resources, py::object get_resources,
+                   std::vector<std::string> eids, std::string peer, py::object cpu_pull, py::object npu_pull)
+      : values(py::make_tuple(bytes, tokens, device, transport, default_put, default_get,
+                              put_resources, get_resources, eids, peer, cpu_pull, npu_pull)) {}
 };
 
 PYBIND11_MODULE(_kvaf_constructor_test, module) {
   auto runtime = py::class_<ConstructorProbe>(module, "NpuRuntime");
-  kvaf::python_binding::BindLegacyNpuRuntimeConstructor(runtime);
+  kvaf::python_binding::BindNpuRuntimeConstructor(runtime);
   runtime.def_readonly("values", &ConstructorProbe::values);
 }

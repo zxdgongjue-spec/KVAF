@@ -70,6 +70,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   add_library(kvaf_default_access_operator
     providers/urma_aiv/access_operator.cc
     providers/urma_aiv/execution_resources.cc
+    providers/urma_aiv/sequential_batch_get.cc
   )
 
   target_include_directories(kvaf_default_access_operator
@@ -77,6 +78,8 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/get/direct/urma_aiv/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/get/gather/urma_aiv/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/get/scatter/urma_aiv/include
       ${ASCEND_CANN_PACKAGE_PATH}/include
   )
 

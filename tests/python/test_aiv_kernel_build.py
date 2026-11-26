@@ -49,7 +49,9 @@ def main():
     operator = repo / 'access_operator'
     with tempfile.TemporaryDirectory(prefix='kvaf kernel build-') as directory:
         root = Path(directory)
-        shutil.copytree(operator / 'algorithms/get/direct', root / 'access_operator/algorithms/get/direct')
+        for path in ('direct', 'gather/urma_aiv', 'scatter/urma_aiv', 'common/aiv'):
+            relative = Path('algorithms/get') / path
+            shutil.copytree(operator / relative, root / 'access_operator' / relative)
         shutil.copytree(repo / 'access_operator/cmake', root / 'access_operator/cmake')
         shutil.copytree(repo / 'access_operator/include/ubmem', root / 'access_operator/include/ubmem')
         shutil.copytree(repo / 'common/include', root / 'common/include')
@@ -100,7 +102,7 @@ add_subdirectory(access_operator/algorithms/get/direct/common/kernel kernel)
         assert direct.stat().st_mtime_ns == old_mtime
         gather = build / 'kernel/kvaf_gather_batch_get_kernels.o'
         gather_before = (gather.read_bytes(), gather.stat().st_mtime_ns)
-        scatter_source = root / 'access_operator/algorithms/get/direct/urma_aiv/kernel/execute_scatter_batch_get_aiv.asc'
+        scatter_source = root / 'access_operator/algorithms/get/scatter/urma_aiv/kernel/execute_scatter_batch_get_aiv.asc'
         scatter_source.write_text(scatter_source.read_text() + '\n// isolation rebuild\n')
         run([cmake, '--build', build, '--target', 'kvaf_scatter_batch_get_kernel', '-j4'])
         assert (gather.read_bytes(), gather.stat().st_mtime_ns) == gather_before

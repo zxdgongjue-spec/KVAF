@@ -29,9 +29,25 @@ NPU 主机加载实际 CANN 环境后，在仓库根目录执行：
 `npu` 默认构建全部后端和 Python binding，并安装 AICPU 包。
 使用新的 CPU 服务和 NPU 客户端进程。默认产物位于 `build-npu/python/kvaf` 与
 `build-npu/bin`。AIV Get / Put 入口分别为 V3 / V2；AICPU Control 为 V5，
-Gather / Scatter Execution 为 V5。不能混用旧 Host 或设备包。
+Gather / Scatter Execution 分别为 V5 / V6。不能混用旧 Host 或设备包。
 
-## 四种 Get 共用一个入口
+## AIV Gather 与 Scatter 的验收范围
+
+这两条路径已接入统一 Dispatcher，以下检查仍需在目标 NPU 和配套 K 端服务上执行。
+先运行 `KVAF_RUN_NPU_TESTS=1 python tests/python/test_aiv_gather_batch_get.py` 与
+`KVAF_RUN_NPU_TESTS=1 python tests/python/test_aiv_scatter_batch_get.py`，使用同一构建的
+Python binding 与 kernel。连接方式和环境变量见 [AIV 路径说明](aiv_batch_get_stage1.md)。
+
+| 检查项 | Gather | Scatter |
+|---|---|---|
+| Eager | 校验零、部分和全量有效前缀，比较 checked/trusted，覆盖 SGL 1、5、6 | 校验零、部分和全量有效前缀，分别覆盖 SGL WRITE 与 CPU 聚合 push |
+| 图 | 使用 `test_aiv_gather_batch_get_perf.py --acl-graph` 验证单节点重复回放 | 使用 Scatter 性能入口的 `--acl-graph --graph-calls 8` 验证同图多节点顺序和输出 |
+| 容量与绑定 | 校验上限 65536 条和超限拒绝，显式 output lease 返回不支持 | 校验上限 65536 条和超限拒绝，显式 output lease 返回不支持 |
+| 生命周期 | 验证首次使用或预热才建链，单图存续时拒绝同配置 eager，失败图 discard 后可重建 | 验证首次使用或预热才建链，收齐同图节点租约后重建，关闭失败保留旧 owner |
+
+原四种 Get 的统一回归仍需执行，新增路径与其他 Put 的交叉组合按实际部署覆盖。
+
+## 原有四种 Get 共用一个入口
 
 在 NPU 仓库根目录运行。跨主机时替换 CPU 地址；设备号和核数按实际环境调整。
 以下命令测四种后端、三个规模，每组包含 eager 和 graph：
@@ -97,7 +113,7 @@ Gather/Scatter 还验证只回放 B 时，未回放的 A 节点不能通过完�
 正式性能图也使用 `graph_resources().prepare/capture` 自动收集，准备及结束均在计时外。
 该检查不验收图内混合算法或跨 stream 并发回放，正式性能样本仍为单节点图。
 
-针对四种 Get 的图资源与 AICPU 节点报告隔离回归，可运行以下命令（CPU 服务地址和设备按现场替换）：
+针对原有四种 Get 的图资源与 AICPU 节点报告隔离回归，可运行以下命令（CPU 服务地址和设备按现场替换）：
 
 ```bash
 bash <<'BASH'

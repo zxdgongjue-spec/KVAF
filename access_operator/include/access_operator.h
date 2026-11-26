@@ -201,10 +201,10 @@ struct AccessOperatorConfig {
   // Ordered per-FE execution sessions for remote Direct Get. Empty uses peer_link.
   std::vector<std::shared_ptr<PeerLink>> peer_get_links;
   bool peer_local{true};
-  std::string aiv_batch_get_mode{"direct_read"};
   std::uint32_t batch_get_token_bytes{0};
   // Gather uses 1..6 local SGEs. No software inflight budget in sequential modes.
   std::uint32_t aiv_gather_sgl_size{6};
+  std::uint32_t aiv_scatter_jettys_per_core{0};
 };
 
 struct BatchGetKernelProfile {

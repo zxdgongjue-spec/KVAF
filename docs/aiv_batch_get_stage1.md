@@ -58,8 +58,9 @@ Gather 完成后提交。三个阶段可以同时处理不同分片。
 
 `--jetty-cursors 1` 让各 Jetty 的消费游标独立推进，`--overlap-head-cq 1` 让后缀清单构造
 与首段控制 WRITE 的 CQ 等待重叠。二者默认 0。
-Scatter 默认使用 4 条共享 payload Jetty；`--jettys-per-core N` 或
-`KVAF_SCATTER_JETTYS_PER_CORE=N` 将总数设为 AIV 核数乘以 N，上限 32。
+Scatter 默认使用 4 条共享 payload Jetty。用 `ExecutionResources(jettys=N)` 或性能脚本的
+`--jettys-per-core N` 将总数设为 AIV 核数乘以 N，上限 32。未显式配置资源时读取
+`KVAF_SCATTER_JETTYS_PER_CORE`。
 CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 按需增长并复用。
 `KVAF_SCATTER_CPU_GATHER=0` 时，CPU 使用源地址 SGL 直接 WRITE 到 HBM staging，
 省去 CPU staging Gather；Scatter pipeline、Jetty 游标、head CQ 重叠和 ACL 图仍可单独配置。
@@ -67,25 +68,28 @@ CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 
 
 ## 独立二进制与类型声明
 
-以下路径相对于 `access_operator/algorithms/get/direct/urma_aiv/`：
+Scatter 和 Gather 分别位于 `access_operator/algorithms/get/scatter/urma_aiv/` 与
+`access_operator/algorithms/get/gather/urma_aiv/`。下表路径相对于各自的算法目录。
 
 | 层次 | Scatter | Gather |
 | --- | --- | --- |
-| Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
+| Host 算法 | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
 | 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，256 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
 | Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV12` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
+两个 owner 分别位于 `access_operator/providers/urma_aiv/scatter_resources.cc` 和
+`access_operator/providers/urma_aiv/gather_resources.cc`。
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
 每核 192 B 区域。默认四条 payload Jetty 的 AIV Scatter mailbox 使用 V8 打开，握手响应为
 392 B；显式配置非四 Jetty 数量时使用 V9 扩展打开，响应为 2296 B。启动和停止命令使用 V8。
 V8 由 AIV 把地址清单和通知 WRITE 到 CPU DDR mailbox，CPU 从本地读取。
-AICPU Scatter 通过 V6 交换 mailbox 和回写队列信息，握手响应为 432 B。AICPU 经 UMDK
+AICPU Scatter 通过 V6 交换 mailbox 和回写队列信息，握手响应为 2336 B。AICPU 经 UMDK
 WRITE 请求头和地址清单，K 端同样从本地 mailbox 读取通知。
-两条路径分别通过 `aiv_batch_get_mode` 和 `aicpu_batch_get_mode` 选择。Gather 和公共控制命令
-使用 V6。部署 Scatter 时同步重编 CPU 服务、NPU Host 和 Scatter kernel。
+两条路径使用 `GetExecutionConfig("urma", "aiv", "scatter")` 与
+`GetExecutionConfig("urma", "aicpu", "scatter")`。Gather 和公共控制命令使用 V6。部署 Scatter 时同步重编 CPU 服务、NPU Host 和 Scatter kernel。
 
 原 `direct_read` 继续使用 `kvaf_execute_batch_get_kernels.o`。三个模块独立编译，
 避免重复链接 SDK 全局符号。顺序模式接收标准 direct/旧 sequential 路径时，
@@ -116,13 +120,12 @@ token_bytes = 656
 tokens_per_block = 128
 slot_size = token_bytes * tokens_per_block
 
+put = kvaf.PutExecutionConfig("urma", "aiv")
+get = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
 runtime = kvaf.NpuRuntime(
-    get_kernel_path,
-    batch_get_token_bytes=token_bytes,
-    batch_get_tokens_per_block=tokens_per_block,
-    batch_put_kernel_object_path=put_kernel_path,
-    npu_core_count=4,
-    aiv_batch_get_mode="cpu_push_scatter",
+    token_bytes, tokens_per_block, default_put=put, default_get=get,
+    put_resources=[(put, kvaf.ExecutionResources(cores=2, kernel_path=put_kernel_path))],
+    get_resources=[(get, kvaf.ExecutionResources(cores=4, kernel_path=get_kernel_path))],
 )
 runtime.link_to(cpu_service_address)
 runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
@@ -330,18 +333,19 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 
 ## Gather 合并接口与回归
 
-构造参数保留公共 Runtime 的位置参数契约（包括 `transport`）；`aicpu_batch_get_mode`、
-`aiv_batch_get_mode`、`aiv_gather_sgl_size` 和 `trusted_gather_inputs` 使用关键字。
-Gather SGL 范围为 1～6。`trusted_gather_inputs=True` 为默认快速路径，调用方负责正确的
-Tensor dtype、连续布局、索引、唯一输出行、生命周期和 eager stream；设为 False 使用带校验路径。
+Runtime 只接受 token 布局两个位置参数。Gather 的 SGL 和受信输入快路径配置在对应的
+`get_resources` 项中。SGL 范围为 1～6，默认 6。设置 `trusted_get_inputs=True` 时，
+调用方保证 Tensor dtype、连续布局、索引、唯一输出行、生命周期和 stream 正确。
 普通 Gather 每次重新读取 Tensor 指针和当前 stream，不缓存跨调用的存储地址。
 
 ```python
+put = kvaf.PutExecutionConfig("urma", "aiv")
+get = kvaf.GetExecutionConfig("urma", "aiv", "gather")
 runtime = kvaf.NpuRuntime(
-    get_kernel_path, 656, 128,
-    batch_put_kernel_object_path=put_kernel_path,
-    transport="urma", aiv_batch_get_mode="gather_read",
-    aiv_gather_sgl_size=6, trusted_gather_inputs=True,
+    656, 128, default_put=put, default_get=get,
+    put_resources=[(put, kvaf.ExecutionResources(cores=2, kernel_path=put_kernel_path))],
+    get_resources=[(get, kvaf.ExecutionResources(
+        cores=4, kernel_path=get_kernel_path, gather_sgl_size=6, trusted_get_inputs=True))],
 )
 ```
 

@@ -16,7 +16,7 @@
 | 能力 | 当前实现 |
 |---|---|
 | Put | URMA AIV、URMA AICPU、UBMEM AIV；同步调用及元数据事务 |
-| Get | URMA AIV Direct、UBMEM AIV Direct、URMA AICPU Gather、URMA AICPU Scatter |
+| Get | URMA AIV Direct、UBMEM AIV Direct、URMA AICPU Gather、URMA AICPU Scatter。AIV Gather/Scatter 代码已接入，待真机验收 |
 | 执行配置 | 默认配置、逐次完整配置替换、按构建支持自动可用、首次使用校验资源预算 |
 | 资源复用 | 按 Runtime / Region / 执行配置延迟建立 provider；Put/Get 执行状态按配置驻留 |
 | 输出绑定 | URMA AIV Direct、AICPU Gather 显式保留输出注册，每个 Get 实例各一个 |
@@ -27,9 +27,20 @@
 | 恢复 | 资源重建、幂等控制协议、原次 Put 完成查询及事务恢复、失败保留资源以供重试 |
 | 诊断 | Get/Put Host 分段计时、四种 Get kernel profile、AICPU 显式结果检查 |
 
-普通访问组合为 3 种 Put × 4 种 Get。AIV Gather/Scatter 仍只预留配置和 provider 接口，
-首次请求时明确报 provider 不可用；独立 CPU Pull/HBM Pull 模块按约定暂不接入。
-图内混合算法不在本轮验收范围；Put 不进入图，也不支持跨 stream 并发回放。
+新增 AIV 路径使用 `GetExecutionConfig("urma", "aiv", "gather")` 或
+`GetExecutionConfig("urma", "aiv", "scatter")`，由 `default_get` 或单次 `execution` 选择。
+`get_resources` 为 Gather 配置 `gather_sgl_size`，范围 1–6，默认 6。
+Scatter 可用 `jettys` 指定每核 payload Jetty 数，总数上限为 32。省略时读取现有环境变量，
+均未指定时沿用 4 条共享 Jetty。两条路径均可按配置显式启用 `trusted_get_inputs`。
+Put 配置和资源分别由 `default_put`、`put_resources` 决定。
+
+| 新增路径 | Eager、容量与注册 | 图与恢复 |
+|---|---|---|
+| AIV Gather | 单 EID、1–8 核、单窗口最多 65536 条请求，输出按 transport 注册，无显式 output lease | 同一实例一个图节点租约，图内禁用 kernel profiling 和探针。失败图需销毁并 discard，关闭 transport 后可通过 Dispatcher 重建 |
+| AIV Scatter | 单 EID、1–8 核、单窗口最多 65536 条请求，payload 写入 owner 的 HBM staging，无显式 output lease | 同一实例的一张图可使用多个节点租约，共用状态 slab 和设备序号。结束失败图须先停止回放、销毁并 discard，再由 Dispatcher 关闭和重建 |
+
+两条路径在图存续期间拒绝该配置的普通 Get。跨 stream 并发回放、不同图共用上述实例、
+以及新路径的真机数据正确性和性能均需单独验收。独立 CPU Pull/HBM Pull 保持各自入口。
 
 所有请求统一通过 Dispatcher 按本次配置或默认配置选择驻留实例，不会每次重新创建
 通信资源。旧构造参数与执行模式开关已移除；初始化只建立缓存与元数据，首次使用
@@ -60,9 +71,9 @@ access_operator/
                                   传输会话、动态库、注册/导入、映射
   algorithms/
     get/direct/{urma_aiv,ubmem_aiv,common}/
-    get/gather/urma_aicpu/
-    get/scatter/urma_aicpu/
-    get/common/aicpu/
+    get/gather/{urma_aiv,urma_aicpu}/
+    get/scatter/{urma_aiv,urma_aicpu}/
+    get/common/{aiv,aicpu}/
     put/{urma_aiv,urma_aicpu,ubmem_aiv,common}/
                                   算法 Host 提交、kernel、ABI 与构建入口
 ```
@@ -651,7 +662,7 @@ print("KVAF_EAGER_EXAMPLE_PASS")
 
 ## Get 图模式
 
-四种 Get 推荐通过 `runtime.graph_resources()` 自动管理一张模型图的 Get 节点。用户不需要
+原有四种 Get 推荐通过 `runtime.graph_resources()` 自动管理一张模型图的 Get 节点。用户不需要
 逐层写准备清单或向模型 forward 传入 lease；普通 `batch_get` 在准备/捕获 scope 内自动路由。
 
 ### 两个 Get 与其他算子一起捕获的完整示例

@@ -159,7 +159,8 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     target_sources(kvaf_cpu_runtime PRIVATE src/cpu_pull_urma.cc cpu_service/backends/urma_cpu_backend.cc cpu_service/urma/cpu_urma_discovery.cc
       cpu_service/urma/cpu_numa_scope.cc
       cpu_service/push/cpu_push_get_transport.cc cpu_service/push/cpu_push_get_worker.cc
-      src/aiv_cpu_push_get_transport.cc src/aiv_cpu_push_get_worker.cc src/cpu_push_gather_executor.cc)
+      cpu_service/push/aiv_cpu_push_get_transport.cc cpu_service/push/aiv_cpu_push_get_worker.cc
+      cpu_service/push/cpu_push_gather_executor.cc)
     target_link_libraries(kvaf_cpu_runtime PRIVATE Threads::Threads OpenMP::OpenMP_CXX kvaf_cpu_gather_executor)
     target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2;-g>")
     target_include_directories(kvaf_cpu_runtime PRIVATE "${KVAF_URMA_INCLUDE_DIR}")

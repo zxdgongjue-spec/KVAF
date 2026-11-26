@@ -11,11 +11,12 @@ list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_OPERATOR_INCLUDE}")
 
 add_custom_command(
   OUTPUT "${KVAF_EXECUTE_KERNEL_OBJECT}"
-  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${KVAF_EXECUTE_KERNEL_SOURCE}" -o "${KVAF_EXECUTE_KERNEL_TMP}"
+  COMMAND ${KVAF_AIV_COMPILER_COMMAND} -c -x cce -O2 "${KVAF_EXECUTE_KERNEL_SOURCE}" -o "${KVAF_EXECUTE_KERNEL_TMP}"
           ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
   COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_EXECUTE_KERNEL_TMP}"
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_URMA_SOURCE}" "${KVAF_UBMEM_SOURCE}"
+          ${KVAF_AIV_TOOLCHAIN_FILES}
           "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
           "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_schedule.h"
@@ -33,7 +34,9 @@ get_filename_component(KVAF_AIV_COMMON_INCLUDE_DIR
   "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/../common/include" ABSOLUTE)
 foreach(mode scatter gather)
   set(stem kvaf_${mode}_batch_get)
-  set(sequential_kernel_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../urma_aiv/kernel")
+  set(algorithm_dir "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/algorithms/get/${mode}/urma_aiv")
+  set(shared_dir "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/algorithms/get/common/aiv")
+  set(sequential_kernel_dir "${algorithm_dir}/kernel")
   set(source "${sequential_kernel_dir}/execute_${mode}_batch_get_aiv.asc")
   set(object "${CMAKE_CURRENT_BINARY_DIR}/${stem}_kernels.o")
   set(temporary "${CMAKE_CURRENT_BINARY_DIR}/${stem}.tmp.o")
@@ -52,17 +55,19 @@ foreach(mode scatter gather)
   endif()
   add_custom_command(
     OUTPUT "${object}" "${installed}"
-    COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${source}" -o "${temporary}"
+    COMMAND ${KVAF_AIV_COMPILER_COMMAND} -c -x cce -O2 "${source}" -o "${temporary}"
             ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
-            "-I${KVAF_AIV_COMMON_INCLUDE_DIR}"
+            "-I${KVAF_AIV_COMMON_INCLUDE_DIR}" "-I${algorithm_dir}/include"
+            "-I${shared_dir}/include" "-I${shared_dir}/kernel"
     COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${temporary}" -o "${object}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_ALGORITHM_BIN_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${object}" "${installed}"
     DEPENDS "${source}"
+            ${KVAF_AIV_TOOLCHAIN_FILES}
             "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_abi.h"
-            "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/${mode}_batch_get_abi.h"
-            "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/sequential_batch_get_abi.h"
-            "${sequential_kernel_dir}/batch_get_kernel_common.h"
+            "${algorithm_dir}/include/${mode}_batch_get_abi.h"
+            "${shared_dir}/include/sequential_batch_get_abi.h"
+            "${shared_dir}/kernel/batch_get_kernel_common.h"
             "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
             ${mode_dependencies}
     VERBATIM)

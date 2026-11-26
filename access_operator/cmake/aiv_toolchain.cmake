@@ -55,8 +55,12 @@ set(KVAF_KERNEL_INCLUDES
 )
 
 set(KVAF_AIV_COMPILE_OPTIONS
-  --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
+  --cce-aicore-arch=dav-c310-vec --cce-aicore-only
   -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
   -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
   -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all)
 set(KVAF_AIV_LINK_OPTIONS -m aicorelinux -Ttext=0 -static)
+
+set(KVAF_AIV_COMPILE_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/compile_aiv_kernel.cmake")
+set(KVAF_AIV_COMPILER_COMMAND "${CMAKE_COMMAND}" -P "${KVAF_AIV_COMPILE_SCRIPT}" -- "${KVAF_CCEC}")
+set(KVAF_AIV_TOOLCHAIN_FILES "${CMAKE_CURRENT_LIST_FILE}" "${KVAF_AIV_COMPILE_SCRIPT}")

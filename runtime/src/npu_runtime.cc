@@ -1,4 +1,5 @@
 #include "npu_runtime.h"
+#include "npu_kernel_paths.h"
 #include "npu_eid_selection.h"
 #include "execution_dispatcher.h"
 #include "session_access_operator.h"
@@ -7,7 +8,6 @@
 #endif
 #if defined(KVAF_ENABLE_NPU_PULL)
 #include "hbm_read_client.h"
-#include "npu_kernel_paths.h"
 #endif
 
 #include <acl/acl.h>
@@ -18,7 +18,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -30,7 +29,6 @@
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
 #include "ubmem/access_operator.h"
 #include "sequential_batch_get.h"
-#include "startup_bandwidth_probe.h"
 #include "ubmem/device_mapping.h"
 #endif
 #include "peer_link.h"
@@ -174,14 +172,11 @@ struct NpuRuntime::Impl {
     }
     auto budget = detail::ResolveExecutionResources(transport, executor, get, peer_candidates.local, selected);
     if (get && transport == Transport::Urma && executor == Executor::Aiv && algorithm != GetAlgorithm::Direct) {
-      if (!selected || selected->kernel_path.empty()) {
-        auto path = budget.kernel_path;
-        const auto separator = path.find_last_of("/\\");
-        const auto stem = algorithm == GetAlgorithm::Scatter ? "kvaf_scatter_batch_get_kernels.o"
-                                                            : "kvaf_gather_batch_get_kernels.o";
-        budget.kernel_path = (separator == std::string::npos ? "" : path.substr(0, separator + 1)) + stem;
-      }
-      if (!selected || !selected->max_inflight_total) budget.max_inflight_total = 0;
+      const bool scatter = algorithm == GetAlgorithm::Scatter;
+      if (!selected || selected->kernel_path.empty())
+        budget.kernel_path = scatter ? detail::kDefaultAivScatterKernelPath : detail::kDefaultAivGatherKernelPath;
+      budget.max_inflight_total = 0;
+      budget.jettys = scatter ? (selected ? selected->jettys : 0U) : 2U;
     }
     if (get && executor == Executor::Aicpu && algorithm == GetAlgorithm::Gather && !(selected && selected->jettys))
       budget.jettys = 1;
@@ -199,10 +194,19 @@ struct NpuRuntime::Impl {
     }
     if (explicit_resources) {
       const auto& r = *explicit_resources;
+      const bool sequential_aiv = get && t == Transport::Urma && e == Executor::Aiv &&
+          algorithm != GetAlgorithm::Direct;
+      if (r.gather_sgl_size && !(sequential_aiv && algorithm == GetAlgorithm::Gather))
+        throw std::invalid_argument("gather_sgl_size requires URMA AIV Gather Get");
+      if (r.trusted_get_inputs && !sequential_aiv)
+        throw std::invalid_argument("trusted_get_inputs requires URMA AIV Gather or Scatter Get");
+      if (r.jettys && sequential_aiv && algorithm == GetAlgorithm::Gather)
+        throw std::invalid_argument("AIV Gather uses one control and one data Jetty per core");
       if (r.jettys && (t != Transport::Urma || (e != Executor::Aiv && !(get && algorithm == GetAlgorithm::Gather))))
         throw std::invalid_argument("Jetty budget requires URMA AIV or AICPU Gather");
-      if (r.max_inflight_total && (!get || e != Executor::Aiv || t != Transport::Urma))
-        throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
+      if (r.max_inflight_total && (!get || e != Executor::Aiv || t != Transport::Urma ||
+                                    algorithm != GetAlgorithm::Direct))
+        throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Direct Get");
       if (r.cpu_threads && (!get || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
         throw std::invalid_argument("CPU thread budget requires AICPU Gather");
       if (!r.kernel_path.empty() && e == Executor::Aicpu)
@@ -230,13 +234,15 @@ struct NpuRuntime::Impl {
         (budget.request_capacity > 65536U &&
          !(get && IsWindowedGet({t, e, algorithm}))) || budget.cpu_threads > 64U ||
         (t == Transport::Urma && e == Executor::Aiv &&
-         (!budget.jettys || budget.jettys > (get ? 64U : 2U) ||
+         ((!budget.jettys && !(get && algorithm == GetAlgorithm::Scatter)) ||
+          budget.jettys > (get ? 64U : 2U) ||
           (get && *budget.max_inflight_total && *budget.max_inflight_total < 2U * budget.cores))))
       throw std::invalid_argument("invalid execution resource budget");
     if (get && t == Transport::Urma && e == Executor::Aiv && algorithm != GetAlgorithm::Direct &&
         (budget.cores > 8U || options.npu_eids.size() > 1 ||
          GatherStagingBytes(options.batch_get_token_bytes) > UINT32_MAX ||
-         (algorithm == GetAlgorithm::Gather && (!options.aiv_gather_sgl_size || options.aiv_gather_sgl_size > 6))))
+         (algorithm == GetAlgorithm::Gather && budget.gather_sgl_size &&
+          (!*budget.gather_sgl_size || *budget.gather_sgl_size > 6))))
       throw std::invalid_argument("invalid AIV Gather/Scatter resource budget");
     if (e != Executor::Aicpu) {
       if (budget.kernel_path.empty())
@@ -325,7 +331,7 @@ struct NpuRuntime::Impl {
     std::uint32_t physical_device;
     if (!detail::ResolvePhysicalDeviceId(options.device_id, &physical_device))
       throw std::invalid_argument("cannot resolve physical NPU from device " + std::to_string(options.device_id));
-    const auto& cpu_device = adaptive_cpu_device.empty() ? options.peer_ub_device : adaptive_cpu_device;
+    const auto& cpu_device = options.peer_ub_device;
     const bool automatic_cpu = !table.device_fixed && cpu_device.empty();
     detail::PairEids pair;
     if (table.local && (options.npu_eids.empty() || automatic_cpu))
@@ -383,10 +389,10 @@ struct NpuRuntime::Impl {
       else
         c.batch_put_kernel_object_path = budget.kernel_path;
       if (get && algorithm != GetAlgorithm::Direct) {
-        c.aiv_batch_get_mode = algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read";
-        c.aiv_gather_sgl_size = options.aiv_gather_sgl_size;
+        c.aiv_gather_sgl_size = budget.gather_sgl_size.value_or(6U);
+        if (algorithm == GetAlgorithm::Scatter) c.aiv_scatter_jettys_per_core = budget.jettys;
         c.batch_get_token_bytes = options.batch_get_token_bytes;
-        return CreateSequentialBatchGet(std::move(c));
+        return CreateSequentialBatchGet(algorithm, std::move(c));
       }
       c.enable_get = get;
       if (get) c.batch_put_kernel_object_path.clear();
@@ -428,10 +434,6 @@ struct NpuRuntime::Impl {
   std::vector<detail::NpuEid> local_eids;
   std::mutex cache_eid_mutex;
   bool cache_eids_ready{false};
-  std::string adaptive_cpu_device;
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
-#endif
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
   std::shared_ptr<peer::PeerLink> peer_link;
@@ -450,14 +452,6 @@ struct NpuRuntime::Impl {
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& config = impl_->options;
-  if (config.adaptive_ub_device) {
-    const GetExecutionConfig direct{Transport::Urma, Executor::Aiv, GetAlgorithm::Direct};
-    if (config.transport_mode != TransportMode::Urma || !(config.default_get == direct) ||
-        !config.peer_ub_device.empty() || !config.adaptive_ub_miss_count ||
-        config.adaptive_ub_miss_count > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-      throw std::invalid_argument("adaptive CPU selection requires URMA AIV Direct, a valid miss count and no peer pin");
-    }
-  }
   if ((config.batch_get_token_bytes == 0) != (config.batch_get_tokens_per_block == 0))
     throw std::invalid_argument("invalid NPU Runtime token layout");
   if (aclrtSetDevice(config.device_id) != ACL_SUCCESS)
@@ -526,61 +520,10 @@ Status NpuRuntime::InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_siz
     auto status = impl_->peer_link->DiscoverCandidates(&impl_->peer_candidates);
     if (!status.ok()) return status;
   }
-  const auto initialize = [&](const RuntimeInitRequest& cache) {
-    impl_->runtime_core.reset();
-    impl_->dispatcher.reset();
-    impl_->cache_eids_ready = false;
-    impl_->CreateCore();
-    return impl_->runtime_core->Initialize(cache);
-  };
-  impl_->adaptive_cpu_device.clear();
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->options.adaptive_ub_device && !impl_->options.adaptive_peer_ub_devices.empty()) {
-    peer::PeerCandidateTable table;
-    auto status = impl_->peer_link->GetCacheCandidateCount(&table);
-    if (!status.ok()) return status;
-    if (!table.device_fixed) {
-      const detail::StartupProbeConfig probe{
-          impl_->options.batch_get_token_bytes, impl_->options.batch_get_tokens_per_block,
-          impl_->options.adaptive_ub_miss_count};
-      detail::StartupProbeLayout layout{};
-      status = detail::BuildStartupProbeLayout(probe, &layout);
-      if (!status.ok()) return status;
-      const auto& devices = impl_->options.adaptive_peer_ub_devices;
-      std::vector<std::vector<detail::StartupCandidate>> candidates;
-      candidates.reserve(devices.size());
-      for (std::uint32_t index = 0; index < devices.size(); ++index) {
-        const auto& device = devices[index];
-        if (device.empty() || device.find(',') != std::string::npos)
-          return Status::InvalidArgument("adaptive CPU candidate must name one UB device");
-        candidates.push_back({{index, 0U}});
-      }
-      const RuntimeInitRequest scratch{layout.ddr_bytes, layout.block_bytes, DeviceKind::kCpu};
-      status = detail::SelectStartupDeviceCandidate(candidates,
-          [&](const detail::StartupCandidate& candidate, bool measure, double* cycles) {
-            const auto& device = devices[candidate.peer];
-            impl_->adaptive_cpu_device = device;
-            auto trial = initialize(measure ? scratch : request);
-            if (!trial.ok()) return trial;
-            if (measure) {
-              impl_->bandwidth_probe = std::make_unique<detail::StartupBandwidthProbe>(probe);
-              trial = impl_->bandwidth_probe->Run(*this, cycles);
-              if (!trial.ok()) return trial;
-              std::fprintf(stderr, "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u ub_device=%s "
-                                   "miss_count=%u cycles=%.0f\n",
-                           impl_->options.device_id, device.c_str(), probe.miss_count, *cycles);
-            } else {
-              std::fprintf(stderr, "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u ub_device=%s cycles=%.0f\n",
-                           impl_->options.device_id, device.c_str(), *cycles);
-            }
-            return trial;
-          }, [&] { return ShutdownDdr(); });
-      if (!status.ok()) impl_->adaptive_cpu_device.clear();
-      return status;
-    }
-  }
-#endif
-  return initialize(request);
+  impl_->runtime_core.reset();
+  impl_->dispatcher.reset();
+  impl_->CreateCore();
+  return impl_->runtime_core->Initialize(request);
 }
 
 
@@ -895,9 +838,6 @@ Status NpuRuntime::ShutdownDdr() {
     status = impl_->peer_link->CloseExecution();
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   if (status.ok()) impl_->cpu_pull.reset();
-#endif
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (status.ok()) impl_->bandwidth_probe.reset();
 #endif
   if (status.ok()) impl_->ddr_closing=false;
   return status;

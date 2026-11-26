@@ -71,9 +71,9 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 `put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
 预算按 provider 配置。`cores=0` 时，URMA AIV Put 用 2 核、Get 在本机用 2 核、远端 A+K 用 4 核，UBMEM AIV
 Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 6 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
-Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 按 SQ/CQ 容量自动分组，非零须至少为
-`2 * cores`。`request_capacity` 默认 65536；所有 Get 仅把它作为预热提示，
-总请求量由调用方张量和 ABI 决定，不受此配置限制。Put 仍受配置容量及 65536 上限约束。
+Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Direct Get 接受 `max_inflight_total`，默认 2048，显式 0 按 SQ/CQ 容量自动分组，非零须至少为
+`2 * cores`。`request_capacity` 默认 65536。支持分窗的 Get 将其作为预热提示；AIV Gather/Scatter 为固定窗口，
+最多 65536 条请求，并受配置容量约束。Put 仍受配置容量及 65536 上限约束。
 图/输出绑定仍须预先准备足够的请求容量。Gather 可额外指定 `cpu_threads`。
 Gather 可设置 `gather_ddr_bytes`，Scatter 可设置 `scatter_hbm_bytes`；均为字节预算，包含
 对应工作区的元数据和控制区，自动选择预算内最大的 4096 倍数窗口。默认 0 保留现有
@@ -85,8 +85,11 @@ Gather 还可设置 `gather_read_wave_wrs=64`，限制每 worker 每波的数据
 地址发送粒度用 `gather_address_groups_per_post=N`，接受任意正整数；
 优先级为显式配置 > `KVAF_GATHER_ADDRESS_GROUPS_PER_POST` > 默认值 3。
 这些字段均配置在 NPU 侧 `ExecutionResources`，由 `NpuRuntime(get_resources=...)` 接收。
-AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
-`bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
+URMA AIV Gather 的 `gather_sgl_size` 范围为 1–6，默认 6。URMA AIV Scatter 的 `jettys`
+指定每核 payload Jetty 数，两条路径可分别选择 `trusted_get_inputs=True`。
+空 `kernel_path` 使用构建目录的默认产物。Direct Get 为 `bin/kvaf_execute_batch_get_kernels.o`，
+AIV Gather/Scatter 分别使用 `bin/kvaf_gather_batch_get_kernels.o` 与
+`bin/kvaf_scatter_batch_get_kernels.o`，Put 使用 `bin/kvaf_execute_batch_put_kernels.o`。
 `./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，
 不依赖应用启动目录。资源项中非空的 `kernel_path` 覆盖默认值；移动构建产物后须重新构建
 或显式指定新路径。不使用的算法不检查 kernel 文件。

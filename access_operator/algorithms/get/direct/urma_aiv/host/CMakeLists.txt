@@ -1,9 +1,17 @@
 add_library(kvaf_execute_batch_get_host SHARED batch_get_host.cpp execute_batch_get_loader.cpp)
 if(TARGET kvaf_access_operator)
-  target_sources(kvaf_execute_batch_get_host PRIVATE
-    sequential_batch_get.cpp
-    scatter_batch_get.cpp execute_scatter_batch_get_loader.cpp
-    gather_batch_get.cpp execute_gather_batch_get_loader.cpp)
+  set(get_dir "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/algorithms/get")
+  foreach(mode gather scatter)
+    set(algorithm_dir "${get_dir}/${mode}/urma_aiv")
+    target_sources(kvaf_execute_batch_get_host PRIVATE
+      "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/providers/urma_aiv/${mode}_resources.cc"
+      "${algorithm_dir}/host/${mode}_batch_get.cpp"
+      "${algorithm_dir}/host/execute_${mode}_batch_get_loader.cpp")
+    target_include_directories(kvaf_execute_batch_get_host PRIVATE "${algorithm_dir}/include")
+  endforeach()
+  target_include_directories(kvaf_execute_batch_get_host
+    PUBLIC "${get_dir}/common/aiv/include"
+    PRIVATE "${get_dir}/common/aiv/host" "${KVAF_ACCESS_OPERATOR_SOURCE_DIR}/providers/urma_aiv")
   target_link_libraries(kvaf_execute_batch_get_host PRIVATE kvaf_access_operator)
 endif()
 target_include_directories(kvaf_execute_batch_get_host

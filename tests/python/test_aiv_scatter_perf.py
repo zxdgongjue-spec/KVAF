@@ -308,11 +308,15 @@ def main(argv=None):
     output = torch.empty((output_rows, args.token_bytes), dtype=torch.uint8, device=device)
     stream = torch.npu.current_stream(device_id)
     keys = build_dsa_keys(args.blocks, q_capacity=args.blocks)
-    runtime = kvaf.NpuRuntime(kernel, args.token_bytes, args.tokens_per_block,
-                              device_id=device_id, npu_core_count=args.cores,
-                              batch_put_kernel_object_path=put_kernel,
-                              npu_eids=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
-                              aiv_batch_get_mode="cpu_push_scatter")
+    put = kvaf.PutExecutionConfig("urma", "aiv")
+    get = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
+    runtime = kvaf.NpuRuntime(
+        args.token_bytes, args.tokens_per_block, device_id=device_id, default_put=put, default_get=get,
+        npu_eids=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
+        put_resources=[(put, kvaf.ExecutionResources(cores=args.cores, jettys=2, kernel_path=put_kernel))],
+        get_resources=[(get, kvaf.ExecutionResources(cores=args.cores, kernel_path=kernel,
+                                                    trusted_get_inputs=True))],
+    )
     if args.profile_iterations and not all(hasattr(runtime, name) for name in (
             "start_scatter_profile", "scatter_profile", "stop_scatter_profile")):
         raise RuntimeError("rebuild the Python binding with scatter profiling support")

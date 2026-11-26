@@ -50,9 +50,12 @@ constexpr UrmaAivParallelism DefaultUrmaAivParallelism(bool get, bool peer_local
   return get && !peer_local ? UrmaAivParallelism{4, 1} : UrmaAivParallelism{2, 2};
 }
 struct ExecutionResources {
-  // Zero cores/Jettys select provider defaults: local URMA AIV Get 2 x 2,
-  // remote Get 4 x 1, Put 2 x 2. UBMEM AIV uses 16 cores, AICPU Put 1 / Get 6. An absent
-  // in-flight budget uses 2048; explicit zero uses SQ/CQ capacity for URMA AIV Get.
+  // Zero cores/Jettys select provider defaults. URMA AIV Direct Get uses
+  // local 2 x 2 or remote 4 x 1. AIV Put uses 2 x 2. UBMEM AIV uses 16 cores,
+  // AICPU Put uses 1 worker and AICPU Get uses 6. AIV Scatter defaults to
+  // shared payload Jettys; AIV Gather uses one control and one data Jetty per core.
+  // For URMA AIV Direct Get, an absent in-flight budget uses 2048 and explicit
+  // zero uses SQ/CQ capacity.
   // Get derives total capacity from each invocation's buffers; request_capacity
   // is a warmup hint for Get and a provider limit for Put.
   // Empty AIV kernel paths use this build's bin output; AICPU packages resolve through CANN.
@@ -70,6 +73,9 @@ struct ExecutionResources {
   // URMA AICPU Gather only: address groups per publication. Explicit >
   // KVAF_GATHER_ADDRESS_GROUPS_PER_POST > default 3. Any positive value is valid.
   std::optional<std::uint32_t> gather_address_groups_per_post;
+  // URMA AIV Gather only, defaults to 6. Trusted input is opt-in per Gather/Scatter Get.
+  std::optional<std::uint32_t> gather_sgl_size;
+  bool trusted_get_inputs{false};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

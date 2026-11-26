@@ -52,10 +52,6 @@ struct NpuRuntimeOptions : ExecutionPolicy {
   // A device name pins the peer. An ordered CSV selects remote AIV/Gather Get FEs.
   // Empty selects automatically; KVAF_DEFAULT_PEER_FE_COUNT controls remote Get.
   std::string peer_ub_device{};
-  std::uint32_t aiv_gather_sgl_size{6U};
-  bool adaptive_ub_device{false};
-  std::uint32_t adaptive_ub_miss_count{2048U};
-  std::vector<std::string> adaptive_peer_ub_devices;
   CpuPullOptions cpu_pull_options;
   NpuPullOptions npu_pull_options;
 };

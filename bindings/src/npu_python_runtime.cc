@@ -392,62 +392,6 @@ class PythonGetGraphResources;
 
 class NpuPythonRuntime final {
  public:
-  NpuPythonRuntime(std::string batch_get_kernel_object_path,
-                   std::uint32_t batch_get_token_bytes,
-                   std::uint32_t batch_get_tokens_per_block,
-                   std::uint32_t device_id, std::uint32_t npu_core_count,
-                   std::string batch_put_kernel_object_path,
-                   std::uint32_t jettys_per_core,
-                   std::vector<std::string> npu_eids,
-                   bool adaptive_ub_device,
-                   std::uint32_t adaptive_ub_miss_count,
-                   std::string peer_ub_device,
-                   std::vector<std::string> adaptive_peer_ub_devices,
-                   std::uint32_t batch_get_max_inflight_total,
-                   const std::string& transport, std::string aicpu_batch_get_mode,
-                   std::string aiv_batch_get_mode, std::uint32_t aiv_gather_sgl_size,
-                   bool trusted_gather_inputs) {
-    NpuRuntimeOptions options{batch_get_token_bytes, batch_get_tokens_per_block};
-    if (transport == "urma") options.transport_mode = TransportMode::Urma;
-    else if (transport == "ubmem") options.transport_mode = TransportMode::Ubmem;
-    else throw py::value_error("transport must be urma or ubmem");
-    options.adaptive_ub_device = adaptive_ub_device;
-    options.adaptive_ub_miss_count = adaptive_ub_miss_count;
-    options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
-    const auto transport_kind = transport == "urma" ? Transport::Urma : Transport::Ubmem;
-    const auto executor = aicpu_batch_get_mode.empty() ? Executor::Aiv : Executor::Aicpu;
-    const auto& mode = executor == Executor::Aiv ? aiv_batch_get_mode : aicpu_batch_get_mode;
-    GetAlgorithm algorithm;
-    if (mode == "direct_read" && executor == Executor::Aiv) algorithm = GetAlgorithm::Direct;
-    else if (mode == "gather_read") algorithm = GetAlgorithm::Gather;
-    else if (mode == "cpu_push_scatter") algorithm = GetAlgorithm::Scatter;
-    else throw py::value_error("invalid BatchGet mode");
-    options.default_get = GetExecutionConfig{transport_kind, executor, algorithm};
-    options.default_put = PutExecutionConfig{transport_kind, executor};
-    options.device_id = device_id;
-    options.npu_eids = std::move(npu_eids);
-    options.peer_ub_device = std::move(peer_ub_device);
-    options.aiv_gather_sgl_size = aiv_gather_sgl_size;
-    ExecutionResources get;
-    get.cores = npu_core_count;
-    get.jettys = executor == Executor::Aiv && transport_kind == Transport::Urma ? jettys_per_core : 0;
-    if (executor == Executor::Aiv) {
-      get.kernel_path = std::move(batch_get_kernel_object_path);
-      if (transport_kind == Transport::Urma)
-        get.max_inflight_total = algorithm == GetAlgorithm::Direct ? batch_get_max_inflight_total : 0;
-    }
-    options.get_resources.emplace_back(*options.default_get, std::move(get));
-    ExecutionResources put;
-    put.cores = npu_core_count;
-    put.jettys = executor == Executor::Aiv && transport_kind == Transport::Urma ? std::min(jettys_per_core, 2U) : 0;
-    if (executor == Executor::Aiv) put.kernel_path = std::move(batch_put_kernel_object_path);
-    options.put_resources.emplace_back(*options.default_put, std::move(put));
-    trusted_scatter_inputs_ = true;
-    trusted_gather_inputs_ = trusted_gather_inputs;
-    native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
-  }
-
-
   NpuPythonRuntime(py::object batch_get_token_bytes,
                    py::object batch_get_tokens_per_block, std::uint32_t device_id,
                    const std::string& transport_mode, py::object default_put,
@@ -473,6 +417,8 @@ class NpuPythonRuntime final {
       options.put_resources = put_resources.cast<decltype(options.put_resources)>();
     if (!get_resources.is_none())
       options.get_resources = get_resources.cast<decltype(options.get_resources)>();
+    for (const auto& [config, resources] : options.get_resources)
+      if (resources.trusted_get_inputs) trusted_get_configs_.push_back(config);
     if (!default_put.is_none()) options.default_put = default_put.cast<PutExecutionConfig>();
     if (!default_get.is_none()) options.default_get = default_get.cast<GetExecutionConfig>();
     options.device_id = device_id;
@@ -1192,6 +1138,11 @@ class NpuPythonRuntime final {
   }
 
  private:
+  bool TrustsGetInputs(const std::optional<GetExecutionConfig>& config) const {
+    return config && std::find(trusted_get_configs_.begin(), trusted_get_configs_.end(), *config) !=
+        trusted_get_configs_.end();
+  }
+
   py::object BatchGetImpl(const AccessTableHandle& access_table, const py::object& addresses,
                           const py::object& valid, const py::object& indices,
                           const py::object& offsets, const py::object& miss_count,
@@ -1217,7 +1168,7 @@ class NpuPythonRuntime final {
     const bool sequential = selected && selected->algorithm != GetAlgorithm::Direct &&
         selected->transport == Transport::Urma &&
         selected->executor == Executor::Aiv && !graph_lease && !output_lease && !active_graph_scope_;
-    if (sequential && trusted_scatter_inputs_ && selected->algorithm == GetAlgorithm::Scatter) {
+    if (sequential && TrustsGetInputs(selected) && selected->algorithm == GetAlgorithm::Scatter) {
       std::optional<BatchGetHostTiming> scatter_host;
       auto* timing = BeginScatterHostTiming(scatter_host, 0);
       const auto started = timing ? BatchGetProfileNowNs() : 0U;
@@ -1235,7 +1186,7 @@ class NpuPythonRuntime final {
       return py::none();
     }
 
-    if (sequential && selected->algorithm == GetAlgorithm::Gather && trusted_gather_inputs_) {
+    if (sequential && TrustsGetInputs(selected) && selected->algorithm == GetAlgorithm::Gather) {
       const auto request = TrustedNpuRequest(access_table, addresses, valid, indices, offsets,
           miss_count, output_indices, output, native_->batch_get_token_bytes(),
           native_->batch_get_tokens_per_block(), metadata_);
@@ -1329,7 +1280,7 @@ class NpuPythonRuntime final {
         BatchGetExecutionOptions options{acl_stream, synchronize, timings.get(), execution,
                                          graph_lease, output_lease};
         const auto& target = execution ? execution : selected;
-        options.trusted_npu_request = graph_lease && trusted_gather_inputs_ && target &&
+        options.trusted_npu_request = graph_lease && TrustsGetInputs(target) &&
             target->transport == Transport::Urma && target->executor == Executor::Aiv &&
             target->algorithm == GetAlgorithm::Gather;
         status = native_->core().BatchGet(request, options, get_call_trace_ ? &host : nullptr);
@@ -1670,8 +1621,7 @@ class NpuPythonRuntime final {
   std::uint64_t generation_{};
   bool host_profile_enabled_{false}, host_profile_ready_{false};
   BatchGetHostTiming host_profile_{};
-  bool trusted_scatter_inputs_{false};
-  bool trusted_gather_inputs_{false};
+  std::vector<GetExecutionConfig> trusted_get_configs_;
   friend class PythonGetGraphResources;
   void ApplyGraphScope(const py::object&, const NpuTensorLayout&, std::size_t, aclrtStream,
                        bool, bool, std::optional<GetExecutionConfig>&, std::uint64_t&,
@@ -1998,7 +1948,6 @@ void BindNpuPythonRuntime(py::module_& module) {
 
   auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
   python_binding::BindNpuRuntimeConstructor(runtime);
-  python_binding::BindLegacyNpuRuntimeConstructor(runtime);
   runtime
       .def("graph_resources", [](py::object self) {
         return std::make_shared<PythonGetGraphResources>(std::move(self));
