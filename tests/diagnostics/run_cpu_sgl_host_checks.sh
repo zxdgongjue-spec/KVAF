@@ -7,6 +7,8 @@ readonly KVAF_SGL_CXX="${CXX:-c++}"
 readonly KVAF_SGL_CLANGXX="${CLANGXX:-clang++}"
 mkdir -p "$KVAF_SGL_BUILD"
 includes=(-Iaccess_operator/algorithms/get/direct/urma_aiv/include -Icommon/include -Iaccess_operator/include -Iaccess_operator/algorithms -Iruntime/include)
+"$KVAF_SGL_CXX" -std=c++17 "${includes[@]}" tests/diagnostics/cpu_sgl_push_layout.cc -o "$KVAF_SGL_BUILD/push-layout"
+"$KVAF_SGL_BUILD/push-layout"
 # Preserve GM as a distinct Clang address space. The executable model below
 # erases that qualifier and cannot catch local/GM struct assignment errors.
 if command -v "$KVAF_SGL_CLANGXX" >/dev/null 2>&1; then

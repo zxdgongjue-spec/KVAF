@@ -138,9 +138,11 @@ __aicore__ inline uint64_t PostChunkMailbox(const MailboxLaunch& mailbox, const 
     uint32_t owner, bool first, bool failed, __gm__ volatile BatchGetWorkerProfile* profile) {
   const auto staging = (descriptor_offset + uint64_t(kMaxRequests) * 8 + 63) & ~uint64_t(63);
   const auto slot = failed ? kPushChunkCount + owner : chunk;
-  const auto commit = staging + uint64_t(slot) * sizeof(Word);
-  const auto descriptor = descriptor_offset + uint64_t(chunk) * kChunkRows * 8;
-  const auto rows = count - chunk * kChunkRows < kChunkRows ? count - chunk * kChunkRows : kChunkRows;
+  const auto commit = staging + (failed ? uint64_t(slot) * sizeof(Word) : PushCommitOffset(chunk));
+  const auto head = PushLaunchHeadRows(a.sequence);
+  const auto begin = PushChunkBegin(chunk, head);
+  const auto descriptor = descriptor_offset + uint64_t(begin) * 8;
+  const auto rows = PushChunkEnd(count, chunk, head) - begin;
   const uint64_t local[5] = {0, target_offset, descriptor, commit, 64};
   const uint64_t remote[5] = {0, target_offset, descriptor, 192 + uint64_t(owner) * 64, 64};
   const uint64_t lengths[5] = {64, sizeof(OutputTarget), failed ? 0U : uint64_t(rows) * 8, 8, 8};

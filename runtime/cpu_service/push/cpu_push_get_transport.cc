@@ -1,7 +1,7 @@
 #include "cpu_service/push/cpu_push_get_transport.h"
 #include "urma_device_abi.h"
 #include "batch_get_profile.h"
-#include "cpu_sgl_push_abi.h"
+#include "cpu_sgl_push_layout.h"
 
 #include <chrono>
 #include <cstddef>
@@ -42,19 +42,21 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                              urma::ImportJettyEx import, std::uint32_t psn,
                              peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base,
                              const peer::OpenCpuSglPushRequest* push, peer::OpenCpuSglPushResponse* mailbox) {
+  const auto small_head = push ? PushSetupHeadRows(setup.output_mode) : 0;
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      setup.output_mode > (push ? kPushChunkedOutput : kChunkedOutput) ||
+      (setup.output_mode > (push ? kPushChunkedOutput : kChunkedOutput) && !small_head) ||
       setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode == kScatterOutput) ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode != kScatterOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
-  if (push && (!mailbox || (setup.output_mode != kPipelinedOutput && setup.output_mode != kPushChunkedOutput) || !push->control_tp ||
+  if (push && (!mailbox || (setup.output_mode != kPipelinedOutput && setup.output_mode != kPushChunkedOutput && !small_head) || !push->control_tp ||
       !push->control_psn || (push->control.bytes != 28 && push->control.bytes != 32)))
     return Status::InvalidArgument("invalid device-push mailbox setup");
-  if (push && setup.output_mode == kPushChunkedOutput && setup.hbm_bytes < layout_.bytes + sizeof(ChunkPushState))
+  head_rows_ = small_head ? small_head : kChunkRows;
+  if (push && (setup.output_mode == kPushChunkedOutput || small_head) && setup.hbm_bytes < layout_.bytes + PushWorkspaceBytes(head_rows_))
     return Status::InvalidArgument("missing device-push chunk commit storage");
   device_push_ = push != nullptr;
   context_ = context;
@@ -66,7 +68,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   token_bytes_ = setup.token_bytes;
   direct_output_ = setup.output_mode != kScatterOutput;
   payload_only_ = setup.output_mode == kPayloadOnlyOutput;
-  chunked_ = setup.output_mode == kChunkedOutput || setup.output_mode == kPushChunkedOutput;
+  chunked_ = setup.output_mode == kChunkedOutput || setup.output_mode == kPushChunkedOutput || small_head;
   pipeline_ = chunked_ || setup.output_mode == kPipelinedOutput;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
@@ -85,7 +87,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                max_bytes_, workers_, token_bytes_, kPostPayloadWrs);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
-  if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
+  if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, push ? setup.hbm_bytes : layout_.bytes))
     return Error("HBM workspace outside exported segment");
   urma_import_seg_flag_t flag{};
   // Match the probe's READ/WRITE-only HBM import, without remote atomics.
@@ -313,7 +315,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   const bool detail = (payload_only_ || pipeline_) && profile_.enabled;
   batch_result_ = Result::kOk;
   head_count_ = pipeline_ ? static_cast<std::uint32_t>(r.reserved_words[0]) : 0;
-  if (chunked_ && (r.reserved_words[0] != kChunkRows || !r.count))
+  if (chunked_ && (r.reserved_words[0] != kChunkRows || r.reserved_words[1] != (head_rows_ < kChunkRows ? head_rows_ : 0) || !r.count))
     return Status::InvalidArgument("invalid CPU SGL chunk size");
   if (pipeline_ && !chunked_ && (r.reserved_words[0] != std::min(r.count, kPipelineHeadRows) || !head_count_))
     return Status::InvalidArgument("invalid CPU SGL pipeline head");
@@ -451,7 +453,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   prepared_.clear();
   head_waves_ = 0;
   chunk_plans_.clear();
-  const auto phases = chunked_ ? (count + kChunkRows - 1) / kChunkRows : pipeline_ && head_count_ < count ? 2U : 1U;
+  const auto phases = chunked_ ? PushChunkCount(count, head_rows_) : pipeline_ && head_count_ < count ? 2U : 1U;
   for (std::uint32_t phase = 0; phase < phases; ++phase) {
     const auto first_plan = static_cast<std::uint32_t>(prepared_.size());
     std::array<std::vector<PreparedQueue>, kJettyCount> shards;
@@ -462,7 +464,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
           auto shard = JettyRange(range, queue);
           if (chunked_) {
-            shard = JettyRange({phase * kChunkRows, std::min(count, (phase + 1) * kChunkRows)}, queue);
+            shard = JettyRange({PushChunkBegin(phase, head_rows_), PushChunkEnd(count, phase, head_rows_)}, queue);
           } else if (pipeline_) {
             shard.begin = std::max(shard.begin, phase == 0 ? 0U : head_count_);
             shard.end = std::min(shard.end, phase == 0 ? head_count_ : count);
@@ -851,12 +853,25 @@ Status Transport::WritePushed(const std::atomic<bool>* stop) {
 Status Transport::WriteChunks(const std::atomic<bool>* stop) {
   auto* p = profile_.enabled ? &profile_ : nullptr;
   const auto count = request().count;
-  const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+  const auto chunks = PushChunkCount(count, head_rows_);
   constexpr std::uint32_t kWindow = 4;  // Bounded even for split-token, multi-wave chunks.
   std::array<std::uint32_t, kMaxWorkers> published{};
   std::vector<bool> posted(chunks);
   std::uint32_t submitted_chunks = 0, inflight = 0, prefetched = chunks;
   std::uint64_t prefetch_start = 0;
+  std::uint64_t no_ready_since = 0;
+  bool gap_inflight = false;
+  auto gap = [&](bool waiting) {
+    if (!p || !device_push_) return;
+    if (no_ready_since && (!waiting || gap_inflight != (inflight != 0))) {
+      const auto now = BatchGetProfileNowNs();
+      (gap_inflight ? p->no_ready_inflight_ns : p->no_ready_idle_ns) += now - no_ready_since;
+      no_ready_since = 0;
+    }
+    if (waiting && !no_ready_since) {
+      no_ready_since = BatchGetProfileNowNs(); gap_inflight = inflight != 0;
+    }
+  };
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
   auto poll = [&](bool wait) -> Status {
     std::uint64_t completed = 0;
@@ -902,10 +917,12 @@ Status Transport::WriteChunks(const std::atomic<bool>* stop) {
       bool ready = false;
       for (std::uint32_t c = 0; c < chunks; ++c)
         ready |= !posted[c] && published[c % workers_] > c / workers_;
-      if (inflight && !ready) { auto status = poll(false); if (!status.ok()) return status; }
+      gap(!ready);
+      if (inflight && !ready) { auto status = poll(false); if (!status.ok()) return status; gap(true); }
       continue;
     }
-    const auto begin = next * kChunkRows, end = std::min(count, begin + kChunkRows);
+    gap(false);
+    const auto begin = PushChunkBegin(next, head_rows_), end = PushChunkEnd(count, next, head_rows_);
     if (!device_push_) {
       const auto reading = prefetched != chunks ? prefetch_start : p ? BatchGetProfileNowNs() : 0;
       auto status = prefetched != chunks ? Status::OK() :
@@ -920,7 +937,7 @@ Status Transport::WriteChunks(const std::atomic<bool>* stop) {
     // chunk. Each READ lands in its own stable slice of the registered mirror.
     for (std::uint32_t c = 0; !device_push_ && c < chunks; ++c) {
       if (c == next || posted[c] || published[c % workers_] <= c / workers_) continue;
-      const auto first = c * kChunkRows, last = std::min(count, first + kChunkRows);
+      const auto first = PushChunkBegin(c, head_rows_), last = PushChunkEnd(count, c, head_rows_);
       prefetch_start = p ? BatchGetProfileNowNs() : 0;
       auto status = BeginControlRead(layout_.descriptor + std::uint64_t{first} * 8, std::uint64_t{last - first} * 8);
       if (!status.ok()) return status;
@@ -955,6 +972,7 @@ Status Transport::WriteChunks(const std::atomic<bool>* stop) {
     ++submitted_chunks;
     if (p) ++p->chunks;
   }
+  gap(false);
   // An invalid later chunk cannot retire imports or publish done over prior DMA.
   while (inflight) { auto status = poll(true); if (!status.ok()) return status; }
   return Status::OK();
@@ -1031,16 +1049,19 @@ void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
   if (device_push_ && chunked_) {
     const auto& p = profile_;
-    std::fprintf(stderr, "CPU_SGL_PUSH_CHUNK_PROFILE sequence=%" PRIu64 " rows=%u chunk_rows=%u chunks=%u"
+    std::fprintf(stderr, "CPU_SGL_PUSH_CHUNK_PROFILE sequence=%" PRIu64 " rows=%u head_rows=%u chunk_rows=%u chunks=%u"
         " descriptor_reads=0 ready_wrs=0 source_validation=disabled address_validate_us=%.3f"
         " first_post_us=%.3f chunk_ready_us=%.3f chunk_submit_us=%.3f chunk_cq_wait_us=%.3f"
         " source_sge_update_us=%.3f payload_post_us=%.3f done_post_us=%.3f done_cq_wait_us=%.3f cpu_total_us=%.3f"
+        " no_ready_us=%.3f no_ready_inflight_us=%.3f no_ready_idle_us=%.3f"
         " local_progress_polls=%u data_wrs=%u tail_cqes=%u post_calls=%u max_inflight=%u plan_reused=%u result=%u\n",
-        request().sequence, request().count, kChunkRows, p.chunks, p.address_validate_ns / 1000.0,
+        request().sequence, request().count, head_rows_, kChunkRows, p.chunks, p.address_validate_ns / 1000.0,
         p.first_post_ns ? (p.first_post_ns - p.cpu_start_ns) / 1000.0 : 0,
         p.chunk_ready_ns / 1000.0, p.chunk_submit_ns / 1000.0, p.chunk_cq_wait_ns / 1000.0,
         p.source_sge_update_ns / 1000.0, p.post_ns / 1000.0, p.done_post_ns / 1000.0,
-        p.done_cq_wait_ns / 1000.0, p.cpu_total_ns / 1000.0, p.progress_reads, p.data_wrs,
+        p.done_cq_wait_ns / 1000.0, p.cpu_total_ns / 1000.0,
+        (p.no_ready_inflight_ns + p.no_ready_idle_ns) / 1000.0, p.no_ready_inflight_ns / 1000.0,
+        p.no_ready_idle_ns / 1000.0, p.progress_reads, p.data_wrs,
         p.tail_cqes, p.post_calls, p.max_inflight, unsigned(p.plan_reused), unsigned(batch_result_));
     return;
   }

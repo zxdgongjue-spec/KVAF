@@ -13,15 +13,16 @@ struct PushFixture : Fixture {
   uint64_t head_commit_cycle{};
   uint64_t later_chunk_cycle{};
   bool chunks{};
+  uint32_t head_rows{kChunkRows};
   bool fail_first_control{};
   std::vector<std::function<void()>> source_checks;
   std::deque<std::vector<std::function<void()>>> pending_controls;
   uint32_t max_pending{};
   static inline PushFixture* active{};
-  explicit PushFixture(uint32_t workers, bool chunked = false) : Fixture(workers), mailbox(layout.staging / 64), sq(64 * 16), cq(64 * 8), chunks(chunked) {
-    args.execution.sequence = chunks ? kChunkPipelineLaunch : kPipelineLaunch;
+  explicit PushFixture(uint32_t workers, bool chunked = false, uint32_t head = kChunkRows, uint32_t capacity = kCapacity) : Fixture(workers, capacity), mailbox(layout.staging / 64), sq(64 * 16), cq(64 * 8), chunks(chunked), head_rows(head) {
+    args.execution.sequence = chunks ? PushLaunch(head_rows) : kPipelineLaunch;
     if (chunks) {
-      workspace.resize((layout.bytes + sizeof(ChunkPushState)) / 64);
+      workspace.resize((layout.bytes + PushWorkspaceBytes(head_rows)) / 64);
       args.execution.workspace = reinterpret_cast<uint64_t>(workspace.data());
       sgl_model::descriptor = args.execution.workspace + layout.descriptor;
       sgl_model::descriptor_end = args.execution.workspace + layout.staging;
@@ -54,7 +55,7 @@ struct PushFixture : Fixture {
       const uint64_t local = uint64_t(w[14]) | (uint64_t(w[15]) << 32);
       const auto bytes = w[12];
       const auto base = reinterpret_cast<uint64_t>(f.mailbox.data());
-      if (f.chunks && !f.later_chunk_cycle && remote >= base + f.layout.descriptor + uint64_t(kChunkRows) * 8)
+      if (f.chunks && !f.later_chunk_cycle && remote >= base + f.layout.descriptor + uint64_t(f.head_rows) * 8)
         f.later_chunk_cycle = AscendC::GetSystemCycle();
       assert(bytes && bytes <= f.context.max_write_bytes && remote >= base && remote + bytes <= base + f.layout.staging);
       assert(local >= f.args.execution.workspace && local + bytes <= f.args.execution.workspace + f.workspace.size() * 64);
@@ -112,6 +113,7 @@ struct PushFixture : Fixture {
     const auto* header = reinterpret_cast<Request*>(mailbox.data());
     assert(header->sequence == sequence && header->count == uint32_t(count) && header->mode == (chunks ? kChunkedOutput : kDirectOutput));
     assert(header->reserved_words[0] == (chunks ? kChunkRows : std::min(uint32_t(count), kPipelineHeadRows)));
+    assert(header->reserved_words[1] == (chunks && head_rows < kChunkRows ? head_rows : 0));
     const auto* target = reinterpret_cast<OutputTarget*>(base + layout.output_target);
     assert(target->base == args.execution.output && !std::memcmp(target->segment, args.output_target.segment, kOutputSegmentBytes));
   }
@@ -126,7 +128,7 @@ struct PushFixture : Fixture {
     };
     const auto head = std::min(uint32_t(count), kPipelineHeadRows);
     if (chunks) {
-      const auto total = (uint32_t(count) + kChunkRows - 1) / kChunkRows;
+      const auto total = PushChunkCount(uint32_t(count), head_rows);
       std::vector<bool> copied(total);
       uint32_t completed = 0;
       bool failed = false;
@@ -138,7 +140,7 @@ struct PushFixture : Fixture {
           if ((token >> 32) != sequence) continue;
           if (uint32_t(token) & kChunkFailed) { failed = true; break; }
           for (uint32_t c = w; c < total && c / args.execution.workers < uint32_t(token); c += args.execution.workers)
-            if (!copied[c]) { copy(c * kChunkRows, std::min(uint32_t(count), (c + 1) * kChunkRows)); copied[c] = true; ++completed; }
+            if (!copied[c]) { copy(PushChunkBegin(c, head_rows), PushChunkEnd(uint32_t(count), c, head_rows)); copied[c] = true; ++completed; }
         }
       }
       assert(failed == (result != Result::kOk));
@@ -163,6 +165,30 @@ struct PushFixture : Fixture {
 };
 }
 int main() {
+  for (uint32_t head : {128U, 256U, 512U}) for (uint32_t workers : {1U, 4U, 5U, 8U}) {
+    PushFixture f(workers, true, head); uint64_t sequence = 0;
+    for (uint32_t count : {7U, head, head + 1, head + 1024, head + 1025, 0U, 9001U}) {
+      f.count = count; ++sequence;
+      auto work = f.LaunchPush();
+      if (count) { f.WaitHead(sequence); f.FinishCpu(sequence); }
+      f.Check(work, sequence, Result::kOk);
+      assert(f.pending_controls.empty());
+    }
+  }
+  for (uint32_t head : {128U, 256U, 512U}) {
+    PushFixture f(4, true, head); f.count = 9001; f.rows[3000] = -1;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1, Result::kInvalidRequest); f.Check(work, 1, Result::kInvalidRequest);
+  }
+  for (uint32_t head : {1U, 7U, 1023U}) {
+    PushFixture f(4, true, head); f.count = 9001;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+  }
+  {
+    PushFixture f(4, true, 256, 65536); f.count = 65536;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+    assert(PushChunkCount(f.count, f.head_rows) == 65 && f.pending_controls.empty());
+  }
+
   {
     // A split Head may fail before notify. Do not admit a phantom deferred
     // CQE or consume stale replay state; conservatively retain the done wait.
@@ -177,11 +203,11 @@ int main() {
     auto work = f.LaunchPush(); f.Check(work, 1, Result::kInvalidRequest);
     assert(!f.head_commit_cycle && !f.produced && f.pending_controls.empty());
   }
-  {
+  for (uint32_t head : {256U, 1024U}) {
     // Owner 1 is stalled in its first build. Owner 2 must reach the CPU
     // without waiting for that builder or an all-workers barrier.
-    PushFixture f(4, true); f.count = 9001;
-    sgl_model::pause_row = kChunkRows;
+    PushFixture f(4, true, head); f.count = 9001;
+    sgl_model::pause_row = head;
     sgl_model::paused = false; sgl_model::resume = false;
     auto work = f.LaunchPush(); f.WaitHead(1);
     const auto deadline = std::chrono::steady_clock::now() + 5s;

@@ -16,6 +16,31 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_small_head_resources_and_child_csv_forwarding(self):
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        for backend, executor in (("cpu_sgl_push", "aicpu"), ("aiv_cpu_sgl_push", "aiv")):
+            self.assertEqual(parse_args(["--backend", backend]).sgl_push_head_rows, 1024)
+            for head in (128, 256, 512, 1024):
+                args = parse_args(["--backend", backend, "--sgl-push-chunked", "--sgl-push-head-rows", str(head)])
+                self.assertIsNone(validate_args(args))
+                self.assertEqual(parse_args(workload_command(args)).sgl_push_head_rows, head)
+                execution = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push",
+                                               sgl_push_chunked=True, sgl_push_head_rows=head)
+                self.assertEqual(execution.runtime_kwargs["get_resources"][0][1].get("sgl_push_head_rows", 1024), head)
+                self.assertNotIn("sgl_push_head_rows", execution.runtime_kwargs["put_resources"][0][1])
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+                    args.output_dir = Path(directory)
+                    report = BatchGetCsv(args); report.add_summary("graph", {}); report.write()
+                    with report.summary_path.open() as source:
+                        self.assertEqual(next(csv.DictReader(source))["sgl_push_head_rows"], str(head))
+            for flags in (["--sgl-push-head-rows", "256"], ["--sgl-push-chunked", "--sgl-push-head-rows", "0"],
+                          ["--sgl-push-chunked", "--sgl-push-head-rows", "1025"]):
+                self.assertIn("--sgl-push-head-rows", validate_args(parse_args(["--backend", backend, *flags])))
+        for backend in ("aiv", "ubmem", "cpu_sgl_write", "aiv_cpu_sgl_write"):
+            self.assertIn("--sgl-push-head-rows", validate_args(parse_args(["--backend", backend, "--sgl-push-head-rows", "256"])))
+
     def test_device_push_chunk_mode_is_opt_in_and_forwarded(self):
         kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
                                PutExecutionConfig=lambda *args: args,

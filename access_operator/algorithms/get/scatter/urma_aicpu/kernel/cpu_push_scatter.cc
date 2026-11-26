@@ -47,6 +47,7 @@ struct Execution {
   bool pipeline{};
   bool chunked{};
   const MailboxLaunch* mailbox{};
+  std::uint32_t head_rows{kChunkRows};
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   ChunkPushState& ChunkState() const { return *reinterpret_cast<ChunkPushState*>(Memory() + layout.staging); }
@@ -67,10 +68,10 @@ struct Execution {
   }
   std::uint64_t Post(std::uint32_t chunk, std::uint32_t owner, std::uint32_t progress, bool first) {
     BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
-    Store(ChunkState().commits[chunk], Progress(args.sequence, progress));
+    Store(*reinterpret_cast<Word*>(Memory() + layout.staging + PushCommitOffset(chunk)), Progress(args.sequence, progress));
     if (first) Store(*reinterpret_cast<Word*>(Memory() + layout.notify), args.sequence | (profile ? kProfileNotify : 0));
     Barrier();
-    const auto result = PostChunkDescriptorMailbox(*mailbox, args, layout, request_count, chunk, owner, first, false);
+    const auto result = PostChunkDescriptorMailbox(*mailbox, args, layout, request_count, chunk, owner, first, false, head_rows);
     if (result) return std::uint64_t(Result::kTransportError);
     if (first) {
       if (profile) profile->head_doorbell_ns = BatchGetProfileNowNs() - profile->enter_ns;
@@ -82,7 +83,7 @@ struct Execution {
     BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
     Store(ChunkState().commits[kPushChunkCount + owner], Progress(args.sequence, kChunkFailed | error));
     Barrier();
-    return PostChunkDescriptorMailbox(*mailbox, args, layout, request_count, 0, owner, false, true)
+    return PostChunkDescriptorMailbox(*mailbox, args, layout, request_count, 0, owner, false, true, head_rows)
         ? std::uint64_t(Result::kTransportError) : 0;
   }
   std::uint64_t Wait() {
@@ -187,7 +188,11 @@ struct Execution {
       auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
       *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, direct ? kDirectOutput : kScatterOutput, {}};
       if (pipeline) header->reserved_words[0] = head;
-      if (chunked) { header->mode = kChunkedOutput; header->reserved_words[0] = kChunkRows; }
+      if (chunked) {
+        header->mode = kChunkedOutput;
+        header->reserved_words[0] = kChunkRows;
+        if (mailbox && head_rows != kChunkRows) header->reserved_words[1] = head_rows;
+      }
       if (direct)
         *reinterpret_cast<OutputTarget*>(Memory() + layout.output_target) = *output_target;
     }
@@ -210,10 +215,11 @@ struct Execution {
 }  // namespace
 
 static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target,
-                                    bool pipeline = false, bool chunked = false, const MailboxLaunch* mailbox = nullptr) {
+                                    bool pipeline = false, bool chunked = false,
+                                    const MailboxLaunch* mailbox = nullptr, std::uint32_t head_rows = kChunkRows) {
   const auto entered = mailbox && args && args->profile ? BatchGetProfileNowNs() : 0;
   Layout layout;
-  if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
+  if (!ValidPushHeadRows(head_rows) || !args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.
@@ -232,7 +238,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
     if (mailbox) profile->head_profile_tag = kCpuSglPushHeadProfileV1;
   }
   Execution io{*args, output_target, layout, c, CounterNow(),
-      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox};
+      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox, head_rows};
   if (mailbox && chunked && !worker) io.InitChunks();
   std::uint32_t count = 0;
   Range range{};
@@ -242,11 +248,11 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   bool head_notified = false;
   if (chunked) {
     range = {};
-    const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+    const auto chunks = PushChunkCount(count, head_rows);
     auto* progress = reinterpret_cast<Word*>(io.Memory() + layout.ready) + worker;
     std::uint32_t completed = 0;
     for (auto chunk = worker; chunk < chunks; chunk += args->workers) {
-      const Range part{chunk * kChunkRows, std::min(count, (chunk + 1) * kChunkRows)};
+      const Range part{PushChunkBegin(chunk, head_rows), PushChunkEnd(count, chunk, head_rows)};
       range.end += part.end - part.begin;
       if (io.Status() != Result::kPending) continue;
       {
@@ -259,7 +265,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
       Store(*progress, Progress(args->sequence, ++completed));
       Barrier();
       if (!worker && mailbox) {
-        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence);
+        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence, head_rows);
         if (result) Fail(c, static_cast<Result>(result));
         head_notified = io.Notified();
       } else if (!worker && !head_notified) {
@@ -288,14 +294,14 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
     bool built = false;
     if (mailbox && chunked) {
       while (Load(c.built) < target && io.Check(false) == Result::kPending) {
-        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence);
+        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence, head_rows);
         if (result) Fail(c, static_cast<Result>(result));
         io.Relax(false);
       }
       built = Load(c.built) >= target;
-      const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+      const auto chunks = PushChunkCount(count, head_rows);
       while (built && io.Total() < chunks && io.Check(false) == Result::kPending) {
-        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence);
+        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence, head_rows);
         if (result) Fail(c, static_cast<Result>(result));
       }
       if (io.Check(false) == Result::kTimeout) Fail(c, Result::kTimeout);
@@ -384,6 +390,7 @@ std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
 namespace kvaf::cpu_push {
 std::uint32_t ExecuteCpuSglPush(CpuSglPushArgs* args) {
   const bool chunks = args && (args->write.execution.sequence & kChunkPipelineLaunch);
-  return args ? ExecuteCpuPush(&args->write.execution, &args->write.output_target, !chunks, chunks, &args->mailbox) : 1;
+  return args ? ExecuteCpuPush(&args->write.execution, &args->write.output_target, !chunks, chunks,
+      &args->mailbox, chunks ? PushLaunchHeadRows(args->write.execution.sequence) : kChunkRows) : 1;
 }
 }  // namespace kvaf::cpu_push

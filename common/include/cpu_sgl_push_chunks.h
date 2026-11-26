@@ -1,5 +1,5 @@
 #pragma once
-#include "cpu_sgl_push_abi.h"
+#include "cpu_sgl_push_layout.h"
 #ifndef KVAF_SGL_CHUNK_INLINE
 #define KVAF_SGL_CHUNK_INLINE inline
 #endif
@@ -23,8 +23,9 @@ template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t FailChunkControl(IO& io, 
   return posted ? posted : result;
 }
 template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t RelayReadyChunks(IO& io, std::uint32_t count,
-                                                std::uint32_t workers, std::uint64_t sequence) {
-  const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+                                                std::uint32_t workers, std::uint64_t sequence,
+                                                std::uint32_t head = kChunkRows) {
+  const auto chunks = PushChunkCount(count, head);
   for (std::uint32_t owner = 0; owner < workers; ++owner) {
     const auto token = io.ProgressWord(owner), epoch = token >> 32;
     if (epoch < sequence) continue;

@@ -1,5 +1,5 @@
 #pragma once
-#include "cpu_sgl_push_abi.h"
+#include "cpu_sgl_push_layout.h"
 #include "aicpu_urma/transport.h"
 
 namespace kvaf::cpu_push {
@@ -28,7 +28,7 @@ inline std::uint32_t RetireDescriptorMailbox(const MailboxLaunch& mailbox) {
   return aicpu_urma::UmdkTransferWait(&context, 0);
 }
 inline std::uint32_t PostChunkDescriptorMailbox(const MailboxLaunch& mailbox, const KernelArgs& a,
-    const Layout& layout, std::uint32_t count, std::uint32_t chunk, std::uint32_t owner, bool first, bool failed) {
+    const Layout& layout, std::uint32_t count, std::uint32_t chunk, std::uint32_t owner, bool first, bool failed, std::uint32_t head = kChunkRows) {
   aicpu_urma::UmdkTransfer transfers[5]{};
   std::uint32_t size = 0;
   auto add = [&](std::uint64_t local, std::uint64_t remote, std::uint64_t bytes) {
@@ -36,11 +36,11 @@ inline std::uint32_t PostChunkDescriptorMailbox(const MailboxLaunch& mailbox, co
   };
   if (first) { add(layout.request, layout.request, sizeof(Request)); add(layout.output_target, layout.output_target, sizeof(OutputTarget)); }
   if (!failed) {
-    const auto begin = chunk * kChunkRows, end = std::min(count, begin + kChunkRows);
+    const auto begin = PushChunkBegin(chunk, head), end = PushChunkEnd(count, chunk, head);
     add(layout.descriptor + std::uint64_t(begin) * 8, layout.descriptor + std::uint64_t(begin) * 8, std::uint64_t(end - begin) * 8);
   }
   const auto slot = failed ? kPushChunkCount + owner : chunk;
-  add(layout.staging + std::uint64_t(slot) * sizeof(Word), layout.ready + std::uint64_t(owner) * sizeof(Word), 8);
+  add(layout.staging + (failed ? std::uint64_t(slot) * sizeof(Word) : PushCommitOffset(chunk)), layout.ready + std::uint64_t(owner) * sizeof(Word), 8);
   if (first) add(layout.notify, layout.notify, 8);
   const aicpu_urma::UmdkContext context{mailbox.session, mailbox.owner_pid};
   return aicpu_urma::UmdkTransferPost(&context, transfers, size, 0);

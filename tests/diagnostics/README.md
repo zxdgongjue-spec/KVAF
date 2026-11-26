@@ -176,3 +176,11 @@ that the Head notify is posted before either initializing that bookkeeping or
 publishing the owner's local Ready word. It also covers split Heads across SQ
 wrap, first-build rejection, empty replay after a non-empty request, profiling
 disabled, and a failed first control CQE before notify without a phantom tail.
+
+Small-Head checks exercise H=128/256/512 and unaligned 1/7/1023 with 1024-row
+suffix chunks, replay at Head/chunk boundaries, 65 chunks at 65536 rows,
+separate immutable last-commit storage, invalid setup/header rejection, errors
+and STOP draining. The CPU provider delays progress publication during CQ
+polling to prove that `no_ready_inflight_us` measures the full gap, including
+work outside the individual progress scans. Default H=1024 keeps mode 5 and
+its existing layout. Small Heads use the separately negotiated mode 6 tag.

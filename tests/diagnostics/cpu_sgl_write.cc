@@ -29,10 +29,10 @@ struct Fixture {
   std::int32_t count{kCapacity};
   CpuSglWriteArgs direct_args;
   KernelArgs& args{direct_args.execution};
-  explicit Fixture(std::uint32_t workers = 4)
+  explicit Fixture(std::uint32_t workers = 4, std::uint32_t capacity = kCapacity)
       : statuses(workers), profiles(workers), source(8 * 4 * kBytes),
-        output(kCapacity * kBytes, 0xA5), addresses(8),
-        indices(kCapacity), offsets(kCapacity), rows(kCapacity) {
+        output(capacity * kBytes, 0xA5), addresses(8),
+        indices(capacity), offsets(capacity), rows(capacity) {
     assert(MakeLayout(kBytes, workers, &layout, true));
     assert(layout.bytes == layout.staging);  // No payload staging allocation.
     workspace = std::aligned_alloc(64, layout.bytes);
@@ -51,7 +51,7 @@ struct Fixture {
     args.request.offsets = reinterpret_cast<std::uint64_t>(offsets.data());
     args.request.output_indices = reinterpret_cast<std::uint64_t>(rows.data());
     args.request.miss_count = reinterpret_cast<std::uint64_t>(&count);
-    args.request.request_capacity = kCapacity;
+    args.request.request_capacity = capacity;
     args.request.token_bytes = kBytes;
     args.workspace = reinterpret_cast<std::uint64_t>(workspace);
     args.output = reinterpret_cast<std::uint64_t>(output.data());

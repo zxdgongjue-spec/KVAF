@@ -36,6 +36,10 @@ resources = kvaf.ExecutionResources(cores=4, sge_per_wr=4)
 新增资源开关 `sgl_push_chunked=True`，对应 CLI `--sgl-push-chunked`，选择 1024 行多段设备推送，
 日志/CSV 标识 `sgl_pipeline_mode=device_push_chunked`，并记录 `sgl_push_chunked=1`。
 该开关仅适用于两个 `cpu_sgl_push` 后端，与原 `--sgl-pipeline` 的逐 chunk READ 模式分别保留。
+新增资源 `sgl_push_head_rows`，默认 1024；非默认值要求同时启用 `sgl_push_chunked=True`。
+CLI 对应 `--sgl-push-chunked --sgl-push-head-rows 256`，AIV/AICPU 均支持 1..1024。
+例如 `kvaf.ExecutionResources(cores=4, sge_per_wr=4, sgl_push_chunked=True, sgl_push_head_rows=256)`。
+Head 行数按执行资源固定，图回放可改变有效请求长度；配置与 CSV 记录 `sgl_push_head_rows`。
 新算法不支持 `sgl_payload_only`；性能比较使用完整 kernel 和端到端计时。
 
 有效前缀的 `output_indices[i]` 必须等于 `i`，输出至少有
@@ -104,6 +108,21 @@ CPU 仍逐轮导入/释放输出 segment，这部分成本计入整体延迟。
 这是可重叠的“构建 → 推送地址 → CPU 更新/提交 → 数据 DMA”多段调度，
 并不保证所有阶段在每个时刻都重叠；核 0 自己构建时不同时操作控制 SQ。
 
+### 小 Head 与后续 1024 行分段
+
+设配置 Head 行数为 H，第一段为 `[0, min(count, H))`；第 c 段（c≥1）为
+`[H+(c-1)*1024, min(count, H+c*1024))`。全局段号仍由 `c % workers` 的 worker
+构建，CPU、设备发布和 SGE/WR 计划共用同一套边界计算。空请求仍不通知 CPU。
+H=256、count=8192 时共有 9 段：256 行 Head、7 段 1024 行、最后 768 行。
+在四条数据 Jetty、SGE4 下仍是 2048 个数据 WR，按段提交为 36 次 post 和 36 个尾 CQE；
+默认 H=1024 为 8 段、32 次 post/尾 CQE。缩短 Head 不保证同比缩短 kernel，须同时看后续供给和提交开销。
+
+默认 H=1024 保留 setup mode 5、原工作区大小和 launch ABI。小 Head 使用独立 setup 标记：
+`output_mode` 低 8 位为 6，高位保存 H；请求头 `reserved_words[0]=1024`、`[1]=H`。
+CPU 先验证协商值，再接受请求头；旧 CPU 服务会拒绝该 setup，旧 kernel 发出的固定 1024 头也会被拒绝。
+65536 行最多产生 65 段，新增第 65 个成功 commit 源放在原 `ChunkPushState` 尾后的一条 Word；
+原 64 个成功槽位、错误槽位和管理状态的偏移均保留，每条源数据继续保持到其控制 CQE 完成。
+
 流水发布后发生后缀错误时，CPU 不提交错误后缀，排空已提交的合法数据后返回失败 done。
 失败请求可能已写入 head，output 不可消费；按现有执行资源失效和重建流程处理。
 Shutdown 先确认设备发送 kernel 已停止，再销毁描述符发送队列；CPU STOP 完成后才释放
@@ -114,6 +133,7 @@ HBM 注册。无法确认 kernel 结束时保留两端目标内存，报告 `Com
 CPU service、NPU Host/Python 和设备 kernel 均须使用此版本重建，重启两端进程。
 仅更新 Host 无法启用新协议；不自动回退到旧 READ 模式。
 多段设备推送使用 setup output mode 5；旧 CPU service 会拒绝该模式，须同步更新两端。
+小 Head 还需要两端包含 mode 6 的协商及分段支持；启用前重建 CPU 服务、NPU Host/Python 和 kernel，重启两端。
 
 ```bash
 # CPU 端
@@ -174,6 +194,34 @@ AICPU 使用 `--backend cpu_sgl_push --aicpu-workers 4`，同样增加 `--sgl-pu
 `local_progress_polls` 是本地扫描轮数。`payload_post_us` 只计 provider 提交调用；
 `chunk_submit_us` 也包含该段 SGE 更新等工作，两个值不能相加。
 
+先固定一种图 API，再比较 Head 行数，例如在 NPU 端沿用服务地址和卡号：
+
+```bash
+for head in 1024 512 256 128; do
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend aiv_cpu_sgl_push --aiv-cores 4 --sge-per-wr 4 \
+    --sgl-push-chunked --sgl-push-head-rows "$head" \
+    --execution graph --graph-api acl \
+    --request-length 32768 --table-capacity 1277952 --miss-count 8192 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+    --warmup 10 --iterations 100 --kernel-profile \
+    --output-dir "reports/aiv-acl-head-${head}"
+done
+```
+
+AICPU 替换为 `--backend cpu_sgl_push --aicpu-workers 5`，使用另一组报告目录。
+本轮 `head_build` 测的是前 `min(count, H)` 行的实际构建；`head_doorbell` 的计时起点和提交边界保持不变。
+CPU 日志增加 `head_rows=H`，并新增完整的无就绪段时间：
+
+- `no_ready_us`：首次扫描确认没有可提交段，到后续发现就绪段的区间累计，包含区间内的扫描、循环和 CQ 回收。
+- `no_ready_inflight_us`：上述区间中，CPU 仍跟踪着未回收数据计划的部分。
+- `no_ready_idle_us`：上述区间中，CPU 没有在途数据计划的部分。
+
+后两者之和等于 `no_ready_us`；已知有就绪段但因 SQ credits/在途窗口等待的时间不计入。
+这些都是 CPU 观察到的 wall-clock 区间，包含 CPU 调度影响；“在途”不证明 DMA 始终忙碌。
+它们与 `chunk_ready_us`、部分 `chunk_cq_wait_us` 重叠，不能相加。以 kernel/端到端耗时判断净收益。
+
 AIV 的 `--kernel-profile-clock-mhz` 应按目标设备频率设置。另给旧后端加
 `--sgl-pipeline`、单独指定报告目录，可与旧逐 chunk 流水比较。
 将 `--sge-per-wr 4` 改为 8 可比较 SGE 数；不要在新后端加 `--sgl-payload-only`。
@@ -198,7 +246,7 @@ BATCH_GET_PROFILE ... stage=head_build mean_us=... p50_us=... p99_us=...
 BATCH_GET_PROFILE ... stage=head_doorbell mean_us=... p50_us=... p99_us=...
 ```
 
-- `head_build`：核 0 构建前 `min(count, 1024)` 个源地址清单的函数耗时。
+- `head_build`：核 0 构建前 `min(count, H)` 个源地址清单的函数耗时，H 默认 1024。
   AIV 包含 SIMT 查表/检查、UB 到 HBM 拷贝及其同步；AICPU 包含对应的地址填充循环和输出映射检查。
   请求头、输出描述准备和后缀构建不计入该值。
 - `head_doorbell`：从本轮最早设备 worker 进入，到核 0 提交含 Head notify 的最后一批控制 WRITE。
@@ -245,6 +293,9 @@ head/suffix 错误、等待 done、零描述符 READ、head CQE 未收齐时提�
 跨轮次进度、错误/STOP 排空和零描述符 READ。原生 AICPU post/wait 检查四条在途链、
 FIFO 回收/槽位复用及部分提交失败后 WR/SGE 存储保留；资源解析和 Python/子命令/CSV
 回归检查新增开关确实传递到 Get 配置且默认关闭。
+小 Head 覆盖 128/256/512、非对齐 1/7/1023、Head/后续段边界、65 段上限、
+旧式请求头/错误协商拒绝、失败/STOP、不同输出目标的计划复用；延迟进度发布的模型验证
+`no_ready_inflight_us` 覆盖完整等待区间而不只是本地扫描耗时。
 没有 UMDK 头文件时跳过 CPU 传输模型和原生 UMDK 语法检查。
 
 这些检查不替代 CANN/ccec 编译、真实 DMA 可见性、注册退役及 NPU 图回放验证。

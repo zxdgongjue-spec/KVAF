@@ -44,6 +44,7 @@ class Transport {
     std::uint64_t head_submit_ns{}, head_cq_wait_ns{}, suffix_wait_ns{}, suffix_read_ns{};
     std::uint64_t suffix_submit_ns{}, suffix_cq_wait_ns{};
     std::uint64_t chunk_ready_ns{}, chunk_read_ns{}, chunk_submit_ns{}, chunk_cq_wait_ns{};
+    std::uint64_t no_ready_inflight_ns{}, no_ready_idle_ns{};
     std::uint32_t chunks{}, progress_reads{}, max_inflight{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
@@ -106,7 +107,7 @@ class Transport {
   PreparedWrite done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
-  std::uint32_t head_count_{}, head_waves_{};
+  std::uint32_t head_count_{}, head_waves_{}, head_rows_{kChunkRows};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};

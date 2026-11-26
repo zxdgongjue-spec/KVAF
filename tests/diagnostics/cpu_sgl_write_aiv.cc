@@ -20,15 +20,15 @@ struct Fixture {
   std::vector<int32_t> indices, offsets, rows;
   int32_t count{};
   CpuSglWriteArgs args{};
-  explicit Fixture(uint32_t workers) : statuses(workers), profiles(workers),
-      source(kCapacity * kBytes * 2), output(kCapacity * kBytes, 0xcc), valid(kCapacity, 1),
-      addresses(kCapacity), indices(kCapacity), offsets(kCapacity), rows(kCapacity) {
+  explicit Fixture(uint32_t workers, uint32_t capacity = kCapacity) : statuses(workers), profiles(workers),
+      source(capacity * kBytes * 2), output(capacity * kBytes, 0xcc), valid(capacity, 1),
+      addresses(capacity), indices(capacity), offsets(capacity), rows(capacity) {
     assert(MakeLayout(kBytes, workers, &layout, true));
     workspace.resize(layout.bytes / sizeof(Word));
     for (uint32_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 37 + i / kBytes);
-    for (uint32_t i = 0; i < kCapacity; ++i) {
+    for (uint32_t i = 0; i < capacity; ++i) {
       addresses[i] = reinterpret_cast<uint64_t>(source.data() + i * kBytes * 2);
-      indices[i] = (i * 7) % kCapacity; offsets[i] = (i % 2) * kBytes; rows[i] = i;
+      indices[i] = (i * 7) % capacity; offsets[i] = (i % 2) * kBytes; rows[i] = i;
     }
     auto& a = args.execution;
     auto& r = a.request;
@@ -38,7 +38,7 @@ struct Fixture {
     r.offsets = reinterpret_cast<uint64_t>(offsets.data());
     r.output_indices = reinterpret_cast<uint64_t>(rows.data());
     r.miss_count = reinterpret_cast<uint64_t>(&count);
-    r.table_capacity = r.request_capacity = kCapacity;
+    r.table_capacity = r.request_capacity = capacity;
     r.token_bytes = kBytes; r.block_bytes = kBytes * 2;
     r.canonical_base = reinterpret_cast<uint64_t>(source.data()); r.logical_bytes = source.size();
     a.workspace = reinterpret_cast<uint64_t>(workspace.data());
