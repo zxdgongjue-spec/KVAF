@@ -8,6 +8,7 @@ struct PushFixture : Fixture {
   AivMailboxContext context{};
   std::vector<uint32_t> sq, cq;
   uint32_t sq_db{}, cq_db{}, consumed{}, produced{};
+  uint64_t head_commit_cycle{};
   static inline PushFixture* active{};
   explicit PushFixture(uint32_t workers) : Fixture(workers), mailbox(layout.staging / 64), sq(64 * 16), cq(64 * 8) {
     args.execution.sequence = kPipelineLaunch;
@@ -38,7 +39,10 @@ struct PushFixture : Fixture {
       assert(local >= f.args.execution.workspace && local + bytes <= f.args.execution.workspace + f.layout.staging);
       // Do not overwrite CPU-owned done/Ready sources.
       assert(remote + bytes <= base + 128 || remote >= base + f.layout.output_target);
-      if (bytes == 8) sgl_model::Store(remote, *reinterpret_cast<const uint64_t*>(local));
+      if (bytes == 8) {
+        if (remote == base + 64) f.head_commit_cycle = AscendC::GetSystemCycle();
+        sgl_model::Store(remote, *reinterpret_cast<const uint64_t*>(local));
+      }
       else std::memcpy(reinterpret_cast<void*>(remote), reinterpret_cast<void*>(local), bytes);
       if (w[0] & (1U << 21)) {
         f.cq[(f.produced % 64) * 8] = (1U - ((f.produced / 64) & 1U)) << 2;
@@ -100,8 +104,23 @@ int main() {
       auto work = f.LaunchPush();
       if (count) { f.WaitHead(sequence); for (auto& w : work) assert(w.wait_for(1ms) == std::future_status::timeout); f.FinishCpu(sequence); }
       f.Check(work, sequence, Result::kOk);
+      if (count) assert(f.profiles[0].enter_ns + f.profiles[0].head_doorbell_ns >= f.head_commit_cycle);
       assert(f.context.queue.cq_consumer_index == f.produced);
     }
+  }
+  {
+    // The Head spans several control batches and SQ wraps. Record its final
+    // commit doorbell, not the first batch or a later suffix/CQ observation.
+    PushFixture f(4); f.count = 1025; f.context.max_write_bytes = 64;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+    assert(f.profiles[0].enter_ns + f.profiles[0].head_doorbell_ns >= f.head_commit_cycle);
+    assert(f.context.queue.cq_consumer_index == f.produced);
+  }
+  {
+    PushFixture f(4); f.count = 7; f.args.execution.profile = 0;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1);
+    for (auto& w : work) { assert(w.wait_for(5s) == std::future_status::ready); w.get(); }
+    for (const auto& p : f.profiles) assert(!p.head_build_ns && !p.head_doorbell_ns && !p.head_profile_tag);
   }
   {
     PushFixture f(4); f.count = 9001; f.rows[7000] = 0;

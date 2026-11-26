@@ -9,13 +9,73 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-from test_npu_batch_get_perf import device_profile_ms, parse_args, print_measurements, validate_args, validate_sgl_payload_sample
+from test_npu_batch_get_perf import device_profile_ms, parse_args, print_measurements, sgl_head_timings, validate_args, validate_sgl_payload_sample
 from utils.batch_get_csv import BatchGetCsv
 from utils.get_options import workload_command
 from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_head_profiles_use_publisher_and_preserve_clock_and_overlap(self):
+        for backend in ("aiv_cpu_sgl_push", "cpu_sgl_push"):
+            aiv = backend.startswith("aiv_")
+            clock = 500
+            scale = clock if aiv else 1000
+            args = parse_args(["--backend", backend, "--workers", "2", "--miss-count", "7",
+                               "--kernel-profile", "--kernel-profile-clock-mhz", str(clock)])
+            self.assertIsNone(validate_args(args))
+            workers = []
+            for core in (0, 1):
+                start = 1_000_000 + (10 * scale if core == 0 else 0)
+                if aiv:
+                    workers.append(dict(core=core, kernel_start_cycle=start, kernel_finish_cycle=1_000_000 + 100 * scale,
+                                        sgl_request_cycles=30 * scale, sgl_notify_cycles=3 * scale, sgl_ack_cycles=50 * scale,
+                                        sgl_head_build_cycles=8 * scale if core == 0 else 0,
+                                        sgl_head_doorbell_cycles=20 * scale if core == 0 else 0))
+                else:
+                    stages = {name + "_us": 0 for name in
+                              ("request", "descriptor_cache", "source_write", "notify", "read", "read_setup",
+                               "wr_build", "ready_wait", "post", "cq_wait", "scatter", "ack")}
+                    stages.update(request_us=30, notify_us=3 if core == 0 else 0, ack_us=50 if core == 0 else 0,
+                                  head_build_us=8 if core == 0 else 0, head_doorbell_us=20 if core == 0 else 0)
+                    workers.append(dict(core=core, device_start_ns=start, device_finish_ns=1_000_000 + 100 * scale,
+                                        stages=stages))
+            # Core 0 entered 10 us later. Its 20-us prefix becomes 30 us from
+            # the first worker entry; the nested 8-us build is not added again.
+            self.assertEqual(sgl_head_timings(workers, clock, 7), dict(head_build=8, head_doorbell=30))
+            self.assertAlmostEqual(device_profile_ms(workers, clock), .1)
+            with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()) as output:
+                args.output_dir = Path(directory)
+                report = BatchGetCsv(args)
+                print_measurements(args, "graph", [.12], [workers], report)
+                report.write()
+                self.assertIn("stage=head_build mean_us=8.000000", output.getvalue())
+                self.assertIn("stage=head_doorbell mean_us=30.000000", output.getvalue())
+                self.assertIn("stages_overlap=1", output.getvalue())
+                with report.profile_path.open() as source:
+                    rows = list(csv.DictReader(source))
+                self.assertEqual({row["name"]: row["value"] for row in rows
+                                  if row["kind"] == "stage" and row["metric"] == "mean_us" and row["name"].startswith("head_")},
+                                 dict(head_build="8.000000", head_doorbell="30.000000"))
+            target = workers[0] if aiv else workers[0]["stages"]
+            key = "sgl_head_doorbell_cycles" if aiv else "head_doorbell_us"
+            saved = target.pop(key)
+            with redirect_stdout(StringIO()) as output, self.assertRaisesRegex(AssertionError, "Head profile"):
+                print_measurements(args, "graph", [.12], [workers])
+            self.assertEqual(output.getvalue(), "")
+            target[key] = saved
+            for invalid in (-1, float("nan"), 101 * scale if aiv else 101, 1):
+                target[key] = invalid
+                with self.assertRaisesRegex(AssertionError, "Head profile"):
+                    sgl_head_timings(workers, clock, 7)
+            target[key] = saved
+            for w in workers:
+                fields = w if aiv else w["stages"]
+                for name in (("sgl_head_build_cycles", "sgl_head_doorbell_cycles") if aiv else
+                             ("head_build_us", "head_doorbell_us")):
+                    fields[name] = 0
+            self.assertEqual(sgl_head_timings(workers, clock, 0), dict(head_build=0, head_doorbell=0))
+
     def test_device_push_is_a_distinct_pipelined_algorithm(self):
         kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
                                PutExecutionConfig=lambda *args: args,

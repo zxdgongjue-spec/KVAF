@@ -38,7 +38,8 @@ __aicore__ inline uint64_t RetireDeferredMailbox(const MailboxLaunch& mailbox) {
 }
 
 __aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const KernelArgs& a,
-    uint64_t descriptor_offset, uint64_t target_offset, uint32_t count, bool suffix, bool failed = false) {
+    uint64_t descriptor_offset, uint64_t target_offset, uint32_t count, bool suffix, bool failed = false,
+    __gm__ volatile BatchGetWorkerProfile* profile = nullptr) {
   auto* context = reinterpret_cast<__gm__ AivMailboxContext*>(mailbox.aiv_context);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(mailbox.aiv_context + offsetof(AivMailboxContext, queue));
   if (!context || !state) return uint64_t(Result::kTransportError);
@@ -120,6 +121,8 @@ __aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const Kerne
     // start payload DMA while core 0 retires this control completion.
     const bool last = region == regions;
     st_dev(static_cast<uint32_t>(pi + wrs), reinterpret_cast<__gm__ uint32_t*>(e.sq_db_va), 0);
+    if (last && !suffix && profile)
+      profile->head_doorbell_ns = GetSystemCycle() - profile->enter_ns;
     if (last) return 0U;
     const auto result = WaitMailboxCqe(mailbox, &context->entity, state);
     if (result) return result;

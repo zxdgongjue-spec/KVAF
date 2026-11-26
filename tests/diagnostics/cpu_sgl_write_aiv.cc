@@ -127,7 +127,16 @@ struct Fixture {
       }
       if (w) assert(profiles[w].notify_ns == 0 && profiles[w].ack_ns == 0);
       assert(profiles[w].bytes == profiles[w].spans * kBytes);
-      assert(profiles[w].input_cache_ns == 0 && profiles[w].descriptor_cache_ns == 0 && profiles[w].source_write_ns == 0);
+      if (kvaf::HasCpuSglPushHeadProfile(profiles[w])) {
+        const auto build = profiles[w].head_build_ns, posted = profiles[w].head_doorbell_ns;
+        assert(build <= profiles[w].exit_ns - profiles[w].enter_ns);
+        assert(posted <= profiles[w].exit_ns - profiles[w].enter_ns);
+        if (w || !count) assert(build == 0 && posted == 0);
+        else {
+          assert(build > 0);
+          if (result == Result::kOk) assert(posted >= build);
+        }
+      } else assert(profiles[w].input_cache_ns == 0 && profiles[w].descriptor_cache_ns == 0 && profiles[w].source_write_ns == 0);
       assert(profiles[w].read_ns == 0 && profiles[w].read_setup_ns == 0 && profiles[w].wr_build_ns == 0);
       assert(profiles[w].ready_wait_ns == 0 && profiles[w].post_ns == 0 && profiles[w].cq_wait_ns == 0);
       assert(profiles[w].read_wqes == 0 && profiles[w].post_calls == 0 && profiles[w].output_cache_ns == 0);

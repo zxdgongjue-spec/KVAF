@@ -348,6 +348,14 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
   }
   const auto profile = View().profile;
   auto copied = detail::CopyAicpuProfiles(profile.device, profile.host, s.config.workers, profiles);
+  if (copied.ok() && s.config.device_push) for (std::size_t i = 0; i < profiles->size(); ++i) {
+    const auto& raw = (*profiles)[i].aicpu_profile;
+    const auto wall = raw.exit_ns - raw.enter_ns;
+    if (!HasCpuSglPushHeadProfile(raw) || raw.head_build_ns > wall || raw.head_doorbell_ns > wall ||
+        (raw.head_doorbell_ns && raw.head_build_ns > raw.head_doorbell_ns) ||
+        (i && (raw.head_build_ns || raw.head_doorbell_ns)))
+      return Status::InvalidState("invalid or missing CPU SGL Push Head profile; rebuild the matching NPU Host and kernel");
+  }
   if (copied.ok() && s.config.aiv) for (auto& p : *profiles) {
     // These three stages are disjoint within one worker. Check raw cycles so
     // broken timestamps cannot turn into a plausible-looking bandwidth result.

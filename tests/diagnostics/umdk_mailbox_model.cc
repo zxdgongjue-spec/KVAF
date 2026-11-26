@@ -1,6 +1,10 @@
 #include "aicpu_urma/control_abi.h"
 #include <atomic>
 #include <cstring>
+#include <chrono>
+namespace mailbox_model {
+std::uint64_t first_wait_ns{};
+}
 namespace kvaf::aicpu_urma {
 // CPU-only protocol model: ordered writes become visible before the final
 // release word. Production uses the real asynchronous UMDK queue implementation.
@@ -15,5 +19,10 @@ std::uint32_t UmdkTransferPost(const UmdkContext*, const UmdkTransfer* transfers
   }
   return 0;
 }
-std::uint32_t UmdkTransferWait(const UmdkContext*, std::uint32_t) { return 0; }
+std::uint32_t UmdkTransferWait(const UmdkContext*, std::uint32_t) {
+  if (!mailbox_model::first_wait_ns)
+    mailbox_model::first_wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  return 0;
+}
 }

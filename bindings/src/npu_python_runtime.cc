@@ -280,6 +280,13 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
     WORKER_TIME(scatter);
     WORKER_TIME(output_cache);
 #undef WORKER_TIME
+    if (HasCpuSglPushHeadProfile(sample)) {
+      worker["input_cache_us"] = 0.0;
+      worker["descriptor_cache_us"] = 0.0;
+      worker["source_write_us"] = 0.0;
+      worker["head_build_us"] = sample.head_build_ns / 1000.0;
+      worker["head_doorbell_us"] = sample.head_doorbell_ns / 1000.0;
+    }
     worker["bytes"] = sample.bytes;
     worker["spans"] = sample.spans;
     worker["read_wqes"] = sample.read_wqes;
@@ -801,6 +808,10 @@ class NpuPythonRuntime final {
         item["sgl_ack_cycles"] = profile.aicpu_profile.ack_ns;
         item["sgl_scatter_copies"] = profile.aicpu_profile.scatter_copies;
         item["sgl_ready_queries"] = profile.aicpu_profile.ready_queries;
+        if (HasCpuSglPushHeadProfile(profile.aicpu_profile)) {
+          item["sgl_head_build_cycles"] = profile.aicpu_profile.head_build_ns;
+          item["sgl_head_doorbell_cycles"] = profile.aicpu_profile.head_doorbell_ns;
+        }
       }
       if (profile.device_start_ns) {
         item["device_start_ns"] = profile.device_start_ns;

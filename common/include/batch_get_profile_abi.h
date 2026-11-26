@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace kvaf {
@@ -14,8 +15,13 @@ struct CpuSglWriteSample {
 // fields rather than presenting them as nanoseconds. CPU samples stay in ns.
 struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t enter_ns{}, exit_ns{};
-  std::uint64_t request_ns{}, input_cache_ns{}, descriptor_cache_ns{};
-  std::uint64_t source_write_ns{}, notify_ns{}, read_ns{}, ack_ns{};
+  std::uint64_t request_ns{};
+  // Device-push SGL owns these otherwise unused slots. The tag distinguishes
+  // nested Head timings from legacy cache/write stages without changing stride.
+  union { std::uint64_t input_cache_ns{}; std::uint64_t head_build_ns; };
+  union { std::uint64_t descriptor_cache_ns{}; std::uint64_t head_doorbell_ns; };
+  union { std::uint64_t source_write_ns{}; std::uint64_t head_profile_tag; };
+  std::uint64_t notify_ns{}, read_ns{}, ack_ns{};
   std::uint64_t read_setup_ns{}, wr_build_ns{}, ready_wait_ns{}, post_ns{}, cq_wait_ns{};
   std::uint64_t bytes{}, spans{}, read_wqes{}, post_calls{}, ready_queries{};
   std::uint64_t scatter_ns{}, output_cache_ns{};
@@ -23,5 +29,12 @@ struct alignas(64) BatchGetWorkerProfile {
   CpuSglWriteSample cpu_sgl_write{};
 };
 static_assert(sizeof(BatchGetWorkerProfile) == 192);
+static_assert(offsetof(BatchGetWorkerProfile, head_build_ns) == 24 &&
+              offsetof(BatchGetWorkerProfile, head_doorbell_ns) == 32 &&
+              offsetof(BatchGetWorkerProfile, head_profile_tag) == 40);
+constexpr std::uint64_t kCpuSglPushHeadProfileV1 = 0x53474c4845414431ULL;  // SGLHEAD1
+inline bool HasCpuSglPushHeadProfile(const BatchGetWorkerProfile& p) {
+  return p.head_profile_tag == kCpuSglPushHeadProfileV1;
+}
 
 }  // namespace kvaf

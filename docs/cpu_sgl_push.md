@@ -126,6 +126,38 @@ CPU profiling 输出 `CPU_SGL_PUSH_PROFILE`：`descriptor_reads=0`、`ready_wrs=
 设备 profile 的 scatter 和 ready 查询均为零，ack 包含 CPU 数据传输和完成等待。
 关闭 CPU 源地址扫描只需更新、重建 CPU 服务并重启，NPU Host/kernel 和测试命令无需修改。
 
+### 设备 Head 独立打点
+
+新 NPU Host/Python 和 kernel 增加两个独立指标，原测试命令加上已有的
+`--kernel-profile` 即会输出，并写入 `profile.csv`：
+
+```text
+BATCH_GET_PROFILE ... stage=head_build mean_us=... p50_us=... p99_us=...
+BATCH_GET_PROFILE ... stage=head_doorbell mean_us=... p50_us=... p99_us=...
+```
+
+- `head_build`：核 0 构建前 `min(count, 1024)` 个源地址清单的函数耗时。
+  AIV 包含 SIMT 查表/检查、UB 到 HBM 拷贝及其同步；AICPU 包含对应的地址填充循环和输出映射检查。
+  请求头、输出描述准备和后缀构建不计入该值。
+- `head_doorbell`：从本轮最早设备 worker 进入，到核 0 提交含 Head notify 的最后一批控制 WRITE。
+  AIV 在实际 `st_dev` doorbell 后记录；AICPU 的 provider 内部操作 doorbell，故以
+  `urma_post_jetty_send_wr` 成功返回作为可观察边界，不等待控制 CQE。
+  日志的 `head_doorbell_boundary=doorbell/native_post_return` 标明两者区别。
+
+原始记录仅核 0 保存 Head 耗时，其他核和空请求为 0，每轮回放重新初始化。
+Python snapshot 的 AIV 原始字段为 `sgl_head_build_cycles`、`sgl_head_doorbell_cycles`，
+AICPU 为 worker stages 中的 `head_build_us`、`head_doorbell_us`。
+snapshot 的 doorbell 值相对核 0 自身入口；benchmark 根据各核入口时间换算为相对最早 worker，
+避免漏掉发布核较晚开始执行的间隔。AIV 换算仍使用 `--kernel-profile-clock-mhz`。
+
+这两个指标相互嵌套，并与原 `request/notify` 重叠，不能相加。
+它们不包含 CPU 观察 notify 的延迟及首次数据 WRITE 的准备时间，也不测出地址清单的纯网络耗时。
+当前仍为 Head/Suffix 两段流程，新增打点不会改为逐 chunk 发布。
+
+Head 打点使用带版本标记的现有 profile 槽位，记录大小仍为 192 B，旧算法的字段含义不变。
+测这两个新指标须同步重建 NPU Host/Python 和所选 kernel；CPU 服务无需为此重建。
+Host/脚本遇到缺失或越过 kernel 时间窗口的 Head 记录会报错，避免将旧版本记录当作 0。
+
 若在 `CPU_PUSH_INIT stage=register_control` 后报注册失败，先确认 CPU 服务已包含
 mailbox 权限修复：新 mailbox 注册使用 `READ | WRITE`（access=6）。URMA 的
 `LOCAL_ONLY`（bit 0）不能与远端权限组合，WRITE 注册还要求 READ；access=5 会被拒绝。

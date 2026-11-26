@@ -137,7 +137,10 @@ struct Execution {
     const auto head = std::min(*count, kPipelineHeadRows);
     const auto build_range = !pipeline ? *range : !worker ? Range{0, head} :
         Range{std::max(range->begin, head), std::max(range->end, head)};
-    if (!chunked && !FillSources(build_range)) return false;
+    {
+      BatchGetProfileScope head_timer(mailbox && profile && !worker && *count ? &profile->head_build_ns : nullptr);
+      if (!chunked && !FillSources(build_range)) return false;
+    }
     if (!worker) {
       auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
       *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, direct ? kDirectOutput : kScatterOutput, {}};
@@ -154,13 +157,19 @@ struct Execution {
     auto* notify = reinterpret_cast<Word*>(Memory() + layout.notify);
     Store(*notify, args.sequence | (profile ? kProfileNotify : 0));
     Barrier();
-    if (mailbox && PostDescriptorMailbox(*mailbox, args, layout, count, false)) Fail(coordination, Result::kTransportError);
+    if (mailbox) {
+      if (PostDescriptorMailbox(*mailbox, args, layout, count, false)) Fail(coordination, Result::kTransportError);
+      // The native provider owns the doorbell; successful post return is our
+      // observable submission boundary. No control CQE is waited here.
+      else if (profile) profile->head_doorbell_ns = BatchGetProfileNowNs() - profile->enter_ns;
+    }
   }
 };
 }  // namespace
 
 static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target,
                                     bool pipeline = false, bool chunked = false, const MailboxLaunch* mailbox = nullptr) {
+  const auto entered = mailbox && args && args->profile ? BatchGetProfileNowNs() : 0;
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
@@ -176,7 +185,10 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   const auto target = args->sequence * args->workers;
   BatchGetWorkerProfile measured{};
   auto* profile = args->profile ? &measured : nullptr;
-  if (profile) profile->enter_ns = BatchGetProfileNowNs();
+  if (profile) {
+    profile->enter_ns = entered ? entered : BatchGetProfileNowNs();
+    if (mailbox) profile->head_profile_tag = kCpuSglPushHeadProfileV1;
+  }
   Execution io{*args, output_target, layout, c, CounterNow(),
       CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox};
   std::uint32_t count = 0;

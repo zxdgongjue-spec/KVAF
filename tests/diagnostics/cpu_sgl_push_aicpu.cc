@@ -2,9 +2,11 @@
 #include "cpu_sgl_write.cc"
 #undef KVAF_CPU_SGL_REUSE_FIXTURE
 #include <iostream>
+namespace mailbox_model { extern std::uint64_t first_wait_ns; }
 
 namespace {
 void RunPush(Fixture& f, Result expected = Result::kOk) {
+  mailbox_model::first_wait_ns = 0;
   std::vector<Word> mailbox(f.layout.staging / 64);
   const auto remote = reinterpret_cast<uint64_t>(mailbox.data());
   CpuSglPushArgs pushed{f.direct_args, {remote, f.layout.staging, 0, 1, 1}};
@@ -60,6 +62,14 @@ void RunPush(Fixture& f, Result expected = Result::kOk) {
     reported |= status.result == uint64_t(expected) && status.sequence == sequence;
     if (expected == Result::kOk) assert(status.result == uint64_t(expected) && status.sequence == sequence);
     assert(f.profiles[w].scatter_copies == 0 && f.profiles[w].ready_queries == 0);
+    if (expected == Result::kOk && f.args.profile) {
+      const auto& p = f.profiles[w];
+      assert(HasCpuSglPushHeadProfile(p));
+      if (w || !f.count) assert(p.head_build_ns == 0 && p.head_doorbell_ns == 0);
+      else assert(p.head_build_ns > 0 && p.head_doorbell_ns >= p.head_build_ns &&
+                  p.head_doorbell_ns <= p.exit_ns - p.enter_ns &&
+                  p.enter_ns + p.head_doorbell_ns <= mailbox_model::first_wait_ns);
+    }
   }
   assert(reported);
   if (expected == Result::kOk) for (int i = 0; i < f.count; ++i)
@@ -73,5 +83,7 @@ int main() {
   }
   { Fixture f(4); f.rows[0] = -1; RunPush(f, Result::kInvalidRequest); }
   { Fixture f(4); f.rows[3000] = 0; RunPush(f, Result::kInvalidRequest); }
+  { Fixture f(4); f.count = 7; f.args.profile = 0; RunPush(f);
+    for (const auto& p : f.profiles) assert(!p.head_build_ns && !p.head_doorbell_ns && !p.head_profile_tag); }
   std::cout << "AICPU device-push SGL mailbox model passed\n";
 }

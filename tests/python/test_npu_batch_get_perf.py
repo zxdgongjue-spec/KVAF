@@ -32,6 +32,7 @@ environment variables:
 from __future__ import annotations
 
 import argparse
+import math
 from copy import deepcopy
 import os
 from pathlib import Path
@@ -219,6 +220,51 @@ def print_aiv_sgl_details(args, execution, samples, details=None):
                           metrics, details, "stage", stage)
 
 
+def sgl_head_timings(workers, clock_mhz, active_rows):
+    """Nested Head timings; normalize the publisher prefix to first worker entry."""
+    nanoseconds = "device_start_ns" in workers[0]
+    begin, end = (("device_start_ns", "device_finish_ns") if nanoseconds else
+                  ("kernel_start_cycle", "kernel_finish_cycle"))
+    scale = 1000.0 if nanoseconds else clock_mhz
+    origin = min(int(w[begin]) for w in workers)
+    result = None
+    for index, worker in enumerate(workers):
+        core = int(worker.get("core", index))
+        fields = worker.get("stages", {}) if nanoseconds else worker
+        keys = (("head_build_us", "head_doorbell_us") if nanoseconds else
+                ("sgl_head_build_cycles", "sgl_head_doorbell_cycles"))
+        values = [float(fields.get(key, -1)) for key in keys]
+        if not nanoseconds:
+            values = [value / scale for value in values]
+        build, doorbell = values
+        wall = (int(worker[end]) - int(worker[begin])) / scale
+        if (not all(math.isfinite(v) and 0 <= v <= wall for v in values) or
+                (doorbell and build > doorbell) or (core and (build or doorbell)) or
+                (not core and active_rows > 0 and not (build and doorbell)) or
+                (not active_rows and (build or doorbell))):
+            raise AssertionError("invalid or missing CPU SGL Push Head profile; rebuild the matching NPU Host and kernel")
+        if not core:
+            if result is not None:
+                raise AssertionError("duplicate CPU SGL Push Head publisher")
+            result = dict(head_build=build, head_doorbell=doorbell +
+                          ((int(worker[begin]) - origin) / scale if doorbell else 0))
+    if result is None:
+        raise AssertionError("missing CPU SGL Push Head publisher")
+    return result
+
+
+def print_sgl_head_details(args, execution, timings, details=None):
+    boundary = "native_post_return" if uses_aicpu(args) else "doorbell"
+    print(f"BATCH_GET_HEAD_PROFILE_CONTRACT backend={args.backend} execution={execution} "
+          f"publisher=0 head_doorbell_origin=first_worker_entry head_doorbell_boundary={boundary} stages_overlap=1")
+    for stage in ("head_build", "head_doorbell"):
+        values = [sample[stage] for sample in timings]
+        metrics = dict(mean_us=f"{statistics.mean(values):.6f}", p50_us=f"{percentile(values, .5):.6f}",
+                       p99_us=f"{percentile(values, .99):.6f}")
+        print_profile_row("BATCH_GET_PROFILE", dict(backend=args.backend, execution=execution, stage=stage),
+                          metrics, details, "stage", stage)
+
+
 def validate_sgl_payload_sample(workers, rows):
     if not workers or "cpu_sgl_waves" not in workers[0]:
         raise RuntimeError("missing CPU SGL sample; rebuild the matching CPU service, NPU host and AICPU kernel")
@@ -237,6 +283,8 @@ def print_measurements(args, execution, samples, profiles, report=None):
     if len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     kernel_samples = [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles]
+    head_timings = ([sgl_head_timings(p, args.kernel_profile_clock_mhz, args.miss_count) for p in profiles]
+                    if args.backend in ("cpu_sgl_push", "aiv_cpu_sgl_push") else None)
     kernel_source = "device_ns" if uses_aicpu(args) else "device_cycles"
     scopes.append(("kernel", kernel_samples, kernel_source))
     if args.sgl_payload_only:
@@ -288,6 +336,8 @@ def print_measurements(args, execution, samples, profiles, report=None):
                   f"e2e_timing_source={e2e_source}", flush=True)
     if args.kernel_profile:
         details = [] if report is not None and report.profile_path is not None else None
+        if head_timings is not None:
+            print_sgl_head_details(args, execution, head_timings, details)
         if args.backend in ("aiv_cpu_sgl_write", "aiv_cpu_sgl_push"):
             print_aiv_sgl_details(args, execution, profiles, details)
         elif uses_aicpu(args):

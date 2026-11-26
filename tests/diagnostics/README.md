@@ -153,3 +153,9 @@ CPU source-range scanning is disabled for both head and suffix, while request
 sequence and output capacity checks remain active. Legacy READ-based cases
 continue to reject invalid source ranges. See
 [CPU SGL Push](../../docs/cpu_sgl_push.md) for the API, pipeline and comparisons.
+
+Head profile regressions cover both executors, empty/small/replayed requests,
+profiling disabled, final Head doorbells across multiple WQE batches, and
+submission timestamps before control-CQE retirement. Python checks verify
+cycle/ns conversion, late publisher entry, nested timing bounds, missing Host/
+kernel fields, and console/CSV reporting without adding overlapping stages.
