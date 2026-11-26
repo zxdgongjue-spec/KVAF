@@ -9,7 +9,7 @@ from .get_options import parallelism_field
 
 
 def run_worker(kvaf, torch, args, runtime, execution, output,
-               make_plan, submit, check_output):
+               make_plan, submit, check_output, summarize_profile):
     control = args.contention_control_dir
     device = args.device_id
     stream = torch.npu.current_stream()
@@ -37,6 +37,7 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
         remaining = window["start"] - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
+        profiles = []
         begin = time.monotonic()
         batches = 0
         while time.monotonic() < window["stop"]:
@@ -45,6 +46,8 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
             graph.replay()
             graph.synchronize()
             batches += 1
+            if args.kernel_profile:
+                profiles.append(runtime.batch_get_kernel_profile(graph_lease=leases[-1]))
         end = time.monotonic()
         if not batches:
             raise RuntimeError("worker missed the measurement window")
@@ -59,10 +62,12 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
             "graph_calls": len(plans), "graphs": 1, "batches": batches, "verified": True,
             "request_length": args.request_length, "miss_count": args.miss_count,
             parallelism_field(args.backend): args.parallelism,
-            "profiling_enabled": False,
+            "profiling_enabled": args.kernel_profile,
             "execution_mode": args.execution_mode,
         }
         if args.backend == "aiv":
             result["jettys_per_core"] = args.jettys_per_core
+    if args.kernel_profile:
+        result["kernel_profile"] = summarize_profile(args, profiles)
     args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
     print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)

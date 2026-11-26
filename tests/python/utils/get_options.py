@@ -86,6 +86,14 @@ def add_workload_arguments(parser, *, defaults=None, request_aliases=()):
                        help="setup-only Put chunk size; does not change the Get workload")
 
 
+def add_kernel_profile_arguments(parser, help_text):
+    parser.add_argument("--kernel-profile", action="store_true", help=help_text)
+    parser.add_argument("--kernel-profile-clock-mhz", type=int,
+                        default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
+                            environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
+                        help="AIV clock for converting cycles to time; unused by AICPU")
+
+
 def add_backend_arguments(parser, *, sweep=False):
     group = parser.add_argument_group("Get backend and execution resources")
     group.add_argument("--backend", choices=BACKENDS, help="Get implementation")

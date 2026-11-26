@@ -15,7 +15,8 @@ import sys
 import time
 
 from utils.get_options import (
-    add_backend_arguments, add_workload_arguments, configure_backend_help, gather_read_wave_settings, parallelism_field,
+    add_backend_arguments, add_kernel_profile_arguments, add_workload_arguments, configure_backend_help,
+    gather_read_wave_settings, parallelism_field,
     resolve_backend, validate_workload, workload_command,
 )
 from utils.perf_execution import add_execution_metadata
@@ -89,6 +90,8 @@ def run_group(args, devices, directory):
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
             ]
+            if args.kernel_profile:
+                command.extend(["--kernel-profile", "--kernel-profile-clock-mhz", str(args.kernel_profile_clock_mhz)])
             print(f"MULTICARD_WORKER phase={directory.name} device={device} peer={peer} log={log_path}", flush=True)
             process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
@@ -168,6 +171,15 @@ def write_summary(directory, isolated, concurrent, config=None):
             "concurrent_GBps": shared["bandwidth_GBps"],
             "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
         }
+        if config.get("kernel_profile"):
+            for phase, result in (("isolated", solo), ("concurrent", shared)):
+                profile = result["kernel_profile"]
+                if not result["profiling_enabled"] or profile["samples"] != result["batches"]:
+                    raise ValueError(f"incomplete {phase} kernel profile for device {result['device']}")
+                for name in ("samples", "mean_us", "p50_us", "mean_GBps", "p50_GBps"):
+                    row[f"{phase}_kernel_{name}"] = profile[name]
+                if row["backend"] == "aiv":
+                    row[f"{phase}_kernel_max_core_p50_GBps"] = profile["max_core_p50_GBps"]
         rows.append(row)
         print(f"{row['device']:6d}  {row['isolated_GBps']:13.3f}  {row['concurrent_GBps']:15.3f}"
               f"  {row['retained_percent']:10.2f}  {row['drop_percent']:6.2f}  {row['peer']}")
@@ -211,6 +223,7 @@ def write_summary(directory, isolated, concurrent, config=None):
         "backend", "transport", "execution_mode", "aiv_cores", "aicpu_workers", "requests", "request_length", "miss_count", "token_bytes", "table_capacity", "tokens_per_block",
         "seconds", "graphs", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total", "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs",
+        "kernel_profile", "kernel_profile_clock_mhz",
     ) if key in config}
     if config.get("backend") == "gather_read":
         metadata.update(gather_read_wave_settings(argparse.Namespace(**config)))
@@ -267,6 +280,15 @@ def write_summary(directory, isolated, concurrent, config=None):
                "并发总吞吐 = 所有卡有效搬运字节数之和 ÷（最晚结束时间 − 最早开始时间）。",
                "各卡并发带宽直接相加使用了各自的测量时长，因此可能与并发总吞吐略有差别；总保留/下降比例使用并发总吞吐计算。",
                "测量窗口共同覆盖时长取各卡主机测量窗口的交集。", ""]
+    if config.get("kernel_profile"):
+        headers = ["设备", "独跑 kernel 均值 GB/s", "并发 kernel 均值 GB/s", "并发 kernel P50 GB/s", "并发样本数"]
+        profile_rows = [(r["device"], f"{r['isolated_kernel_mean_GBps']:.3f}", f"{r['concurrent_kernel_mean_GBps']:.3f}",
+                         f"{r['concurrent_kernel_p50_GBps']:.3f}", r["concurrent_kernel_samples"]) for r in rows]
+        table = markdown_table(headers, profile_rows)
+        report += ["## 每卡 kernel profiling", "", table, "",
+                   "每次正式回放采最后一个 Get。每个样本按最早 worker 开始至最晚 worker 结束计时。",
+                   "主机持续带宽包含设备采样及每轮回读开销。各阶段和各核数据见对应设备日志。", ""]
+        print(f"MULTICARD_KERNEL_SUMMARY\n{table}")
     if aggregate["overlap_percent"] < 95:
         report += ["测量窗口重叠率不足 95%，需检查子进程日志后再判断带宽竞争。", ""]
     (directory / "report.md").write_text("\n".join(report))
@@ -335,6 +357,7 @@ def main(argv=None):
         request_length=4096, table_capacity=4096, tokens_per_block=128, token_bytes=656,
         miss_count=None, warmup=3, seed=20260903), request_aliases=("--requests",))
     add_backend_arguments(parser, sweep=True)
+    add_kernel_profile_arguments(parser, "sample the last Get of every measured replay and report per-device kernel timing")
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
     parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
     parser.add_argument("--graph-calls", type=int, default=256, help="Get calls in each device's ACL graph (default: 256)")
@@ -358,6 +381,8 @@ def main(argv=None):
         return 0
     resolve_backend(args, parser, default_backend="ubmem", sweep=True)
     field = parallelism_field(args.backend)
+    if args.kernel_profile and field == "aiv_cores" and args.kernel_profile_clock_mhz <= 0:
+        parser.error("--kernel-profile-clock-mhz must be positive")
     counts = args.parallelism
     if not counts or len(set(counts)) != len(counts):
         parser.error(f"--{field.replace('_', '-')} requires distinct positive counts")
@@ -396,7 +421,7 @@ def main(argv=None):
           f"devices={args.devices} {field}={counts} graph_api=acl graph_calls={args.graph_calls} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
           f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
-          "timing=sustained_graph_replay_to_completion profiling_enabled=0 units=decimal_GBps", flush=True)
+          f"timing=sustained_graph_replay_to_completion profiling_enabled={int(args.kernel_profile)} units=decimal_GBps", flush=True)
     print(f"MULTICARD_RESULTS path={directory}", flush=True)
     try:
         for count in counts:

@@ -49,7 +49,7 @@ from utils.dsa_keys import build_dsa_keys
 from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
                              captured_get_resources, validate_graph_inputs)
 from utils.get_options import (
-    MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
+    MAX_JETTYS_PER_CORE, add_backend_arguments, add_kernel_profile_arguments, add_workload_arguments, configure_backend_help,
     environment_int, resolve_backend, uses_aicpu, validate_workload, gather_read_wave_settings,
 )
 from utils.perf_execution import BenchmarkExecution, add_execution_metadata
@@ -65,14 +65,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_backend_arguments(parser)
     parser.add_argument("--iterations", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
-    parser.add_argument("--kernel-profile", action="store_true",
-                        help="add stage/worker details, including UBMEM address/MTE/drain timings; kernel bandwidth is always reported")
+    add_kernel_profile_arguments(parser, "add stage/worker details, including UBMEM address/MTE/drain timings; kernel bandwidth is always reported")
     parser.add_argument("--output-dir", type=Path, help="directory for summary.csv and, with --kernel-profile, "
                         "profile.csv (default: reports/batch-get/<timestamp>-<backend>-d<device>)")
-    parser.add_argument("--kernel-profile-clock-mhz", type=int,
-                        default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
-                            environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
-                        help="AIV clock for converting cycles to time; unused by AICPU")
     parser.add_argument("--build-dir", type=Path,
                         help="build directory containing python/kvaf and, for AIV/UBMEM, bin/*.o")
     parser.add_argument("--device-id", type=int, default=environment_int("DEVICE_ID", 0))
@@ -111,7 +106,7 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "multi-graph-check requires graph or both execution and a positive miss-count"
     if args.iterations <= 0:
         return "iterations must be positive"
-    if args.contention_control_dir is None and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
+    if (args.contention_control_dir is None or args.kernel_profile) and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     if args.contention_control_dir is not None:
         if args.output_dir is not None:
@@ -122,8 +117,6 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "contention worker uses its own graph execution; omit --execution"
         if args.contention_result is None or args.miss_count <= 0:
             return "contention mode requires a result path and positive miss-count"
-        if args.kernel_profile:
-            return "contention mode measures sustained graph throughput without device profiling"
     return None
 
 
@@ -227,14 +220,42 @@ def print_measurements(args, execution, samples, profiles, report=None):
         report.add_summary(execution, measurements)
     if args.kernel_profile:
         details = [] if report is not None and report.profile_path is not None else None
-        if uses_aicpu(args):
-            print_aicpu_details(args, execution, profiles, details)
-        else:
-            print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.parallelism,
-                                 args.jettys_per_core, args.request_length, args.miss_count,
-                                 args.token_bytes, args.transport, details)
+        print_kernel_details(args, execution, profiles, details)
         if details is not None:
             report.add_profile(execution, details)
+
+
+def print_kernel_details(args, execution, profiles, details=None):
+    if uses_aicpu(args):
+        print_aicpu_details(args, execution, profiles, details)
+    else:
+        print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.parallelism,
+                             args.jettys_per_core, args.request_length, args.miss_count,
+                             args.token_bytes, args.transport, details,
+                             readback_outside_host_metric=args.contention_control_dir is None)
+
+
+def summarize_multicard_profile(args, profiles):
+    if not profiles or any(len(p) != args.parallelism for p in profiles):
+        raise AssertionError("missing multicard BatchGet kernel profile samples or workers")
+    durations_ms = [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles]
+    mean_ms = statistics.mean(durations_ms)
+    p50_ms = percentile(durations_ms, .5)
+    payload = args.miss_count * args.token_bytes
+    summary = dict(scope="last_get_per_measured_replay", samples=len(profiles),
+                   payload_bytes_per_sample=payload, mean_us=mean_ms * 1000, p50_us=p50_ms * 1000,
+                   mean_GBps=payload / mean_ms / 1e6, p50_GBps=payload / p50_ms / 1e6)
+    if args.backend == "aiv":
+        # peer-eid's kernel_total takes the longest individual core in each Get.
+        max_core_cycles = [max(p["kernel_finish_cycle"] - p["kernel_start_cycle"] for p in sample)
+                           for sample in profiles]
+        p50_us = percentile(max_core_cycles, .5) / args.kernel_profile_clock_mhz
+        if p50_us <= 0:
+            raise AssertionError("empty AIV core duration in multicard profile")
+        summary["max_core_p50_GBps"] = payload / p50_us / 1000
+    print(f"MULTICARD_KERNEL_PROFILE device={args.device_id} {format_fields(summary)}", flush=True)
+    print_kernel_details(args, "graph", profiles)
+    return summary
 
 
 def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
@@ -572,7 +593,7 @@ def kernel_stage_metrics(milliseconds, cycles, precision):
 
 def print_ubmem_kernel_profile(
     samples: list[list[dict[str, object]]], warmup: int, clock_mhz: int,
-    miss_count: int, token_bytes: int, details=None,
+    miss_count: int, token_bytes: int, details=None, *, readback_outside_host_metric=True,
 ) -> None:
     # Take every stage from the same slowest core in each sample. Independent
     # stage maxima can come from different cores and would not sum to total.
@@ -606,7 +627,7 @@ def print_ubmem_kernel_profile(
         f"detail={int(detailed)} aggregation=max_elapsed_across_cores "
         "kernel_total=miss_count_address_resolution_mte_copy_and_final_drain "
         "address_preparation=simt_ub_pipeline address_batch_rows=32 address_banks=2 "
-        "profile_overhead_included=1 d2h_outside_host_metric=1"
+        f"profile_overhead_included=1 d2h_outside_host_metric={int(readback_outside_host_metric)}"
     )
     if detailed:
         print(
@@ -642,12 +663,14 @@ def print_kernel_profile(
     token_bytes: int,
     transport: str = "urma",
     details=None,
+    *, readback_outside_host_metric=True,
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
 
     if transport == "ubmem":
-        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes, details)
+        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes, details,
+                                   readback_outside_host_metric=readback_outside_host_metric)
         return
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
@@ -769,7 +792,7 @@ def print_kernel_profile(
         "transfer_window=first_doorbell_to_all_cq_complete "
         "completion_wait=sum_all_group_drains "
         "peak_submitted_not_drained=per_core_conservative_software_count "
-        "profile_overhead_included=1 d2h_outside_host_metric=1"
+        f"profile_overhead_included=1 d2h_outside_host_metric={int(readback_outside_host_metric)}"
     )
     total_useful_bytes = len(samples) * miss_count * token_bytes
     for stage, values in stage_samples.items():
@@ -816,7 +839,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "FAIL: rebuild KVAF with the selected NPU backend and Python bindings."
         )
         return 2
-    if args.contention_control_dir is None and not all(
+    if (args.contention_control_dir is None or args.kernel_profile) and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in ("start_batch_get_kernel_profile", "stop_batch_get_kernel_profile", "batch_get_kernel_profile")
     ):
@@ -1125,6 +1148,11 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             if not valid:
                 raise AssertionError(f"BatchGet output mismatch: backend={args.backend}, miss_count={count}")
 
+        if args.contention_control_dir is None or args.kernel_profile:
+            runtime.start_batch_get_kernel_profile(detailed=args.kernel_profile and args.backend == "ubmem")
+            kernel_profile_started = True
+            print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
+
         if args.contention_control_dir is not None:
             from utils.multicard import run_worker
 
@@ -1138,12 +1166,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
                 check_output(plan, args.miss_count, full=False)
 
             run_worker(kvaf, torch, args, runtime, execution, output,
-                       create_request_plan, submit, check)
+                       create_request_plan, submit, check, summarize_multicard_profile)
             return 0
-
-        runtime.start_batch_get_kernel_profile(detailed=args.kernel_profile and args.backend == "ubmem")
-        kernel_profile_started = True
-        print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
 
         print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
               "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "

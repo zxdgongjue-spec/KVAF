@@ -73,6 +73,18 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
 有效字节数为 `已完成的回放次数 × graph_calls × miss_count × token_bytes`，
 带宽按实际测量时间计算。
 
+在原多卡命令中加 `--kernel-profile` 并指定新的 `--output` 目录，可同时查看独跑和并发阶段每张卡的 kernel 结果。
+设备在录图前启用 profiling。每次正式回放同步完成后，worker 读取图中最后一个 Get 的 profile。
+默认图中有 256 个 Get，每轮产生 1 个 kernel 样本。校验和预热回放不计入样本。
+每个 Get 的耗时取最早 worker 开始至最晚 worker 结束。AIV 按 `--kernel-profile-clock-mhz` 将周期换算为时间，
+默认 1000 MHz，可按设备实际频率设置。AICPU 直接使用设备纳秒时间戳。
+
+`summary.csv` 中的 `concurrent_kernel_mean_GBps` 用采样 Get 的有效字节总和除以这些 Get 的设备耗时之和，
+`concurrent_kernel_p50_GBps` 用一次 Get 的有效字节除以设备耗时 P50。`isolated_kernel_*` 给出对应独跑结果。
+带宽单位为十进制 GB/s。AIV 另有 `concurrent_kernel_max_core_p50_GBps`，每个样本先取各核自身耗时的最大值，
+再取跨样本 P50 换算带宽，可与 peer-eid 的 `p50_GBps` 按相同定义对照。各卡的阶段耗时和 worker 明细见 `concurrent/device_<id>.log`；
+AIV 的各核记录含 Jetty 轮询与等待数据。启用采样时，原 `concurrent_GBps` 的主机时间也包含每轮回读开销。
+
 ## 四种后端使用相同负载
 
 | backend | 并行度参数 | 通信参数 |
@@ -117,7 +129,7 @@ BASH
 | 入口 | 测量方式 | profiling |
 |---|---|---|
 | `run_remote_cpu_batch_get_perf.sh` | eager/graph 逐次采样，输出延迟分位数和带宽 | 默认采集算子时间；`--kernel-profile` 增加分段明细 |
-| `run_remote_cpu_batch_get_multicard_perf.sh` | 持续回放一张 ACL 图，每次回放同步一次，按时间窗口计算独立/并发吞吐 | 关闭设备 profiling，不在循环内回读 profile |
+| `run_remote_cpu_batch_get_multicard_perf.sh` | 持续回放一张 ACL 图，每次回放同步一次，按时间窗口计算独立/并发吞吐 | 默认关闭，`--kernel-profile` 采集每轮最后一个 Get 的阶段及 worker 明细 |
 
 多卡控制器调用单卡入口的持续回放 worker；两者复用负载准备、建表和数据校验。
 公共参数/校验在 `tests/python/utils/get_options.py`，图输入更新、捕获与租约释放在

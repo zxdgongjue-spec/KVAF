@@ -1,6 +1,7 @@
 """Exercise multi-card service routing and saved reports without NPU hardware."""
 
 import csv
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, call, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,10 +21,11 @@ import os
 import sys
 import time
 
-from test_npu_batch_get_perf import parse_args
+from test_npu_batch_get_perf import parse_args, validate_args
 from utils.get_options import parallelism_field
 
 args = parse_args(["--build-dir", sys.argv[1], *sys.argv[2:]])
+assert validate_args(args) is None
 assert "--peer" in sys.argv
 assert args.peer == os.environ["KVAF_CPU_SERVICE_ADDR"]
 control = args.contention_control_dir
@@ -33,6 +36,10 @@ while not (control / "start.json").exists():
         raise RuntimeError("controller did not start the worker")
     time.sleep(0.01)
 window = json.loads((control / "start.json").read_text())
+if args.kernel_profile:
+    from test_batch_get_multicard import run_profiled_worker
+    run_profiled_worker(args, window)
+    sys.exit(0)
 result = dict(device=args.device_id, peer=args.peer, backend=args.backend,
               start=window["start"], end=window["stop"], payload_bytes=1000000,
               bandwidth_GBps=1000000 / (window["stop"] - window["start"]) / 1e9,
@@ -40,6 +47,38 @@ result = dict(device=args.device_id, peer=args.peer, backend=args.backend,
 result[parallelism_field(args.backend)] = args.parallelism
 args.contention_result.write_text(json.dumps(result))
 """
+
+
+def run_profiled_worker(args, window):
+    from test_npu_batch_get_perf import MAX_JETTYS_PER_CORE, summarize_multicard_profile
+    from utils.multicard import run_worker
+
+    # Two timed replays with independently timestamped cores and node leases.
+    graph, runtime = Mock(), Mock()
+    leases = list(range(1, args.contention_graph_calls + 1))
+    def snapshot(*, graph_lease):
+        assert graph_lease == leases[-1]
+        assert graph.synchronize.call_count > 1 + args.warmup
+        workers = []
+        for core in range(args.parallelism):
+            start = 1000 + 100 * core
+            profile = dict.fromkeys(("active_requests", "total_posts", "submitted_group_count",
+                                     "completed_group_count", "completion_count", "post_active_cycles",
+                                     "drain_wait_cycles", "peak_submitted_not_drained"), 1)
+            profile.update(core=core, kernel_start_cycle=start, kernel_finish_cycle=start + 500,
+                           setup_done_cycle=start + 10, compact_done_cycle=start + 20,
+                           first_doorbell_cycle=start + 30, completion_done_cycle=start + 400,
+                           jetty_completion_wait_cycles=[0] * MAX_JETTYS_PER_CORE,
+                           jetty_completion_polls=[0] * MAX_JETTYS_PER_CORE)
+            workers.append(profile)
+        return workers
+    runtime.batch_get_kernel_profile.side_effect = snapshot
+    start, stop = window["start"], window["stop"]
+    clock = [start, start, start, (start + stop) / 2, stop, stop]
+    with patch("utils.multicard.captured_get_nodes", return_value=nullcontext((graph, leases))), \
+         patch("utils.multicard.time.monotonic", side_effect=clock):
+        run_worker(None, Mock(), args, runtime, Mock(), None, Mock(), Mock(), Mock(), summarize_multicard_profile)
+    assert runtime.batch_get_kernel_profile.call_args_list == [call(graph_lease=leases[-1])] * 2
 
 
 def read_csv(path):
@@ -113,6 +152,24 @@ class MultiCardServices(unittest.TestCase):
         directory = self.run_case("mixed", peers=(
             "--peer", "default:21111", "--device-peer", "1=other:21112"))
         self.check_case(directory, {"3": "default:21111", "1": "other:21112"})
+
+    def test_kernel_profile_sample_scope_timing_and_saved_summary(self):
+        directory = self.run_case("profile", "aiv", peers=("--kernel-profile", "--graph-calls", "3",
+                                  "--kernel-profile-clock-mhz", "500", "--aiv-cores", "2", "--jettys-per-core", "1"))
+        rows = read_csv(directory / "summary.csv")
+        for row in rows:
+            # Each 32-byte sample spans 600 cycles wall or 500 cycles on the longest core.
+            self.assertEqual(int(row["concurrent_kernel_samples"]), 2)
+            self.assertAlmostEqual(float(row["concurrent_kernel_mean_us"]), 1.2)
+            self.assertAlmostEqual(float(row["concurrent_kernel_mean_GBps"]), 32 / 1200)
+            self.assertAlmostEqual(float(row["isolated_kernel_max_core_p50_GBps"]), 32 / 1000)
+            path = directory / "concurrent" / f"device_{row['device']}"
+            worker = json.loads(path.with_suffix(".json").read_text())
+            self.assertEqual(worker["payload_bytes"], 2 * 3 * 32)
+            self.assertEqual(worker["kernel_profile"]["payload_bytes_per_sample"], 32)
+            self.assertIn("KERNEL_PROFILE_CORE", path.with_suffix(".log").read_text())
+        self.invoke(["--summarize", str(directory)])
+        self.assertEqual(read_csv(directory / "summary.csv"), rows)
 
     def test_shared_environment_service_and_legacy_summary(self):
         directory = self.run_case("shared")
