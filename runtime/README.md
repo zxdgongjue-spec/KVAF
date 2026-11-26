@@ -273,7 +273,26 @@ python3 tests/python/test_npu_hbm_region_roce.py
 
 业务进程对同一个 `kvaf` 包创建两个 Runtime。每条路径分别调用 `link_to` 和
 `initialize(ddr_bytes, slot_size)`，各自使用其 AccessTable 和 DDR 池。按 key 所在缓存池
-路由请求。本地实例可调用 `batch_get_ranges`，RoCE 实例当前使用图外的定长 `batch_get`。
+路由请求。本地实例可调用 `batch_get_ranges`，RoCE 实例支持图外的定长
+`batch_get` 和变长 `batch_get_ranges`。变长读的元数据按调用方 stream 顺序拷到
+Host，由 worker 校验包内范围并提交 RDMA READ。实际数据直接写入输出 HBM。
+输出可用 `hbm_region=` 复用提前注册的区域；`read_chunk_bytes` 控制单条 READ
+的软件分段，提交窗口受该 QP 的发送深度和协商的 READ 深度限制。
+
+RoCE range Get 支持 `synchronize=True` 直接等待并报告失败。异步调用后可用
+`check_batch_get_ranges_status(stream)` 检查结果。只等待 stream 不会报告 worker
+返回的 range Get 错误；失败后应丢弃整个输出。
+
+保持上面的远端 RoCE 服务和客户端环境变量，用以下冒烟测试验证整包 Put、乱序变长
+读取、输出间隙保留，以及异步分段读取。测试先注册一块 64 MiB HBM，再用同一个
+`hbm_region` 的不同子区间作为 Put 源和两次 Get 的输出。单次 Put 写两个 4 MiB
+块，两次 Get 分别从块尾读取共 7 字节。`ROCE_RANGE_LATENCY` 分别打印 HBM
+注册、Put、同步 Get 和异步分段 Get 的耗时，异步耗时包含同 stream 的 12 字节
+校验用拷贝和完成状态检查。通过时打印 `ROCE_RANGE_SMOKE_PASS`。
+
+```bash
+KVAF_RUN_NPU_TESTS=1 python3 tests/python/test_npu_roce_batch_get_ranges.py
+```
 
 ```python
 import os
