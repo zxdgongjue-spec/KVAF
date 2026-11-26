@@ -284,8 +284,11 @@ RoCE range Get 支持 `synchronize=True` 直接等待并报告失败。异步调
 返回的 range Get 错误；失败后应丢弃整个输出。
 
 保持上面的远端 RoCE 服务和客户端环境变量，用以下冒烟测试验证整包 Put、乱序变长
-读取、输出间隙保留，以及预注册 HBM 的异步分段读取。通过时打印
-`ROCE_RANGE_SMOKE_PASS`。
+读取、输出间隙保留，以及异步分段读取。测试先注册一块 64 MiB HBM，再用同一个
+`hbm_region` 的不同子区间作为 Put 源和两次 Get 的输出。单次 Put 写两个 4 MiB
+块，两次 Get 分别从块尾读取共 7 字节。`ROCE_RANGE_LATENCY` 分别打印 HBM
+注册、Put、同步 Get 和异步分段 Get 的耗时，异步耗时包含同 stream 的 12 字节
+校验用拷贝和完成状态检查。通过时打印 `ROCE_RANGE_SMOKE_PASS`。
 
 ```bash
 KVAF_RUN_NPU_TESTS=1 python3 tests/python/test_npu_roce_batch_get_ranges.py
