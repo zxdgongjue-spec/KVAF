@@ -67,6 +67,8 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
         }
         if args.backend == "aiv":
             result["jettys_per_core"] = args.jettys_per_core
+        if args.transport == "urma":
+            result["peer_ub_device"] = args.peer_ub_device
     if args.kernel_profile:
         result["kernel_profile"] = summarize_profile(args, profiles)
     args.contention_result.write_text(json.dumps(result, indent=2) + "\n")

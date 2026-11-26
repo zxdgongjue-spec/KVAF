@@ -238,8 +238,17 @@ def validate_workload(args):
             return "gather-read-wave-wrs must be in [1, 4096]"
         if args.backend != "gather_read":
             return "gather-read-wave-wrs requires --backend gather_read"
-    if args.transport == "ubmem" and args.peer_ub_device:
-        return "peer-ub-device applies only to URMA"
+    if args.peer_ub_device:
+        if args.transport == "ubmem":
+            return "peer-ub-device applies only to URMA"
+        fes = [name.strip() for name in args.peer_ub_device.split(",")]
+        if not all(fes) or len(set(fes)) != len(fes):
+            return "peer-ub-device requires distinct, nonempty UB device names"
+        if len(fes) > 1 and len(args.npu_eids) > 1:
+            return "multiple CPU FEs require a single NPU EID"
+        if (args.backend == "aiv" and args.parallelism is not None and args.jettys_per_core is not None
+                and len(fes) > args.parallelism * args.jettys_per_core):
+            return "peer-ub-device count exceeds aiv-cores * jettys-per-core"
     if args.jettys_per_core is not None and not 1 <= args.jettys_per_core <= MAX_JETTYS_PER_CORE:
         return "jettys-per-core must be in [1, 64]"
     if args.backend == "aiv":
@@ -276,6 +285,8 @@ def workload_command(args):
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:
         command += ["--peer-ub-device", args.peer_ub_device]
+    if getattr(args, "core_fe_map", None):
+        command += ["--core-fe-map", ",".join(map(str, args.core_fe_map))]
     for name in ("gather_ddr_bytes", "scatter_hbm_bytes"):
         if getattr(args, name, 0):
             command += ["--" + name.replace("_", "-"), str(getattr(args, name))]
@@ -297,15 +308,17 @@ def configure_backend_help(parser, argv=None):
     hidden = set()
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":
-        hidden.update(("jettys_per_core", "max_inflight_total", "core_fe_map", "device_core_fe_map"))
+        hidden.update(("jettys_per_core", "max_inflight_total", "core_fe_map", "device_core_fe_maps",
+                       "device_jettys_per_core"))
     if backend != "gather_read":
         hidden.update(("gather_ddr_bytes", "gather_read_wave_wrs"))
     if backend != "cpu_push_scatter":
         hidden.add("scatter_hbm_bytes")
     if backend == "ubmem":
-        hidden.update(("npu_eids", "peer_ub_device"))
+        hidden.update(("npu_eids", "peer_ub_device", "device_peer_ub_devices"))
     if aicpu:
         hidden.add("kernel_profile_clock_mhz")
+        hidden.add("device_aiv_cores")
     for action in parser._actions:
         if action.dest in hidden:
             action.help = argparse.SUPPRESS

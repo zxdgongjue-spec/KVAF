@@ -43,7 +43,11 @@ if args.kernel_profile:
 result = dict(device=args.device_id, peer=args.peer, backend=args.backend,
               start=window["start"], end=window["stop"], payload_bytes=1000000,
               bandwidth_GBps=1000000 / (window["stop"] - window["start"]) / 1e9,
-              verified=True, jettys_per_core=args.jettys_per_core)
+              verified=True)
+if args.backend == "aiv":
+    result["jettys_per_core"] = args.jettys_per_core
+if args.transport == "urma":
+    result["peer_ub_device"] = runtime_options(args)["peer_ub_device"]
 result[parallelism_field(args.backend)] = args.parallelism
 result["get_core_fe_map"] = runtime_options(args).get("get_core_fe_map")
 args.contention_result.write_text(json.dumps(result))
@@ -153,6 +157,62 @@ class MultiCardServices(unittest.TestCase):
         directory = self.run_case("mixed", peers=(
             "--peer", "default:21111", "--device-peer", "1=other:21112"))
         self.check_case(directory, {"3": "default:21111", "1": "other:21112"})
+
+    def test_device_resources_and_fe_maps_in_both_phases(self):
+        directory = self.run_case("mixed-resources", "aiv", peers=(
+            "--device-aiv-cores", "1=3", "--device-aiv-cores", "3=4",
+            "--device-jettys-per-core", "3=1", "--device-jettys-per-core", "1=2",
+            "--device-peer-ub-device", "1=E2,E3", "--device-peer-ub-device", "3=E3,E4",
+            "--device-core-fe-map", "1=0,0,1", "--device-core-fe-map", "3=1,1,1,0"))
+        expected = {1: (3, 2, "E2,E3", [0, 0, 1]), 3: (4, 1, "E3,E4", [1, 1, 1, 0])}
+        for device, values in expected.items():
+            for phase in (f"isolated_{device}", "concurrent"):
+                result = json.loads((directory / phase / f"device_{device}.json").read_text())
+                self.assertEqual(tuple(result[key] for key in
+                    ("aiv_cores", "jettys_per_core", "peer_ub_device", "get_core_fe_map")), values)
+        rows = read_csv(directory / "summary.csv")
+        for row in rows:
+            self.assertEqual((int(row["aiv_cores"]), int(row["jettys_per_core"]), row["peer_ub_device"]),
+                             expected[int(row["device"])][:3])
+        report = (directory / "report.md").read_text()
+        self.assertIn("| 1 | 3 | 2 | E2,E3 |", report)
+        self.assertIn("| 3 | 4 | 1 | E3,E4 |", report)
+        self.invoke(["--summarize", str(directory)])
+        self.assertEqual((directory / "report.md").read_text(), report)
+
+    def test_device_override_keeps_fixed_cores_during_global_sweep(self):
+        directory = self.run_case("sweep-overrides", "aiv", sweep=True, peers=(
+            "--jettys-per-core", "2", "--peer-ub-device", "E3,E4",
+            "--device-aiv-cores", "3=3", "--device-jettys-per-core", "3=1",
+            "--device-peer-ub-device", "3=E2,E3", "--device-core-fe-map", "3=0,0,1"))
+        rows = read_csv(directory / "summary.csv")
+        for row in rows:
+            count = int(row["sweep_aiv_cores"])
+            expected = (3, 1, "E2,E3") if row["device"] == "3" else (count, 2, "E3,E4")
+            self.assertEqual((int(row["aiv_cores"]), int(row["jettys_per_core"]), row["peer_ub_device"]), expected)
+        self.invoke(["--summarize", str(directory)])
+        self.assertEqual(read_csv(directory / "summary.csv"), rows)
+
+    def test_invalid_device_resources_fail_before_creating_output(self):
+        output = self.directory / "invalid"
+        cases = (
+            ("--device-aiv-cores", "3=49"), ("--device-jettys-per-core", "1=0"),
+            ("--device-jettys-per-core", "3=two"), ("--device-aiv-cores", "2=1"),
+            ("--device-aiv-cores", "1=3", "--device-aiv-cores", "1=4"),
+            ("--device-peer-ub-device", "1=E3,"), ("--device-peer-ub-device", "1=E3,E3"),
+            ("--device-peer-ub-device", "3=E2,E3", "--device-core-fe-map", "3=0,0,2"),
+            ("--device-aiv-cores", "3=4", "--device-core-fe-map", "3=0,0,1"),
+            ("--device-aiv-cores", "3=1", "--device-jettys-per-core", "3=1",
+             "--device-peer-ub-device", "3=E2,E3"),
+            ("--backend", "ubmem", "--device-jettys-per-core", "1=2"),
+            ("--backend", "ubmem", "--device-peer-ub-device", "1=E2"),
+            ("--backend", "gather_read", "--device-aiv-cores", "1=4"),
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                self.invoke(["--backend", "aiv", "--devices", "3", "1",
+                             "--output", str(output), *options], expected=2)
+                self.assertFalse(output.exists())
 
     def test_core_fe_maps_follow_device_through_both_phases(self):
         for name, maps in (("both", {"1": [0, 0, 1], "3": [2, 2, 1]}),

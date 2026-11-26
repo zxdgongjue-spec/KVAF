@@ -16,7 +16,7 @@ import time
 
 from utils.get_options import (
     add_backend_arguments, add_kernel_profile_arguments, add_workload_arguments, configure_backend_help,
-    gather_read_wave_settings, parallelism_field, parse_core_fe_map, validate_core_fe_map,
+    gather_read_wave_settings, parallelism_field, parse_core_fe_map,
     resolve_backend, validate_workload, workload_command,
 )
 from utils.perf_execution import add_execution_metadata
@@ -54,25 +54,31 @@ def peer_for_device(config, device):
     return config.get("device_peers", {}).get(str(device), config.get("peer", ""))
 
 
-def resolve_device_core_fe_maps(args, parser, counts):
-    maps = {}
-    for value in args.device_core_fe_map:
+def device_overrides(values, devices, option, convert, parser):
+    overrides = {}
+    for value in values:
         device, separator, fields = value.partition("=")
-        if not separator or not device.isascii() or not device.isdecimal() or int(device) not in args.devices:
-            parser.error("--device-core-fe-map expects DEVICE=FE[,FE...] for a device in --devices")
+        if not separator or not device.isascii() or not device.isdecimal() or int(device) not in devices:
+            parser.error(f"{option} expects DEVICE=VALUE for a device in --devices")
         device = str(int(device))
-        if device in maps:
-            parser.error(f"--device-core-fe-map specified more than once for device {device}")
+        if device in overrides or not fields.strip():
+            parser.error(f"{option} needs one nonempty value for device {device}")
         try:
-            mapping = parse_core_fe_map(fields)
-        except argparse.ArgumentTypeError as error:
-            parser.error(f"--device-core-fe-map device {device}: {error}")
-        for count in counts:
-            error = validate_core_fe_map(args, mapping, count)
-            if error:
-                parser.error(f"--device-core-fe-map device {device}: {error}")
-        maps[device] = mapping
-    return maps
+            overrides[device] = convert(fields)
+        except (argparse.ArgumentTypeError, ValueError) as error:
+            parser.error(f"{option} device {device}: {error}")
+    return overrides
+
+
+def worker_options(args, device, count):
+    key = str(device)
+    worker = argparse.Namespace(**vars(args))
+    worker.parallelism = args.device_aiv_cores.get(key, count)
+    setattr(worker, parallelism_field(args.backend), worker.parallelism)
+    worker.jettys_per_core = args.device_jettys_per_core.get(key, args.jettys_per_core)
+    worker.peer_ub_device = args.device_peer_ub_devices.get(key, args.peer_ub_device)
+    worker.core_fe_map = args.device_core_fe_maps.get(key)
+    return worker
 
 
 def worker_error(device, process, log_path, phase):
@@ -93,27 +99,25 @@ def run_group(args, devices, directory):
     try:
         for device in devices:
             peer = args.device_peers[str(device)]
+            worker = worker_options(args, device, args.parallelism)
             log_path = directory / f"device_{device}.log"
             log = log_path.open("w")
             logs.append(log)
             env = dict(os.environ, DEVICE_ID=str(device),
                        KVAF_CPU_SERVICE_ADDR=peer, PYTHONUNBUFFERED="1")
-            if args.backend == "aiv" and args.parallelism is None:
+            if args.backend == "aiv" and worker.parallelism is None:
                 # The controller uses KVAF_BATCH_GET_AIV_CORES for sweeps.
                 env.pop("KVAF_BATCH_GET_PERF_AIV_CORES", None)
             env["KVAF_REMOTE_CPU_PERF_TIMEOUT"] = str(math.ceil(args.ready_timeout + args.seconds + 60))
             command = [
                 str(runner), str(args.build_dir),
-                *workload_command(args),
+                *workload_command(worker),
                 "--peer", peer,
                 "--graph-api", "acl",
                 "--contention-control-dir", str(directory),
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
             ]
-            if str(device) in args.device_core_fe_maps:
-                mapping = args.device_core_fe_maps[str(device)]
-                command.extend(["--core-fe-map", ",".join(map(str, mapping))])
             if args.kernel_profile:
                 command.extend(["--kernel-profile", "--kernel-profile-clock-mhz", str(args.kernel_profile_clock_mhz)])
             print(f"MULTICARD_WORKER phase={directory.name} device={device} peer={peer} log={log_path}", flush=True)
@@ -182,6 +186,8 @@ def markdown_table(headers, rows):
 def write_summary(directory, isolated, concurrent, config=None):
     config = config or {}
     device_peers = {str(result["device"]): peer_for_device(config, result["device"]) for result in isolated}
+    per_device_resources = any(config.get(key) for key in
+                               ("device_aiv_cores", "device_jettys_per_core", "device_peer_ub_devices"))
     rows = []
     print("device  isolated_GB/s  concurrent_GB/s  retained_%  drop_%  CPU_service")
     for solo, shared in zip(isolated, concurrent):
@@ -195,6 +201,10 @@ def write_summary(directory, isolated, concurrent, config=None):
             "concurrent_GBps": shared["bandwidth_GBps"],
             "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
         }
+        if per_device_resources:
+            for name in ("aiv_cores", "jettys_per_core", "peer_ub_device"):
+                if name in solo:
+                    row[name] = solo[name]
         if config.get("kernel_profile"):
             for phase, result in (("isolated", solo), ("concurrent", shared)):
                 profile = result["kernel_profile"]
@@ -290,10 +300,18 @@ def write_summary(directory, isolated, concurrent, config=None):
                 ("未完成 READ 上限 / 卡", "max_inflight_total"),
             ) if key in config]
             if config.get("device_core_fe_maps"):
-                settings.append(("CPU FE 顺序", config.get("peer_ub_device") or "按服务端候选顺序"))
+                if not config.get("device_peer_ub_devices"):
+                    settings.append(("CPU FE 顺序", config.get("peer_ub_device") or "按服务端候选顺序"))
                 settings.extend((f"设备 {device} 各核的 FE 下标", ", ".join(map(str, mapping)))
                                 for device, mapping in config["device_core_fe_maps"].items())
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
+        if per_device_resources:
+            columns = [(name, label) for name, label in (
+                ("device", "设备"), ("aiv_cores", "AIV 核数"), ("jettys_per_core", "每核 Jetty 数"),
+                ("peer_ub_device", "CPU UB 设备顺序")) if name in rows[0]]
+            report += ["## 每卡资源", "", markdown_table(
+                [label for _, label in columns],
+                [[r[name] if r[name] != "" else "自动" for name, _ in columns] for r in rows]), ""]
     device_rows = [
         (r["device"], r["peer"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
          f"{r['retained_percent']:.2f}", f"{r['drop_percent']:.2f}") for r in rows
@@ -330,19 +348,23 @@ def sweep_case(directory, field, count):
     return directory / f"{'workers' if field == 'aicpu_workers' else 'cores'}_{count}"
 
 
-def write_sweep_summary(directory, counts, field="aiv_cores"):
+def write_sweep_summary(directory, counts, field="aiv_cores", device_aiv_cores=None):
+    # A fixed per-device core count can differ from the sweep coordinate.
+    sweep_field = f"sweep_{field}" if device_aiv_cores else field
     for filename in ("summary.csv", "aggregate.csv"):
         rows = []
         for count in counts:
             with (sweep_case(directory, field, count) / filename).open() as source:
-                rows.extend(dict(row, **{field: count}) for row in csv.DictReader(source))
+                rows.extend(dict(row, **{sweep_field: count}) for row in csv.DictReader(source))
         with (directory / filename).open("w", newline="") as output:
             writer = csv.DictWriter(output, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
     label = "AICPU worker 数 / 卡" if field == "aicpu_workers" else "AIV 核数 / 卡"
+    if device_aiv_cores:
+        label = "默认 AIV 核数"
     headers = [label, "独立带宽之和 GB/s", "并发总吞吐 GB/s", "保留 %", "下降 %"]
-    values = [(row[field], *(f"{float(row[key]):.3f}" for key in (
+    values = [(row[sweep_field], *(f"{float(row[key]):.3f}" for key in (
         "isolated_sum_GBps", "concurrent_wall_GBps", "retained_percent", "drop_percent"))) for row in rows]
     table = markdown_table(headers, values)
     report = ["# 多卡 BatchGet 并行度扫描", "",
@@ -363,7 +385,7 @@ def summarize(directory):
     if isinstance(config[field], list):
         for count in config[field]:
             summarize(sweep_case(directory, field, count))
-        write_sweep_summary(directory, config[field], field)
+        write_sweep_summary(directory, config[field], field, config.get("device_aiv_cores"))
         return
     isolated = [json.loads((directory / f"isolated_{device}/device_{device}.json").read_text())
                 for device in config["devices"]]
@@ -394,7 +416,14 @@ def main(argv=None):
                         help="default CPU service HOST:PORT for devices without --device-peer")
     parser.add_argument("--device-peer", action="append", type=parse_device_peer, default=[],
                         metavar="DEVICE=HOST:PORT", help="CPU service for one device; repeat for multiple devices")
-    parser.add_argument("--device-core-fe-map", action="append", default=[], metavar="DEVICE=FE[,FE...]",
+    parser.add_argument("--device-aiv-cores", action="append", default=[], metavar="DEVICE=N",
+                        help="AIV core count for one aiv or ubmem device; overrides the current sweep value")
+    parser.add_argument("--device-peer-ub-device", dest="device_peer_ub_devices", action="append",
+                        default=[], metavar="DEVICE=NAME[,NAME...]",
+                        help="ordered CPU UB device list for one URMA device")
+    parser.add_argument("--device-jettys-per-core", action="append", default=[], metavar="DEVICE=N",
+                        help="Jettys per AIV core for one aiv device")
+    parser.add_argument("--device-core-fe-map", dest="device_core_fe_maps", action="append", default=[], metavar="DEVICE=FE[,FE...]",
                         help="per-core CPU FE indices for this device (AIV Direct Get); repeat per device")
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
@@ -416,11 +445,6 @@ def main(argv=None):
     counts = args.parallelism
     if not counts or len(set(counts)) != len(counts):
         parser.error(f"--{field.replace('_', '-')} requires distinct positive counts")
-    for count in counts:
-        args.parallelism = count
-        error = validate_workload(args)
-        if error:
-            parser.error(error)
     if args.miss_count <= 0:
         parser.error("sustained bandwidth requires positive --miss-count")
     if args.graph_calls <= 0:
@@ -428,7 +452,24 @@ def main(argv=None):
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
     resolve_device_peers(args, parser)
-    args.device_core_fe_maps = resolve_device_core_fe_maps(args, parser, counts)
+    if args.device_aiv_cores and field != "aiv_cores":
+        parser.error("--device-aiv-cores requires --backend aiv or ubmem")
+    if args.device_jettys_per_core and args.backend != "aiv":
+        parser.error("--device-jettys-per-core requires --backend aiv")
+    for dest, option, convert in (
+        ("device_aiv_cores", "--device-aiv-cores", int),
+        ("device_peer_ub_devices", "--device-peer-ub-device", str),
+        ("device_jettys_per_core", "--device-jettys-per-core", int),
+        ("device_core_fe_maps", "--device-core-fe-map", parse_core_fe_map),
+    ):
+        setattr(args, dest, device_overrides(getattr(args, dest), args.devices, option, convert, parser))
+    for count in counts:
+        if count is not None and not 1 <= count <= (48 if field == "aiv_cores" else 8):
+            parser.error(f"invalid --{field.replace('_', '-')} sweep value: {count}")
+        for device in args.devices:
+            error = validate_workload(worker_options(args, device, count))
+            if error:
+                parser.error(f"device {device}: {error}")
     for name in ("seconds", "ready_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -439,7 +480,6 @@ def main(argv=None):
     config.update(graph_api="acl", graphs=1)
     config.pop("summarize")
     config.pop("device_peer")
-    config.pop("device_core_fe_map")
     config.pop("parallelism")
     config.pop("aicpu_workers" if field == "aiv_cores" else "aiv_cores")
     config["requests"] = args.request_length  # Existing report consumers use this capacity field.
@@ -467,14 +507,15 @@ def main(argv=None):
             isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
             concurrent = run_group(args, args.devices, case / "concurrent")
             case_config = dict(config, **{field: count}, output=str(case))
-            if args.backend == "aiv":
-                for name in ("aiv_cores", "jettys_per_core"):
+            if args.backend == "aiv" or args.device_aiv_cores:
+                resource_fields = ("aiv_cores", "jettys_per_core") if args.backend == "aiv" else ("aiv_cores",)
+                for name in resource_fields:
                     values = {result[name] for result in isolated + concurrent}
                     case_config[name] = values.pop() if len(values) == 1 else "per-device"
                 (case / "config.json").write_text(json.dumps(case_config, indent=2) + "\n")
             write_summary(case, isolated, concurrent, case_config)
         if len(counts) > 1:
-            write_sweep_summary(directory, counts, field)
+            write_sweep_summary(directory, counts, field, args.device_aiv_cores)
     except (Exception, KeyboardInterrupt) as error:
         print(f"MULTICARD_FAILED {error}", file=sys.stderr)
         return 1

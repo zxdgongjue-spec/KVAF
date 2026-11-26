@@ -53,6 +53,31 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
 再看 `DIRECT_AIV_ENTITY_TEMPLATE_READY`。按 `entity_index` 排序，两张卡的 `eid_path`
 应分别为 `0,0,0,0,1,1` 和 `2,2,2,2,1,1`，轮询基线均为 `0,1,2,0,1,2`。
 
+## 每张卡使用不同的核数、Jetty 数或 CPU FE
+
+下面的配置让卡 6 用 3 核、每核 2 个 Jetty，按核走 E2、E2、E3；
+卡 7 用 4 核、每核 1 个 Jetty，按核走 E4、E4、E4、E3。
+把 `CPU_HOST` 和示例 UB 设备名换成服务端实际值。
+
+```bash
+bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
+  --backend aiv --devices 6 7 \
+  --device-peer 6=CPU_HOST:21116 --device-peer 7=CPU_HOST:21117 \
+  --device-aiv-cores 6=3 --device-aiv-cores 7=4 \
+  --device-jettys-per-core 6=2 --device-jettys-per-core 7=1 \
+  --device-peer-ub-device 6=E2,E3 --device-peer-ub-device 7=E3,E4 \
+  --device-core-fe-map 6=0,0,1 --device-core-fe-map 7=1,1,1,0 \
+  --output reports/per-device-resources
+```
+
+三个覆盖项均按设备 ID 生效，并在独跑和并发阶段共用。某张卡省略某项时，会沿用该项的全局参数或原有默认值。
+例如 `--aiv-cores 2 4 --device-aiv-cores 6=3` 会运行两轮，卡 6 固定 3 核，其余卡依次用 2 核、4 核。
+每卡的 `--device-core-fe-map` 按该卡的核数和 FE 列表顺序解释。显式指定列表时，列表长度决定该卡选用的 FE 数量。
+使用按卡覆盖时，可在 `summary.csv` 和每轮 `report.md` 中核对各卡的资源配置。
+
+`--device-aiv-cores` 适用于 `aiv` 和 `ubmem`，`--device-jettys-per-core` 适用于 `aiv`。
+`--device-peer-ub-device` 沿用 URMA 后端原有的 UB 设备选择规则。
+
 ## 每张卡连接独立的 CPU service
 
 使用可重复的 `--device-peer DEVICE=HOST:PORT` 按设备号指定服务，映射与 `--devices`
