@@ -56,8 +56,7 @@ Status SelectProviderEids(Transport transport, Executor executor, bool get,
   }
   if (candidates.empty()) return Status::NotInitialized("URMA local EIDs are not initialized");
   if (get && executor == Executor::Aiv && explicit_eids) {
-    const auto workers = static_cast<std::uint64_t>(resources.cores) *
-        (resources.jettys ? resources.jettys : 1U);
+    const auto workers = static_cast<std::uint64_t>(resources.cores) * resources.jettys;
     if (candidates.size() > workers)
       return Status::InvalidArgument("npu_eids count exceeds selected AIV Get cores * jettys workers");
     *selected = candidates;

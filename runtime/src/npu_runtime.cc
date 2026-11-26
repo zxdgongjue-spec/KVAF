@@ -159,24 +159,28 @@ struct NpuRuntime::Impl {
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *dispatcher, *allocator);
   }
 
-  ExecutionResources Resources(Transport transport, Executor executor, GetAlgorithm algorithm,
-                               bool get) const {
-    const ExecutionResources* selected = nullptr;
+  const ExecutionResources* ConfiguredResources(Transport transport, Executor executor,
+                                                GetAlgorithm algorithm, bool get) const {
     if (get) {
       for (const auto& entry : options.get_resources)
         if (entry.first == GetExecutionConfig{transport, executor, algorithm})
-          selected = &entry.second;
+          return &entry.second;
     } else {
       for (const auto& entry : options.put_resources)
-        if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
+        if (entry.first == PutExecutionConfig{transport, executor}) return &entry.second;
     }
+    return nullptr;
+  }
+  ExecutionResources Resources(Transport transport, Executor executor, GetAlgorithm algorithm,
+                               bool get) const {
+    const auto* selected = ConfiguredResources(transport, executor, algorithm, get);
     auto budget = detail::ResolveExecutionResources(transport, executor, get, peer_candidates.local, selected);
     if (get && transport == Transport::Urma && executor == Executor::Aiv && algorithm != GetAlgorithm::Direct) {
       const bool scatter = algorithm == GetAlgorithm::Scatter;
       if (!selected || selected->kernel_path.empty())
         budget.kernel_path = scatter ? detail::kDefaultAivScatterKernelPath : detail::kDefaultAivGatherKernelPath;
       budget.max_inflight_total = 0;
-      budget.jettys = scatter ? (selected ? selected->jettys : 0U) : 2U;
+      if (!scatter) budget.jettys = 2U;
     }
     if (get && executor == Executor::Aicpu && algorithm == GetAlgorithm::Gather && !(selected && selected->jettys))
       budget.jettys = 1;
@@ -184,15 +188,7 @@ struct NpuRuntime::Impl {
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {
-    const ExecutionResources* explicit_resources = nullptr;
-    if (get) {
-      for (const auto& entry : options.get_resources)
-        if (entry.first == GetExecutionConfig{t, e, algorithm}) explicit_resources = &entry.second;
-    } else {
-      for (const auto& entry : options.put_resources)
-        if (entry.first == PutExecutionConfig{t, e}) explicit_resources = &entry.second;
-    }
-    if (explicit_resources) {
+    if (const auto* explicit_resources = ConfiguredResources(t, e, algorithm, get)) {
       const auto& r = *explicit_resources;
       const bool sequential_aiv = get && t == Transport::Urma && e == Executor::Aiv &&
           algorithm != GetAlgorithm::Direct;
@@ -234,8 +230,7 @@ struct NpuRuntime::Impl {
         (budget.request_capacity > 65536U &&
          !(get && IsWindowedGet({t, e, algorithm}))) || budget.cpu_threads > 64U ||
         (t == Transport::Urma && e == Executor::Aiv &&
-         ((!budget.jettys && !(get && algorithm == GetAlgorithm::Scatter)) ||
-          budget.jettys > (get ? 64U : 2U) ||
+         (!budget.jettys || budget.jettys > (get ? 64U : 2U) ||
           (get && *budget.max_inflight_total && *budget.max_inflight_total < 2U * budget.cores))))
       throw std::invalid_argument("invalid execution resource budget");
     if (get && t == Transport::Urma && e == Executor::Aiv && algorithm != GetAlgorithm::Direct &&
@@ -390,7 +385,12 @@ struct NpuRuntime::Impl {
         c.batch_put_kernel_object_path = budget.kernel_path;
       if (get && algorithm != GetAlgorithm::Direct) {
         c.aiv_gather_sgl_size = budget.gather_sgl_size.value_or(6U);
-        if (algorithm == GetAlgorithm::Scatter) c.aiv_scatter_jettys_per_core = budget.jettys;
+        if (algorithm == GetAlgorithm::Scatter) {
+          // The execution session requires a positive Jetty budget. The Scatter
+          // payload pool uses zero to select its environment override or shared default.
+          const auto* configured = ConfiguredResources(transport, executor, algorithm, get);
+          if (configured) c.aiv_scatter_jettys_per_core = configured->jettys;
+        }
         c.batch_get_token_bytes = options.batch_get_token_bytes;
         return CreateSequentialBatchGet(algorithm, std::move(c));
       }
