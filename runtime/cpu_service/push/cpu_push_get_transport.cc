@@ -364,6 +364,9 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
 }
 
 Status Transport::ValidateSources(std::uint32_t begin, std::uint32_t end) {
+  // Device-push requests trust the generated source list. Skip the CPU scan
+  // before starting its timer; legacy READ-based paths keep range validation.
+  if (device_push_) return Status::OK();
   BatchGetProfileScope timer((payload_only_ || pipeline_) && profile_.enabled ? &profile_.address_validate_ns : nullptr);
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   for (auto i = begin; i < end; ++i)
@@ -1023,7 +1026,7 @@ void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
   if (device_push_) {
     const auto& p = profile_;
-    std::fprintf(stderr, "CPU_SGL_PUSH_PROFILE sequence=%" PRIu64 " rows=%u descriptor_reads=0 ready_wrs=0"
+    std::fprintf(stderr, "CPU_SGL_PUSH_PROFILE sequence=%" PRIu64 " rows=%u descriptor_reads=0 ready_wrs=0 source_validation=disabled"
         " head_first_post_us=%.3f head_submit_us=%.3f suffix_wait_us=%.3f suffix_submit_us=%.3f"
         " output_import_us=%.3f address_validate_us=%.3f source_sge_update_us=%.3f cpu_total_us=%.3f"
         " data_wrs=%u tail_cqes=%u max_inflight=%u plan_reused=%u result=%u\n",

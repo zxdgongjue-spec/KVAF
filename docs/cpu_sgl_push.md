@@ -39,6 +39,11 @@ Head/Suffix 始终启用，资源查询和性能脚本记录 `sgl_pipeline=True`
 容量上限 65536，token 大小按 Runtime 配置。空请求不通知 CPU、不修改 output。
 性能入口要求连续输出和 `--no-sort-input-indices`。
 
+`cpu_sgl_push` 的 CPU service 信任设备生成的源地址清单，关闭逐项源地址范围扫描，
+同时适用于 AIV 和 AICPU。请求头、sequence、数量和 output 容量/segment 检查保留；
+设备端现有检查保持不变。调用方须保证源索引、偏移和地址表有效，且源注册在请求完成前存活。
+原 `cpu_sgl_write`、逐 chunk READ 流水和 scatter 的 CPU 源地址校验继续保留。
+
 同步、异步、两种 AccessTable 重载、`begin_get_output` 注册复用和 Get 图租约
 沿用现有接口。每次回放由设备 epoch 推进 sequence，控制队列与 mailbox 常驻，
 不需要 Host 逐轮重置或代理发送。异步输出仍须等完成后才能消费或复用。
@@ -48,11 +53,12 @@ Head/Suffix 始终启用，资源查询和性能脚本记录 `sgl_pipeline=True`
 1. 核 0 构建并校验前 `min(count, 1024)` 项，将请求头、output 描述和 head 地址
    按序 WRITE 到 CPU，最后 WRITE notify 作为 commit。
 2. head 控制链最后一个 CQE 延后回收。核 0 继续构建自己的后缀，其他核并行构建
-   其后缀；CPU 本地 acquire 观察 notify 后导入 output、校验 head、开始数据 WRITE。
+   其后缀；CPU 本地 acquire 观察 notify 后导入 output、填充 head SGE、开始数据 WRITE。
 3. 设备汇总后缀构建结果并回收 head 控制 CQE。成功时 WRITE 后缀地址，最后
    WRITE `Progress(sequence, result)`；失败时只 WRITE 错误 token。
    CPU 本地 acquire 等待后缀 commit，期间可回收已完成的数据计划。
-4. CPU 校验后缀、填充 SGE 并提交后缀 WRITE。每个计划独占 WR/SGE 存储到 CQE，
+4. CPU 观察到后缀成功 commit 后填充 SGE 并提交后缀 WRITE，不再单独扫描源地址范围。
+   每个计划独占 WR/SGE 存储到 CQE，
    最多四个计划在途，按 SQ credits 回收；credit 足够时不用先等 head 全部完成。
 5. 全部数据链尾 CQE 成功后，CPU 释放本轮 output 导入，再强序 WRITE done。
    设备等待本轮 done、执行可见性同步后退出。
@@ -113,10 +119,12 @@ AIV 的 `--kernel-profile-clock-mhz` 应按目标设备频率设置。另给旧�
 并用 `--multi-graph-check` 验证非空请求的多图/多节点复用。
 
 CPU profiling 输出 `CPU_SGL_PUSH_PROFILE`：`descriptor_reads=0`、`ready_wrs=0`，
-包括 head 首次提交、head 提交、后缀等待/提交、源地址校验、SGE 更新、output 导入、
+并以 `source_validation=disabled address_validate_us=0.000` 标记 CPU 源地址扫描已关闭。
+包括 head 首次提交、head 提交、后缀等待/提交、SGE 更新、output 导入、
 整轮耗时，以及 `data_wrs/tail_cqes/max_inflight/plan_reused/result`。
 这些阶段可嵌套并与 DMA 重叠，不能相加作为 kernel 时间。
 设备 profile 的 scatter 和 ready 查询均为零，ack 包含 CPU 数据传输和完成等待。
+关闭 CPU 源地址扫描只需更新、重建 CPU 服务并重启，NPU Host/kernel 和测试命令无需修改。
 
 若在 `CPU_PUSH_INIT stage=register_control` 后报注册失败，先确认 CPU 服务已包含
 mailbox 权限修复：新 mailbox 注册使用 `READ | WRITE`（access=6）。URMA 的

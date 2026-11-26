@@ -212,9 +212,7 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
 }  // extern "C"
 
 namespace {
-void CheckProfile(const kvaf::cpu_push::Transport& transport,
-                  const kvaf::CpuSglWriteSample& sample, std::uint32_t sequence,
-                  bool payload_only, bool profiling, bool pipeline = false, bool chunked = false) {
+std::string CaptureProfile(const kvaf::cpu_push::Transport& transport) {
   auto* capture = std::tmpfile();
   assert(capture);
   std::fflush(stderr);
@@ -229,6 +227,12 @@ void CheckProfile(const kvaf::cpu_push::Transport& transport,
   char buffer[4096];
   while (const auto bytes = std::fread(buffer, 1, sizeof(buffer), capture)) log.append(buffer, bytes);
   std::fclose(capture);
+  return log;
+}
+void CheckProfile(const kvaf::cpu_push::Transport& transport,
+                  const kvaf::CpuSglWriteSample& sample, std::uint32_t sequence,
+                  bool payload_only, bool profiling, bool pipeline = false, bool chunked = false) {
+  const auto log = CaptureProfile(transport);
   if (!profiling) { assert(log.empty()); return; }
   if (chunked) {
     assert(log.find("CPU_SGL_CHUNK_PROFILE sequence=" + std::to_string(sequence)) == 0);

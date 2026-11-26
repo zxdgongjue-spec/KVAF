@@ -148,5 +148,8 @@ The AIV model consumes actual USER_CTL WQEs, checks splitting and SQ/CQ wrap,
 and delays CPU done. The CPU fake-provider model poisons remote descriptors
 and supplies only the local mailbox, verifies zero descriptor READ WRs, posts
 the suffix while head CQEs remain pending, preserves in-flight WR/SGE arrays,
-and drains accepted data on suffix failure. See
+and drains accepted data on suffix failure. Device-push cases also verify that
+CPU source-range scanning is disabled for both head and suffix, while request
+sequence and output capacity checks remain active. Legacy READ-based cases
+continue to reject invalid source ranges. See
 [CPU SGL Push](../../docs/cpu_sgl_push.md) for the API, pipeline and comparisons.
