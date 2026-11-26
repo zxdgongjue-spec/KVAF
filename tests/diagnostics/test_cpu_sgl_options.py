@@ -16,6 +16,35 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_cooperative_build_is_opt_in_and_forwarded(self):
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        for backend, executor in (("cpu_sgl_push", "aicpu"), ("aiv_cpu_sgl_push", "aiv")):
+            self.assertFalse(parse_args(["--backend", backend]).sgl_push_cooperative)
+            for head in (8, 128, 256, 512, 1024):
+                args = parse_args(["--backend", backend, "--sgl-push-chunked", "--sgl-push-cooperative",
+                                   "--sgl-push-head-rows", str(head)])
+                self.assertIsNone(validate_args(args))
+                self.assertTrue(parse_args(workload_command(args)).sgl_push_cooperative)
+                execution = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push",
+                                               sgl_push_chunked=True, sgl_push_head_rows=head, sgl_push_cooperative=True)
+                self.assertTrue(execution.runtime_kwargs["get_resources"][0][1]["sgl_push_cooperative"])
+                self.assertNotIn("sgl_push_cooperative", execution.runtime_kwargs["put_resources"][0][1])
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+                    args.output_dir = Path(directory)
+                    report = BatchGetCsv(args); report.add_summary("graph", {}); report.write()
+                    with report.summary_path.open() as source:
+                        self.assertEqual(next(csv.DictReader(source))["sgl_push_cooperative"], "1")
+            default = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push", sgl_push_chunked=True)
+            self.assertNotIn("sgl_push_cooperative", default.runtime_kwargs["get_resources"][0][1])
+            for extra in ([], ["--sgl-push-chunked", "--sgl-push-head-rows", "7"],
+                          ["--sgl-push-chunked", "--sgl-push-head-rows", "1023"]):
+                self.assertIn("--sgl-push-cooperative", validate_args(parse_args(["--backend", backend,
+                              "--sgl-push-cooperative", *extra])))
+        for backend in ("aiv", "ubmem", "cpu_sgl_write", "aiv_cpu_sgl_write"):
+            self.assertIn("--sgl-push-cooperative", validate_args(parse_args(["--backend", backend, "--sgl-push-cooperative"])))
+
     def test_small_head_resources_and_child_csv_forwarding(self):
         kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
                                PutExecutionConfig=lambda *args: args,

@@ -55,6 +55,7 @@ struct ExecutionResources {
   bool sgl_pipeline{false};
   bool sgl_push_chunked{false};
   std::uint32_t sgl_push_head_rows{1024};
+  bool sgl_push_cooperative{false};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

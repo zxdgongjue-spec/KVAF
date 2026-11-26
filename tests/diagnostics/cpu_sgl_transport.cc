@@ -410,7 +410,7 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
 }
 // Release chunks only after a prior chunk has actually been posted. Chunk 2
 // precedes chunk 1, proving the consumer has no head-of-line builder barrier.
-void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault = 0, bool profiling = true, bool all_ready = false, std::uint32_t workers = 4, bool pushed = false, std::uint32_t head_rows = kvaf::cpu_push::kChunkRows, bool delay_ready = false) {
+void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault = 0, bool profiling = true, bool all_ready = false, std::uint32_t workers = 4, bool pushed = false, std::uint32_t head_rows = kvaf::cpu_push::kChunkRows, bool delay_ready = false, bool cooperative = false) {
   using namespace kvaf::cpu_push;
   Layout layout;
   assert(MakeLayout(token_bytes, workers, &layout, true));
@@ -428,7 +428,7 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
   setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = hbm_bytes;
   setup.npu_tp = 1; setup.npu_psn = 1; setup.token_value = 7;
   setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = workers;
-  setup.output_mode = pushed ? PushOutputMode(head_rows) : kChunkedOutput; setup.sge_per_wr = 4;
+  setup.output_mode = pushed ? PushOutputMode(head_rows, cooperative) : kChunkedOutput; setup.sge_per_wr = 4;
   std::memcpy(setup.segment, &hbm_segment, sizeof(hbm_segment));
   for (auto& channel : setup.channels) channel.bytes = 28;
   kvaf::peer::OpenCpuPushGetResponse response{};
@@ -436,6 +436,12 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
   kvaf::peer::OpenCpuSglPushRequest push{};
   push.base = setup; push.control_tp = push.control_psn = 1; push.control.bytes = 28;
   kvaf::peer::OpenCpuSglPushResponse mailbox{};
+  if (pushed && cooperative) {
+    for (const auto head : {0U, 7U, 1025U}) {
+      auto invalid = setup; invalid.output_mode = kPushCooperativeOutput | (head << 8);
+      assert(!transport.Initialize(&context, &source_segment, invalid, QueryTp, ImportJetty, 1, &response, 0, &push, &mailbox).ok());
+    }
+  }
   if (pushed && head_rows < kChunkRows) {
     auto invalid = setup;
     invalid.output_mode = kPushHeadOutput; // Missing Head rows.
@@ -456,7 +462,8 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
     auto& result = sequence == 1 ? output : second;
     std::fill(result.begin(), result.end(), 0xa5);
     output_base = reinterpret_cast<std::uint64_t>(result.data()); output_bytes = result.size();
-    *reinterpret_cast<Request*>(control) = {kMagic, sequence, count, token_bytes, workers, kChunkedOutput, {kChunkRows, head_rows < kChunkRows ? head_rows : 0}};
+    *reinterpret_cast<Request*>(control) = {kMagic, sequence, count, token_bytes, workers, kChunkedOutput,
+        {kChunkRows, head_rows < kChunkRows ? head_rows : 0, cooperative ? 1U : 0U}};
     auto* target = reinterpret_cast<OutputTarget*>(control + layout.output_target);
     *target = {}; target->base = output_base; target->bytes = output_bytes;
     target->token_value = 7; target->segment_bytes = sizeof(urma_seg_t);
@@ -525,6 +532,11 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
       advertised = head_rows == 256 ? 128 : 256; assert(!transport.ReadDescriptor(sequence).ok());
       advertised = head_rows;
     }
+    if (pushed && sequence == 1) {
+      auto& advertised = reinterpret_cast<Request*>(control)->reserved_words[2];
+      advertised = cooperative ? 0 : 1; assert(!transport.ReadDescriptor(sequence).ok());
+      advertised = cooperative ? 1 : 0;
+    }
     assert(transport.ReadDescriptor(sequence).ok());
     assert(transport.WriteBatch(pushed ? &stopped : nullptr).ok());
     assert(transport.batch_result() == (fault == 5 ? Result::kTimeout : fault == 3 ? Result::kSequenceError : fault ? Result::kInvalidRequest : Result::kOk));
@@ -532,9 +544,23 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
     assert(transport.Complete(sequence, transport.batch_result()).ok());
     assert(reinterpret_cast<Completion*>(hbm + layout.done)->token == Progress(sequence, uint32_t(transport.batch_result())));
     assert(ready_wrs == 0);
-    if (!fault && count == 8192 && token_bytes == 656) assert(data_wrs == 2048 && data_tails == chunks * 4 && data_sges == count);
+    if (!fault && count == 8192 && token_bytes == 656) {
+      unsigned expected_wrs = 0, expected_tails = 0;
+      for (unsigned c = 0; c < chunks; ++c) {
+        const auto rows = PushChunkEnd(count, c, head_rows) - PushChunkBegin(c, head_rows);
+        for (unsigned q = 0; q < 4; ++q) {
+          const auto shard = rows / 4 + (q < rows % 4);
+          expected_wrs += (shard + 3) / 4;
+          expected_tails += shard != 0;
+        }
+      }
+      assert(data_wrs == expected_wrs && data_tails == expected_tails && data_sges == count);
+    }
     CheckProfile(transport, {}, sequence, false, profiling, false, true, pushed);
-    if (pushed) assert(read_posts == 0);
+    if (pushed) {
+      assert(read_posts == 0);
+      if (profiling) assert(CaptureProfile(transport).find(cooperative ? "build_mode=cooperative " : "build_mode=round_robin ") != std::string::npos);
+    }
     if (delay_ready) {
       const auto log = CaptureProfile(transport);
       assert(std::stod(log.substr(log.find("no_ready_inflight_us=") + 21)) >= 1000);

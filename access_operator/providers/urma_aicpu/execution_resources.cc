@@ -24,7 +24,7 @@ struct AicpuExecutionResources::State {
       push = std::make_unique<cpu_push::CpuPushTransport>(cpu_push::Config{
           config.peer_link, config.kernel_json, config.local_eid, config.token_bytes, config.workers,
           (config.batch_get_mode == "cpu_sgl_write" || config.batch_get_mode == "cpu_sgl_push"), config.sge_per_wr, config.sgl_payload_only, false,
-          config.sgl_pipeline, config.batch_get_mode == "cpu_sgl_push", config.sgl_push_chunked, config.sgl_push_head_rows});
+          config.sgl_pipeline, config.batch_get_mode == "cpu_sgl_push", config.sgl_push_chunked, config.sgl_push_head_rows, config.sgl_push_cooperative});
 #else
     valid_mode = config.batch_get_mode == "gather_read";
 #endif

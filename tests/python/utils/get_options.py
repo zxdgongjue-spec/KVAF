@@ -100,6 +100,8 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="pipeline 1024-row chunks through construction, descriptor READ and concurrent WRITEs; CPU SGL Write backends only")
     group.add_argument("--sgl-push-chunked", action="store_true",
                        help="device-WRITE each ready 1024-row chunk; cpu_sgl_push/aiv_cpu_sgl_push only")
+    group.add_argument("--sgl-push-cooperative", action="store_true",
+                       help="all device workers build each chunk together; requires --sgl-push-chunked and Head rows divisible by 8")
     group.add_argument("--sgl-push-head-rows", type=int, default=1024,
                        help="first device-push chunk rows (1..1024); requires --sgl-push-chunked for nondefault values")
     group.add_argument("--npu-eids", type=parse_npu_eids,
@@ -163,6 +165,10 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
+    if args.sgl_push_cooperative and (not args.sgl_push_chunked or args.backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push")):
+        return "--sgl-push-cooperative requires a device-push backend with --sgl-push-chunked"
+    if args.sgl_push_cooperative and args.sgl_push_head_rows % 8:
+        return "--sgl-push-cooperative requires --sgl-push-head-rows to be a multiple of 8"
     if not 1 <= args.sgl_push_head_rows <= 1024:
         return "--sgl-push-head-rows must be in [1, 1024]"
     if args.sgl_push_head_rows != 1024 and (not args.sgl_push_chunked or args.backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push")):
@@ -237,6 +243,8 @@ def workload_command(args):
             command += ["--sgl-pipeline"]
         if getattr(args, "sgl_push_chunked", False):
             command += ["--sgl-push-chunked"]
+            if args.sgl_push_cooperative:
+                command += ["--sgl-push-cooperative"]
             if args.sgl_push_head_rows != 1024:
                 command += ["--sgl-push-head-rows", str(args.sgl_push_head_rows)]
     if args.npu_eids:
@@ -263,7 +271,7 @@ def configure_backend_help(parser, argv=None):
     if backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push"):
         hidden.update(("sge_per_wr", "sgl_payload_only", "sgl_pipeline"))
     if backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push"):
-        hidden.update(("sgl_push_chunked", "sgl_push_head_rows"))
+        hidden.update(("sgl_push_chunked", "sgl_push_head_rows", "sgl_push_cooperative"))
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

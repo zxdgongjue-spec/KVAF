@@ -3,6 +3,7 @@
 #undef KVAF_CPU_SGL_REUSE_FIXTURE
 #include <deque>
 #include <functional>
+#include <array>
 
 namespace {
 struct PushFixture : Fixture {
@@ -12,15 +13,16 @@ struct PushFixture : Fixture {
   uint32_t sq_db{}, cq_db{}, consumed{}, produced{};
   uint64_t head_commit_cycle{};
   uint64_t later_chunk_cycle{};
-  bool chunks{};
+  bool chunks{}, cooperative{};
+  std::array<std::atomic<uint32_t>, kMaxWorkers> built_rows{}, built_head_rows{};
   uint32_t head_rows{kChunkRows};
   bool fail_first_control{};
   std::vector<std::function<void()>> source_checks;
   std::deque<std::vector<std::function<void()>>> pending_controls;
   uint32_t max_pending{};
   static inline PushFixture* active{};
-  explicit PushFixture(uint32_t workers, bool chunked = false, uint32_t head = kChunkRows, uint32_t capacity = kCapacity) : Fixture(workers, capacity), mailbox(layout.staging / 64), sq(64 * 16), cq(64 * 8), chunks(chunked), head_rows(head) {
-    args.execution.sequence = chunks ? PushLaunch(head_rows) : kPipelineLaunch;
+  explicit PushFixture(uint32_t workers, bool chunked = false, uint32_t head = kChunkRows, uint32_t capacity = kCapacity, bool coop = false) : Fixture(workers, capacity), mailbox(layout.staging / 64), sq(64 * 16), cq(64 * 8), chunks(chunked), cooperative(coop), head_rows(head) {
+    args.execution.sequence = chunks ? PushLaunch(head_rows, cooperative) : kPipelineLaunch;
     if (chunks) {
       workspace.resize((layout.bytes + PushWorkspaceBytes(head_rows)) / 64);
       args.execution.workspace = reinterpret_cast<uint64_t>(workspace.data());
@@ -37,9 +39,35 @@ struct PushFixture : Fixture {
     e.cq_va = reinterpret_cast<uint64_t>(cq.data()); e.cq_db_va = reinterpret_cast<uint64_t>(&cq_db);
     e.cq_depth = 64; e.cqe_size = 32;
     sgl_model::sq_begin = e.sq_va; sgl_model::sq_end = e.sq_va + sq.size() * 4;
-    active = this; sgl_model::doorbell = Doorbell;
+    active = this; sgl_model::doorbell = Doorbell; sgl_model::descriptor_copy = DescriptorCopy;
   }
-  ~PushFixture() { sgl_model::doorbell = nullptr; active = nullptr; }
+  ~PushFixture() { sgl_model::doorbell = nullptr; sgl_model::descriptor_copy = nullptr; active = nullptr; }
+  static void DescriptorCopy(uint32_t core, uint64_t address, uint32_t bytes) {
+    auto& f = *active;
+    if (!f.chunks) return;
+    const auto row = uint32_t((address - f.args.execution.workspace - f.layout.descriptor) / 8);
+    const auto chunk = PushChunkIndex(row, f.head_rows);
+    const auto first = PushChunkBegin(chunk, f.head_rows), last = PushChunkEnd(f.count, chunk, f.head_rows);
+    const auto begin = f.cooperative ? PushBuildBoundary(first, last, core, f.args.execution.workers) : first;
+    const auto end = f.cooperative ? PushBuildBoundary(first, last, core + 1, f.args.execution.workers) : last;
+    assert(row == begin && bytes == (end - begin) * 8);
+    if (!f.cooperative) assert(core == chunk % f.args.execution.workers);
+    f.built_rows[core] += bytes / 8;
+    if (!chunk) f.built_head_rows[core] += bytes / 8;
+  }
+  void Check(std::vector<std::future<void>>& work, uint64_t sequence, Result result) {
+    Fixture::Check(work, sequence, result);
+    if (result != Result::kOk || !chunks) return;
+    for (uint32_t w = 0; w < args.execution.workers; ++w) {
+      uint32_t expected = 0;
+      for (uint32_t c = 0; c < PushChunkCount(count, head_rows); ++c) {
+        const auto b = PushChunkBegin(c, head_rows), e = PushChunkEnd(count, c, head_rows);
+        if (cooperative) expected += PushBuildBoundary(b, e, w + 1, args.execution.workers) - PushBuildBoundary(b, e, w, args.execution.workers);
+        else if (c % args.execution.workers == w) expected += e - b;
+      }
+      assert(built_rows[w] == expected && profiles[w].spans == expected);
+    }
+  }
   static void Doorbell(uint32_t value, uint64_t address) {
     auto& f = *active;
     if (address == reinterpret_cast<uint64_t>(&f.cq_db)) {
@@ -74,7 +102,13 @@ struct PushFixture : Fixture {
             const auto* bytes = reinterpret_cast<const uint8_t*>(state->sent);
             for (size_t i = 0; i < sizeof(state->sent) + sizeof(state->state); ++i) assert(bytes[i] == 0xa5);
             const auto sequence = reinterpret_cast<const Request*>(base)->sequence;
-            assert((sgl_model::Load(f.args.execution.workspace + f.layout.ready) >> 32) != sequence);
+            if (f.cooperative) {
+              for (uint32_t core = 0; core < f.args.execution.workers; ++core) {
+                const auto end = std::min(uint32_t(f.count), f.head_rows);
+                const auto expected = PushBuildBoundary(0, end, core + 1, f.args.execution.workers) - PushBuildBoundary(0, end, core, f.args.execution.workers);
+                assert(f.built_head_rows[core] == expected);
+              }
+            } else assert((sgl_model::Load(f.args.execution.workspace + f.layout.ready) >> 32) != sequence);
           }
           f.head_commit_cycle = AscendC::GetSystemCycle();
         }
@@ -93,6 +127,8 @@ struct PushFixture : Fixture {
   }
   std::vector<std::future<void>> LaunchPush() {
     later_chunk_cycle = head_commit_cycle = 0;
+    for (auto& rows : built_rows) rows = 0;
+    for (auto& rows : built_head_rows) rows = 0;
     if (chunks) {
       auto* state = reinterpret_cast<ChunkPushState*>(args.execution.workspace + layout.staging);
       std::memset(state->sent, 0xa5, sizeof(state->sent) + sizeof(state->state));
@@ -114,6 +150,7 @@ struct PushFixture : Fixture {
     assert(header->sequence == sequence && header->count == uint32_t(count) && header->mode == (chunks ? kChunkedOutput : kDirectOutput));
     assert(header->reserved_words[0] == (chunks ? kChunkRows : std::min(uint32_t(count), kPipelineHeadRows)));
     assert(header->reserved_words[1] == (chunks && head_rows < kChunkRows ? head_rows : 0));
+    assert(header->reserved_words[2] == (cooperative ? 1U : 0U));
     const auto* target = reinterpret_cast<OutputTarget*>(base + layout.output_target);
     assert(target->base == args.execution.output && !std::memcmp(target->segment, args.output_target.segment, kOutputSegmentBytes));
   }
@@ -165,6 +202,59 @@ struct PushFixture : Fixture {
 };
 }
 int main() {
+  for (uint32_t head : {128U, 256U, 512U, 1024U}) for (uint32_t workers : {1U, 4U, 5U, 8U}) {
+    PushFixture f(workers, true, head, kCapacity, true); uint64_t sequence = 0;
+    for (uint32_t count : {7U, head, head + 1, head + 1024, head + 1025, 0U, 9001U}) {
+      f.count = count; ++sequence;
+      auto work = f.LaunchPush();
+      if (count) { f.WaitHead(sequence); f.FinishCpu(sequence); }
+      f.Check(work, sequence, Result::kOk);
+      assert(f.pending_controls.empty());
+    }
+  }
+  for (uint32_t count : {1U, 7U, 9001U}) {
+    PushFixture f(8, true, 8, kCapacity, true); f.count = count;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+  }
+  {
+    PushFixture f(4, true, 256, 65536, true); f.count = 65536;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+  }
+  {
+    // A slow Head partition gates publication, while other cores can build
+    // four chunks ahead without a per-chunk global barrier.
+    PushFixture f(4, true, 512, kCapacity, true); f.count = 9001;
+    sgl_model::pause_row = 128; sgl_model::paused = false; sgl_model::resume = false;
+    auto work = f.LaunchPush();
+    const auto end = std::chrono::steady_clock::now() + 5s;
+    while (!sgl_model::paused.load()) assert(std::chrono::steady_clock::now() < end);
+    while (sgl_model::Load(f.args.execution.workspace + f.layout.ready + 2 * 64) != Progress(1, 4))
+      assert(std::chrono::steady_clock::now() < end);
+    assert(!sgl_model::Load(reinterpret_cast<uint64_t>(f.mailbox.data()) + 64));
+    assert(!f.produced);
+    sgl_model::resume = true; f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+    sgl_model::pause_row = UINT32_MAX;
+  }
+  {
+    PushFixture f(4, true, 512, kCapacity, true); f.count = 9001;
+    sgl_model::pause_row = 768; sgl_model::paused = false; sgl_model::resume = false;
+    auto work = f.LaunchPush(); f.WaitHead(1);
+    const auto end = std::chrono::steady_clock::now() + 5s;
+    while (!sgl_model::paused.load()) assert(std::chrono::steady_clock::now() < end);
+    while (sgl_model::Load(f.args.execution.workspace + f.layout.ready + 2 * 64) != Progress(1, 5))
+      assert(std::chrono::steady_clock::now() < end);
+    // This row belongs to the stalled worker in a later chunk. Fail only
+    // after the Head has been accepted, so the CPU must receive drained done.
+    f.rows[2816] = -1;
+    assert(sgl_model::Load(reinterpret_cast<uint64_t>(f.mailbox.data()) + f.layout.ready + 64) == 0);
+    sgl_model::resume = true; f.FinishCpu(1, Result::kInvalidRequest); f.Check(work, 1, Result::kInvalidRequest);
+    sgl_model::pause_row = UINT32_MAX;
+  }
+  {
+    PushFixture f(4, true, 512, kCapacity, true); f.count = 9001; f.rows[511] = -1;
+    auto work = f.LaunchPush(); f.Check(work, 1, Result::kInvalidRequest); assert(!f.produced);
+  }
+
   for (uint32_t head : {128U, 256U, 512U}) for (uint32_t workers : {1U, 4U, 5U, 8U}) {
     PushFixture f(workers, true, head); uint64_t sequence = 0;
     for (uint32_t count : {7U, head, head + 1, head + 1024, head + 1025, 0U, 9001U}) {

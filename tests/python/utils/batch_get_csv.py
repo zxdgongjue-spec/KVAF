@@ -10,7 +10,7 @@ SUMMARY_FIELDS = (
     "backend", "transport", "execution",
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
     "payload_bytes_per_call", "aiv_cores", "aicpu_workers", "jettys_per_core", "max_inflight_total",
-    "sge_per_wr", "sgl_pipeline", "sgl_pipeline_mode", "sgl_push_chunked", "sgl_push_head_rows",
+    "sge_per_wr", "sgl_pipeline", "sgl_pipeline_mode", "sgl_push_chunked", "sgl_push_head_rows", "sgl_push_cooperative",
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
@@ -56,6 +56,7 @@ class BatchGetCsv:
             sgl_pipeline_mode="device_push_chunked" if getattr(args, "sgl_push_chunked", False) else "device_push_head_suffix" if args.backend in ("cpu_sgl_push", "aiv_cpu_sgl_push") else "chunked" if getattr(args, "sgl_pipeline", False) else "disabled",
             sgl_push_chunked=int(getattr(args, "sgl_push_chunked", False)),
             sgl_push_head_rows=getattr(args, "sgl_push_head_rows", 1024),
+            sgl_push_cooperative=int(getattr(args, "sgl_push_cooperative", False)),
         )
 
     def add_summary(self, execution, measurements):

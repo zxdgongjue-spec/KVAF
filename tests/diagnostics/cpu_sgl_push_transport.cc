@@ -100,6 +100,13 @@ void RunMailbox(uint32_t count, uint32_t sge, bool fail_suffix = false, bool nar
 }
 }
 int main() {
+  for (auto head : {8U, 128U, 256U, 512U, 1024U}) {
+    for (auto count : {7U, head, head + 1, head + 1024, head + 1025, 8192U})
+      RunChunks(count, 656, 0, true, false, 4, true, head, false, true);
+    for (auto fault : {1, 3, 4, 5}) RunChunks(8192, 656, fault, true, false, 4, true, head, false, true);
+  }
+  RunChunks(65536, 16, 0, true, true, 5, true, 256, false, true);
+  RunChunks(8192, 656, 0, false, true, 8, true, 1024, false, true);
   for (auto head : {128U, 256U, 512U}) {
     for (auto count : {7U, head, head + 1, head + 1024, head + 1025, 8192U})
       RunChunks(count, 656, 0, true, false, 4, true, head);

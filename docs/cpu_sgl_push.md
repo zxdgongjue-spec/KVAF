@@ -40,6 +40,8 @@ resources = kvaf.ExecutionResources(cores=4, sge_per_wr=4)
 CLI 对应 `--sgl-push-chunked --sgl-push-head-rows 256`，AIV/AICPU 均支持 1..1024。
 例如 `kvaf.ExecutionResources(cores=4, sge_per_wr=4, sgl_push_chunked=True, sgl_push_head_rows=256)`。
 Head 行数按执行资源固定，图回放可改变有效请求长度；配置与 CSV 记录 `sgl_push_head_rows`。
+可选 `sgl_push_cooperative=True` / `--sgl-push-cooperative`，让所有设备核共同构建每段，
+要求同时启用多段，且 H 为 8..1024 中的 8 的倍数。默认关闭，保留原按段分核方案。
 新算法不支持 `sgl_payload_only`；性能比较使用完整 kernel 和端到端计时。
 
 有效前缀的 `output_indices[i]` 必须等于 `i`，输出至少有
@@ -111,7 +113,7 @@ CPU 仍逐轮导入/释放输出 segment，这部分成本计入整体延迟。
 ### 小 Head 与后续 1024 行分段
 
 设配置 Head 行数为 H，第一段为 `[0, min(count, H))`；第 c 段（c≥1）为
-`[H+(c-1)*1024, min(count, H+c*1024))`。全局段号仍由 `c % workers` 的 worker
+`[H+(c-1)*1024, min(count, H+c*1024))`。默认全局段号仍由 `c % workers` 的 worker
 构建，CPU、设备发布和 SGE/WR 计划共用同一套边界计算。空请求仍不通知 CPU。
 H=256、count=8192 时共有 9 段：256 行 Head、7 段 1024 行、最后 768 行。
 在四条数据 Jetty、SGE4 下仍是 2048 个数据 WR，按段提交为 36 次 post 和 36 个尾 CQE；
@@ -122,6 +124,35 @@ H=256、count=8192 时共有 9 段：256 行 Head、7 段 1024 行、最后 768 
 CPU 先验证协商值，再接受请求头；旧 CPU 服务会拒绝该 setup，旧 kernel 发出的固定 1024 头也会被拒绝。
 65536 行最多产生 65 段，新增第 65 个成功 commit 源放在原 `ChunkPushState` 尾后的一条 Word；
 原 64 个成功槽位、错误槽位和管理状态的偏移均保留，每条源数据继续保持到其控制 CQE 完成。
+
+### 可选各核协同构建
+
+开启 `--sgl-push-cooperative` 后，AIV 和 AICPU 均按以下方式构建；CPU 的数据计划、
+四条数据 Jetty、单线程提交和在途窗口保持相同：
+
+1. 每个 worker 都依次参与第 0、1、2…段，在每段内按 8 个地址一组分配连续子区间。
+   每个 64 B 地址清单缓存行只有一个写入核；H 要求是 8 的倍数，末段可以不足 8 行。
+   某些子区间为空时该 worker 仍发布完成进度。
+2. 本地 Ready 表示该 worker 已完成的全局段数。核 0 取所有 worker 进度的最小值，
+   只有全段各部分均就绪才推送该段。Head 同样由所有核构建，核 0 汇齐后直接提交。
+3. 无需所有核每段停在同一个 barrier。非发布核完成自己的子区间后可以继续构建后段；
+   最多提前构建四段，再等待核 0 对更早段写入本轮不可变 commit 源槽位。
+   该标记表示发布已经准备，可能早于 doorbell，不代表控制 DMA/CQE 已完成。
+4. 核 0 每段只构建自己的一部分，在段间及等待窗口时转发；控制侧仍最多四条链在途。
+   对 CPU 继续发布原 `chunk % workers` 虚拟 owner 的进度，CPU 无需改为全核聚合。
+   各段按段号发布，单个慢核会阻挡相应段；该代价需要和并行构建收益一起实测。
+
+例如 H=512、4 核时，Head 子区间分别为 `[0,128)`、`[128,256)`、
+`[256,384)`、`[384,512)`；下一段为 `[512,1536)`，各核各构建 256 项。
+核 0 构建和发布仍然串行执行，但其单次构建量缩小为约 1/workers。
+`head_build` 在此模式下从核 0 开始构建自己的 Head 部分，到汇齐所有 Head 部分为止，
+包含汇齐等待；`head_doorbell` 口径不变。其他核的 Head 打点仍为零。
+
+该模式使用 setup mode 7（高位保存 H）和请求头 `reserved_words[2]=1` 双重校验，
+避免旧 kernel 忽略协同标记后混用进度含义。须同步重建 CPU 服务、NPU Host/Python 和 kernel。
+默认按段分核仍使用原 mode 5/6；两种策略可在同一版本内切换。
+配置/CSV 记录 `sgl_push_cooperative`，设备配置输出 `sgl_push_build_mode`，
+CPU chunk 日志输出 `build_mode=cooperative/round_robin`。
 
 流水发布后发生后缀错误时，CPU 不提交错误后缀，排空已提交的合法数据后返回失败 done。
 失败请求可能已写入 head，output 不可消费；按现有执行资源失效和重建流程处理。
@@ -211,7 +242,29 @@ done
 ```
 
 AICPU 替换为 `--backend cpu_sgl_push --aicpu-workers 5`，使用另一组报告目录。
-本轮 `head_build` 测的是前 `min(count, H)` 行的实际构建；`head_doorbell` 的计时起点和提交边界保持不变。
+比较构建策略时固定 Head、核数和图 API，只切换协同开关，例如：
+
+```bash
+for strategy in round_robin cooperative; do
+  extra=()
+  if [[ "$strategy" == cooperative ]]; then extra=(--sgl-push-cooperative); fi
+  KVAF_CPU_SERVICE_ADDR=141.62.38.71:21112 DEVICE_ID=7 \
+    bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend aiv_cpu_sgl_push --aiv-cores 4 --sge-per-wr 4 \
+    --sgl-push-chunked --sgl-push-head-rows 512 "${extra[@]}" \
+    --execution graph --graph-api acl \
+    --request-length 32768 --table-capacity 1277952 --miss-count 8192 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+    --warmup 10 --iterations 100 --kernel-profile \
+    --output-dir "reports/aiv-acl-head512-${strategy}"
+done
+```
+
+AICPU 同样使用此开关，改为 `--backend cpu_sgl_push --aicpu-workers 5` 并更换报告目录。
+先比较同一 Head 的策略差异，再独立比较 Head=1024/512/256/128。
+按段分核时 `head_build` 测的是前 `min(count, H)` 行的实际构建，协同时包含汇齐等待；
+`head_doorbell` 的计时起点和提交边界保持不变。
 CPU 日志增加 `head_rows=H`，并新增完整的无就绪段时间：
 
 - `no_ready_us`：首次扫描确认没有可提交段，到后续发现就绪段的区间累计，包含区间内的扫描、循环和 CQ 回收。
@@ -221,6 +274,57 @@ CPU 日志增加 `head_rows=H`，并新增完整的无就绪段时间：
 后两者之和等于 `no_ready_us`；已知有就绪段但因 SQ credits/在途窗口等待的时间不计入。
 这些都是 CPU 观察到的 wall-clock 区间，包含 CPU 调度影响；“在途”不证明 DMA 始终忙碌。
 它们与 `chunk_ready_us`、部分 `chunk_cq_wait_us` 重叠，不能相加。以 kernel/端到端耗时判断净收益。
+
+### CPU 整轮计时、掩盖与相加关系
+
+两个设备推送后端共用同一 CPU service。`cpu_total_us` 从 CPU acquire 观察本轮 Head
+notify 后开始，到收回最终 Done WRITE 的 CQE 结束；不包含此前设备的 Head 构建及通知传输。
+profile 打印在该窗口外。CPU 一个线程依次处理请求、提交/回收四条 Jetty 的数据计划，
+多队列和最多四个在途计划提供异步传输并发，并非四个 CPU 提交线程。
+
+```text
+CPU：观察 notify → 检查/导入/计划准备 → 扫 Ready → 更新 SGE/post → … → 排空数据 → unimport → Done post/CQE
+DMA：                                          └── 数据传输 ───────────┘
+设备：Head 构建/通知 ─────────────── 后段构建及地址推送 ────────────── 等待 Done
+```
+
+| 日志字段 | 计时边界 | 相加关系 |
+| --- | --- | --- |
+| `first_post_us` | CPU 起点到第一次数据 provider post 调用的入口 | 前缀；包含检查、导入、计划准备及首批 SGE 更新，不是额外阶段 |
+| `chunk_ready_us` | 累计 Ready 扫描调用的时间 | 单线程内与提交/CQ 调用互斥；不代表完整地址等待 |
+| `chunk_submit_us` | 累计 `PostPrepared` 时间 | 包含 SGE 更新、数据 provider post、循环/统计开销 |
+| `source_sge_update_us` | 逐批把源地址填入缓存 SGE | 是 submit 子项，可与 provider post 相加解释 submit |
+| `payload_post_us` | 数据 `urma_post_jetty_send_wr` 调用累计时间 | 是 submit 子项，不测异步数据传输总时间 |
+| `chunk_cq_wait_us` | 数据 CQ 轮询累计时间，包括非阻塞回收和阻塞等待 | 与 submit/Ready 扫描互斥；含轮询/调度开销，不等于纯 DMA 时长 |
+| `done_post_us`、`done_cq_wait_us` | 数据排空、output 解除导入之后的 Done 提交和 CQ 等待 | 收尾串行阶段，已在 cpu_total 内 |
+| `no_ready_us` | 首次确认无就绪段到发现就绪段的完整区间累计 | 与 Ready 扫描及部分 CQ 回收重叠，不能再加进前三项 |
+
+成功请求的 CPU 路径依次为：检查本地请求头及 output 描述、导入输出 segment、
+准备或复用 WR/SGE 计划并更新输出目标、调度各段、排空数据、解除 output 导入、发送及等待 Done。
+当前 chunk 日志没有打印全部导入/解除导入、计划准备和外层循环成本，不能仅用已打印字段
+精确还原 cpu_total。`plan_reused=1` 表示计划存储复用，仍需更新输出目标及本轮源 SGE。
+源地址范围扫描在 device push 下已关闭；头部、进度与输出边界检查继续执行。
+
+可以使用以下恒等关系，输出舍入可能带来微小误差：
+
+```text
+no_ready_us = no_ready_inflight_us + no_ready_idle_us
+chunk_submit_us = source_sge_update_us + payload_post_us + 其余提交开销
+cpu_total_us = chunk_ready_us + chunk_submit_us + chunk_cq_wait_us
+               + done_post_us + done_cq_wait_us + 其余 CPU 窗口时间
+```
+
+最后一项包含检查/导入/计划/解除导入、扫描外的等待循环、调度和计时边界开销，
+不能全部归为等待地址；也不能再把 first_post 或 no_ready 加到右侧。
+首批 post 后，前批 DMA 可掩盖后续 SGE 更新、post 和设备后段构建，但实际掩盖量
+无法由这些累计计时直接推出。`no_ready_inflight` 只有“可能被在途传输掩盖”的含义，
+CQE 可能已经到达而尚未回收；`no_ready_idle` 没有既有数据计划可掩盖，是更明确的供给断档。
+数据全部提交后的末尾排空、解除导入及 Done 是收尾依赖；准备首批数据之前也没有本轮数据 DMA 可掩盖。
+
+设备 `head_build` 嵌套于 `head_doorbell`，不能相加。后者与 cpu_total 使用不同侧的边界：
+中间遗漏通知可见性间隔，末尾设备看到 Done 与 CPU 收到 Done CQE 也不同；
+因此 `head_doorbell + cpu_total` 不能精确拼成 kernel，`kernel - cpu_total` 也不是纯设备计算时间。
+总收益使用相同图 API、相同工作量及采样条件下的 kernel/端到端数据判断。
 
 AIV 的 `--kernel-profile-clock-mhz` 应按目标设备频率设置。另给旧后端加
 `--sgl-pipeline`、单独指定报告目录，可与旧逐 chunk 流水比较。
@@ -246,9 +350,10 @@ BATCH_GET_PROFILE ... stage=head_build mean_us=... p50_us=... p99_us=...
 BATCH_GET_PROFILE ... stage=head_doorbell mean_us=... p50_us=... p99_us=...
 ```
 
-- `head_build`：核 0 构建前 `min(count, H)` 个源地址清单的函数耗时，H 默认 1024。
+- `head_build`：默认按段分核时，核 0 构建前 `min(count, H)` 个源地址清单的函数耗时，H 默认 1024。
   AIV 包含 SIMT 查表/检查、UB 到 HBM 拷贝及其同步；AICPU 包含对应的地址填充循环和输出映射检查。
   请求头、输出描述准备和后缀构建不计入该值。
+  协同构建时改为核 0 自己的 Head 构建及汇齐所有 Head 部分的时间，见上节。
 - `head_doorbell`：从本轮最早设备 worker 进入，到核 0 提交含 Head notify 的最后一批控制 WRITE。
   AIV 在实际 `st_dev` doorbell 后记录；AICPU 的 provider 内部操作 doorbell，故以
   `urma_post_jetty_send_wr` 成功返回作为可观察边界，不等待控制 CQE。
@@ -296,6 +401,8 @@ FIFO 回收/槽位复用及部分提交失败后 WR/SGE 存储保留；资源解
 小 Head 覆盖 128/256/512、非对齐 1/7/1023、Head/后续段边界、65 段上限、
 旧式请求头/错误协商拒绝、失败/STOP、不同输出目标的计划复用；延迟进度发布的模型验证
 `no_ready_inflight_us` 覆盖完整等待区间而不只是本地扫描耗时。
+协同模型覆盖所有核的实际构建范围与缓存行唯一所有权、短 Head/空子区间、慢核导致 Head 延迟、
+其他核可提前构建、Head 发布前/后失败、65 段、多轮进度和 mode 7/请求头标记不匹配拒绝。
 没有 UMDK 头文件时跳过 CPU 传输模型和原生 UMDK 语法检查。
 
 这些检查不替代 CANN/ccec 编译、真实 DMA 可见性、注册退役及 NPU 图回放验证。
