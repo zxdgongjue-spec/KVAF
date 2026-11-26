@@ -41,6 +41,7 @@ inline void GatherSpinPause() {
 }
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
+enum class GatherReadMode { kAicpu, kAiv };
 
 // CPU steady-clock timestamps only; they do not share the AIV clock.
 struct alignas(64) CpuGatherThreadProfile {
@@ -60,7 +61,8 @@ class CpuGatherExecutor {
                 std::size_t min_bytes_per_thread = 256U * 1024U,
                 GatherWaitMode wait_mode = GatherWaitMode::kPassive,
                 void* workspace_memory = nullptr, std::uint64_t workspace_base = 0U,
-                bool bind_cores = false, std::size_t cpu_offset = 0U)
+                bool bind_cores = false, std::size_t cpu_offset = 0U,
+                GatherReadMode read_mode = GatherReadMode::kAicpu)
       : memory_(static_cast<std::uint8_t*>(memory)),
         base_(base),
         workspace_memory_(static_cast<std::uint8_t*>(workspace_memory ? workspace_memory : memory)),
@@ -70,7 +72,7 @@ class CpuGatherExecutor {
                               cpu_ids_.empty() ? std::max<std::size_t>(1U, max_threads)
                                                : cpu_ids_.size())),
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
-        wait_mode_(wait_mode) {}
+        wait_mode_(wait_mode), read_mode_(read_mode) {}
 
   ~CpuGatherExecutor() {
     {
@@ -129,7 +131,10 @@ class CpuGatherExecutor {
     staging_ = workspace_memory_ + (staging - workspace_base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
-    if (cooperative_) {
+    if (pipeline_ready_ != nullptr && read_mode_ == GatherReadMode::kAicpu) {
+      chunk_done_.assign(GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_), 0U);
+      next_chunk_.store(0U, std::memory_order_relaxed);
+    } else if (cooperative_) {
       cooperative_count_ = GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_);
       for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
         cooperative_progress_[chunk].remaining.store(threads, std::memory_order_relaxed);
@@ -168,11 +173,14 @@ class CpuGatherExecutor {
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
+  std::uint64_t CopyReadyRange(std::uint64_t offset, std::uint64_t end) const;
   bool WaitSuffix() const;
 
   std::uint64_t ProcessSource(std::size_t worker);
-  void PublishReady();
+  std::uint64_t CopyDynamicChunks();
+  void PublishTaskReady();
   void PublishCooperativeReady();
+  void AdvanceReadyPrefix(std::uint64_t observed, std::uint64_t ready);
 
   static std::uint64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -206,6 +214,7 @@ class CpuGatherExecutor {
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;
   GatherWaitMode wait_mode_;
+  const GatherReadMode read_mode_;
   std::vector<std::thread> helpers_;
   std::mutex mutex_;
   std::condition_variable ready_;
@@ -223,6 +232,9 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
+  // AICPU helpers claim and publish completed uniform chunks independently.
+  std::vector<std::uint32_t> chunk_done_;
+  std::atomic<std::size_t> next_chunk_{0U};
   std::uint32_t first_chunk_divisor_{0U};
   bool cooperative_{};
   std::uint32_t cooperative_count_{};

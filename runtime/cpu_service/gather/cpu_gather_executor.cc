@@ -63,6 +63,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   const auto* descriptor = workspace_memory_ + (descriptor_address - workspace_base_);
   GatherDescriptorHeader header;
   std::memcpy(&header, descriptor, sizeof(header));
+  if (read_mode_ == GatherReadMode::kAicpu && header.magic != kGatherDescriptorMagic)
+    return 0U;
   const bool head_start = (header.magic & kGatherHeadStartFlag) != 0;
   header.magic &= ~kGatherHeadStartFlag;
   if (head_start && (!control || !header.span_bytes || header.span_count <= kGatherHeadRows))
@@ -123,20 +125,24 @@ void CpuGatherExecutor::Copy() {
   CopyWorker(0U);
   if (!thread_profiles_.empty())
     copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
+  const bool publish_tasks = read_mode_ == GatherReadMode::kAiv && pipeline_ready_ && !cooperative_;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
-    PublishReady();
+    if (publish_tasks) PublishTaskReady();
     GatherSpinPause();
   }
-  if (copy_failed_.load(std::memory_order_relaxed))
+  if (descriptor_suffix_ && copy_failed_.load(std::memory_order_relaxed))
     throw std::runtime_error("gather descriptor suffix wait failed");
-  PublishReady();
+  if (publish_tasks) PublishTaskReady();
+  if (pipeline_ready_ && read_mode_ == GatherReadMode::kAicpu)
+    __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
   if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
 }
 
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
+  const bool finish_barrier = pipeline_ready_ == nullptr || read_mode_ == GatherReadMode::kAicpu;
   if (thread_profiles_.empty()) {
     (void)ProcessSource(worker);
-    if (pipeline_ready_ == nullptr) GatherBarrier();
+    if (finish_barrier) GatherBarrier();
     return;
   }
   auto& profile = thread_profiles_[worker];
@@ -148,8 +154,7 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   profile.start_ns = NowNs();
   profile.bytes = ProcessSource(worker);
   profile.copy_done_ns = NowNs();
-  // Chunk writers already completed their stores before publishing progress.
-  if (pipeline_ready_ == nullptr) GatherBarrier();
+  if (finish_barrier) GatherBarrier();
   profile.done_ns = NowNs();
   const auto cpu_end = ThreadCpuNs();
   profile.cpu_time_valid = cpu_begin != 0U && cpu_end >= cpu_begin;
@@ -175,8 +180,17 @@ bool CpuGatherExecutor::WaitSuffix() const {
   }
 }
 
-// Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
+  if (!descriptor_suffix_ || end <= head_bytes_ || offset >= end)
+    return CopyReadyRange(offset, end);
+  const auto suffix_begin = std::max(offset, head_bytes_);
+  const auto head_copied = CopyReadyRange(offset, suffix_begin);
+  if (!WaitSuffix()) return head_copied;
+  return head_copied + CopyReadyRange(suffix_begin, end);
+}
+
+// Copy only committed source spans, combining adjacent spans into one memcpy.
+std::uint64_t CpuGatherExecutor::CopyReadyRange(std::uint64_t offset, std::uint64_t end) const {
   if (offset >= end) return 0U;
   const auto begin = offset;
   const auto index_for_offset = span_bytes_ != 0U
@@ -185,21 +199,16 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
             variable_offsets_.end(), offset) - variable_offsets_.begin() - 1U);
   std::size_t index = static_cast<std::size_t>(index_for_offset);
   auto in_span = span_bytes_ != 0U ? offset % span_bytes_ : offset - variable_offsets_[index];
-  auto ready_end = descriptor_suffix_ ? std::min(end, head_bytes_) : end;
   while (offset < end) {
-    if (offset >= ready_end) {
-      if (!WaitSuffix()) return offset - begin;
-      ready_end = end;
-    }
     const auto source_address = spans_[index].address + in_span;
     const auto length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
-    auto bytes = std::min<std::uint64_t>(length - in_span, ready_end - offset);
+    auto bytes = std::min<std::uint64_t>(length - in_span, end - offset);
     ++index;
     in_span = 0U;
-    while (bytes < ready_end - offset && index < span_count_ &&
+    while (bytes < end - offset && index < span_count_ &&
            spans_[index].address == source_address + bytes) {
       const auto next_length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
-      bytes += std::min<std::uint64_t>(next_length, ready_end - offset - bytes);
+      bytes += std::min<std::uint64_t>(next_length, end - offset - bytes);
       ++index;
     }
     const auto* source = memory_ + (source_address - base_);
@@ -210,6 +219,10 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
 }
 
 std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
+  if (pipeline_ready_ == nullptr) {
+    return CopyRange(Boundary(worker), Boundary(worker + 1U));
+  }
+  if (read_mode_ == GatherReadMode::kAicpu) return CopyDynamicChunks();
   if (cooperative_) {
     std::uint64_t copied = 0;
     for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
@@ -234,9 +247,6 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
     }
     return copied;
   }
-  if (pipeline_ready_ == nullptr) {
-    return CopyRange(Boundary(worker), Boundary(worker + 1U));
-  }
   std::uint64_t copied = 0U;
   for (auto task = worker; task < task_progress_.size(); task += active_threads_) {
     const auto begin = static_cast<std::uint64_t>(task) * task_bytes_;
@@ -252,15 +262,32 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
       // progress. The task's remaining bytes can then be copied independently.
       GatherBarrier();
       __atomic_store_n(&task_progress_[task].bytes, next - begin, __ATOMIC_RELEASE);
-      if (worker == 0U) PublishReady();
+      if (worker == 0U) PublishTaskReady();
       offset = next;
     }
   }
   return copied;
 }
 
-void CpuGatherExecutor::PublishReady() {
-  if (pipeline_ready_ == nullptr || cooperative_) return;
+std::uint64_t CpuGatherExecutor::CopyDynamicChunks() {
+  std::uint64_t copied = 0U;
+  for (;;) {
+    const auto chunk = next_chunk_.fetch_add(1U, std::memory_order_relaxed);
+    if (chunk >= chunk_done_.size()) return copied;
+    const auto begin = static_cast<std::uint64_t>(chunk) * pipeline_chunk_bytes_;
+    copied += CopyReadyRange(begin, std::min(begin + pipeline_chunk_bytes_, total_bytes_));
+    GatherBarrier();
+    __atomic_store_n(&chunk_done_[chunk], 1U, __ATOMIC_RELEASE);
+    const auto observed = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
+    auto prefix = static_cast<std::size_t>(observed / pipeline_chunk_bytes_);
+    while (prefix < chunk_done_.size() &&
+           __atomic_load_n(&chunk_done_[prefix], __ATOMIC_ACQUIRE) != 0U)
+      ++prefix;
+    AdvanceReadyPrefix(observed, std::min(total_bytes_, static_cast<std::uint64_t>(prefix) * pipeline_chunk_bytes_));
+  }
+}
+
+void CpuGatherExecutor::PublishTaskReady() {
   auto copied = std::min(total_bytes_, static_cast<std::uint64_t>(ready_tasks_) * task_bytes_);
   while (ready_tasks_ < task_progress_.size()) {
     const auto begin = static_cast<std::uint64_t>(ready_tasks_) * task_bytes_;
@@ -285,11 +312,13 @@ void CpuGatherExecutor::PublishCooperativeReady() {
     ++completed;
   const auto ready = completed ? GatherProgressChunkEnd(
       total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_, completed - 1) : 0;
-  auto previous = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
-  // Only completed-block finishers publish per batch. Concurrent finishers may
-  // coalesce prefixes, but a delayed earlier finisher must never regress ready.
-  while (previous < ready) {
-    if (__atomic_compare_exchange_n(pipeline_ready_, &previous, ready, false,
+  AdvanceReadyPrefix(__atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE), ready);
+}
+
+void CpuGatherExecutor::AdvanceReadyPrefix(std::uint64_t observed, std::uint64_t ready) {
+  // Concurrent chunk finishers can advance the prefix in either order.
+  while (observed < ready) {
+    if (__atomic_compare_exchange_n(pipeline_ready_, &observed, ready, false,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
       GatherBarrier();
       break;

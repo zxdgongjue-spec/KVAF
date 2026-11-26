@@ -81,9 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph", dest="execution", action="store_const", const="graph",
                         help="shorthand for --execution graph")
     parser.add_argument("--graph-api", choices=("acl", "torch"),
-                        help="graph API (default: acl for AICPU Scatter, torch otherwise)")
-    parser.add_argument("--acl-graph-submit", choices=("native", "python"),
-                        help="ACL graph timing submission (default: native for AICPU Scatter, python otherwise)")
+                        help="graph API (AICPU Scatter requires acl, other backends default to torch)")
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
     parser.add_argument("--multi-graph-check", action="store_true",
@@ -99,12 +97,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     configure_backend_help(parser, argv)
     args = parser.parse_args(argv)
     resolve_backend(args, parser)
-    if args.graph_api is None:
-        args.graph_api = "acl" if args.backend == "cpu_push_scatter" and args.execution != "eager" else "torch"
-    if args.acl_graph_submit is not None and (args.graph_api != "acl" or args.execution == "eager"):
-        parser.error("--acl-graph-submit requires ACL graph execution")
-    if args.acl_graph_submit is None:
-        args.acl_graph_submit = "native" if args.backend == "cpu_push_scatter" else "python"
+    if args.backend == "cpu_push_scatter" and (args.execution != "eager" or args.contention_control_dir is not None):
+        if args.graph_api == "torch":
+            parser.error("AICPU Scatter graph execution requires --graph-api acl")
+        args.graph_api = "acl"
+    elif args.graph_api is None:
+        args.graph_api = "torch"
     return args
 
 
@@ -412,7 +410,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             check(plan, count, graph.leases[0])
 
         validate_graph_inputs(graph, inputs, check_captured, args.miss_count, args.graph_replays)
-        native_submit = args.graph_api == "acl" and args.acl_graph_submit == "native"
+        native_submit = args.backend == "cpu_push_scatter"
         if native_submit:
             timed_replay = graph.replay_timed
             timing_source = "acl_event_native"

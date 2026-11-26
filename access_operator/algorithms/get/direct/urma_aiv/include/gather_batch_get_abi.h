@@ -1,6 +1,5 @@
 #pragma once
 #include "sequential_batch_get_abi.h"
-#include "gather_prefix_layout.h"
 
 constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524635ULL;
 // A completed successful profile has all seven boundary timestamps. On error,
@@ -63,13 +62,3 @@ struct KvafGatherBatchGetArgs {
   uint32_t head_start;
 };
 static_assert(sizeof(KvafGatherBatchGetArgs) == 256);
-
-// Device-friendly subset of the shared CPU gather wire protocol.
-struct KvafSequentialGatherHeader {
-  uint64_t magic, sequence, staging_address;
-  uint32_t span_count, total_bytes, pipeline_chunk_bytes, span_bytes;
-  uint64_t ready_bytes;
-};
-struct KvafSequentialGatherSpan { uint64_t address; uint32_t length, reserved; };
-static_assert(sizeof(KvafSequentialGatherHeader) == 48);
-static_assert(sizeof(KvafSequentialGatherSpan) == 16);

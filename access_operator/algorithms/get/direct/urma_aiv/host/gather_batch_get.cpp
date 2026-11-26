@@ -1,7 +1,7 @@
 #include "gather_batch_get.h"
 #include "sequential_batch_get_common.h"
 #include "kvaf_aiv_batch_get.h"
-#include "cpu_gather.h"
+#include "gather_prefix_layout.h"
 #include "gather_workspace.h"
 #include "batch_get_profile.h"
 #include "peer_link.h"
@@ -36,10 +36,6 @@ Status ReadProbe(uint32_t* probe) {
     if (std::strcmp(value, ProbeName(p)) == 0) { *probe = p; return Status::OK(); }
   return Status::InvalidArgument("KVAF_AIV_GATHER_PROBE must be ack/wqe/sq/first_read or empty");
 }
-static_assert(sizeof(KvafSequentialGatherHeader) == sizeof(peer::GatherDescriptorHeader));
-static_assert(offsetof(KvafSequentialGatherHeader, ready_bytes) ==
-              offsetof(peer::GatherDescriptorHeader, ready_bytes));
-static_assert(sizeof(KvafSequentialGatherSpan) == sizeof(peer::GatherSpan));
 }
 
 class GatherBatchGet final : public SequentialBatchGet {

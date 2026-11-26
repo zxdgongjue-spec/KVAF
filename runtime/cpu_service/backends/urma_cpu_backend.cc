@@ -445,15 +445,16 @@ class CpuGatherWorker {
                   void* workspace_memory = nullptr, uint64_t workspace_base = 0U,
                   uint64_t workspace_bytes = 0U, uint64_t session_id = 0U,
                   uint32_t lane = 0U, bool affinity = false, std::size_t cpu_offset = 0U,
-                  uint32_t max_spans = UINT32_MAX)
+                  peer::GatherReadMode read_mode = peer::GatherReadMode::kAicpu)
       : memory_(static_cast<std::uint8_t*>(workspace_memory ? workspace_memory : memory)),
         base_(workspace_memory ? workspace_base : base),
         bytes_(workspace_memory ? workspace_bytes : bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
             (control_address ? control_address - base_ : peer::GatherControlOffset(bytes_)))),
         executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), memory_, base_,
-                  affinity, cpu_offset), mode_(mode),
-        session_id_(session_id), lane_(lane), max_spans_(max_spans) {
+                  affinity, cpu_offset, read_mode), mode_(mode),
+        session_id_(session_id), lane_(lane),
+        max_spans_(read_mode == peer::GatherReadMode::kAiv ? peer::kMaxGatherSpans : UINT32_MAX) {
     const char* profile = std::getenv("KVAF_GATHER_PROFILE");
     profile_enabled_ = profile && std::strcmp(profile, "1") == 0;
     if (profile_enabled_) {
@@ -1008,7 +1009,7 @@ class CpuService {
             gather_mode_, control_address + lane * sizeof(peer::GatherControl),
             workspace ? workspace->memory : nullptr, workspace_base, workspace_bytes,
             session_id, lane, aiv && gather_affinity_, cpu_offset,
-            aiv ? peer::kMaxGatherSpans : UINT32_MAX));
+            aiv ? peer::GatherReadMode::kAiv : peer::GatherReadMode::kAicpu));
         cpu_offset += budget;
       }
     } catch (const std::exception& error) {

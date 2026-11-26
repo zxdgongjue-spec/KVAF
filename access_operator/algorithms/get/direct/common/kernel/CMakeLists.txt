@@ -46,7 +46,9 @@ foreach(mode scatter gather)
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/scatter_batch_get_profile.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/cpu_push_get_abi.h")
   elseif(mode STREQUAL "gather")
-    list(APPEND mode_dependencies "${KVAF_AIV_COMMON_INCLUDE_DIR}/gather_prefix_layout.h")
+    list(APPEND mode_dependencies
+      "${KVAF_AIV_COMMON_INCLUDE_DIR}/gather_prefix_layout.h"
+      "${KVAF_AIV_COMMON_INCLUDE_DIR}/gather_span.h")
   endif()
   add_custom_command(
     OUTPUT "${object}" "${installed}"

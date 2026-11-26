@@ -1,5 +1,24 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
+
+namespace kvaf::peer {
+inline constexpr std::uint64_t kGatherDescriptorMagic = 0x4b56414647445232ULL;
+
+struct GatherDescriptorHeader {
+  std::uint64_t magic;
+  std::uint64_t sequence;
+  std::uint64_t staging_address;
+  std::uint32_t span_count;
+  std::uint32_t total_bytes;
+  std::uint32_t pipeline_chunk_bytes{0U};
+  // Zero selects variable-length source spans.
+  std::uint32_t span_bytes{0U};
+  std::uint64_t ready_bytes{0U};
+};
+static_assert(sizeof(GatherDescriptorHeader) == 48U, "gather descriptor ABI changed");
+static_assert(offsetof(GatherDescriptorHeader, ready_bytes) == 40U, "gather progress offset changed");
+}  // namespace kvaf::peer
 
 namespace kvaf {
 // Initial notify commits the first 1024 spans; control+24 commits the suffix.
@@ -40,7 +59,7 @@ KVAF_PREFIX_INLINE bool GatherCooperativeLayoutValid(std::uint32_t chunks, std::
       GatherCooperativeCountValid(chunks);
 }
 KVAF_PREFIX_INLINE std::uint32_t GatherPrefixHeaderBytes(bool configurable) {
-  return configurable ? 64 : 48;
+  return sizeof(peer::GatherDescriptorHeader) + (configurable ? sizeof(GatherChunkConfig) : 0U);
 }
 KVAF_PREFIX_INLINE std::uint64_t GatherFirstChunkBytes(
     std::uint64_t total_bytes, std::uint32_t first_divisor) {

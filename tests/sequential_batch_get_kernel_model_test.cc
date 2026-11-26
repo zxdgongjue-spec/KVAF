@@ -600,7 +600,9 @@ struct Fixture {
             const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(c->command);
             assert(h->pipeline_chunk_bytes == ChunkBytes(worker) && h->sequence == args.sequence);
             if (!args.pipeline_chunk_bytes) {
-              kvaf::peer::CpuGatherExecutor cpu(remote.data(), Address(remote.data()), 2);
+              kvaf::peer::CpuGatherExecutor cpu(remote.data(), Address(remote.data()), 2,
+                  256U * 1024U, kvaf::peer::GatherWaitMode::kPassive, nullptr, 0U, false, 0U,
+                  kvaf::peer::GatherReadMode::kAiv);
               assert(cpu.PrepareDirect(remote.size(), c->command, args.sequence, count, c));
               cpu.Copy();
               if (!args.prepare_ahead) {
