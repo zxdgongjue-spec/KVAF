@@ -490,11 +490,12 @@ Status AivExecutionResources::Initialize(const RemoteRegionDesc& remote_region) 
     std::vector<void*> peer_links;
     for (const auto& link : state_->config.peer_get_links) peer_links.push_back(link.get());
     if (peer_links.empty()) peer_links.push_back(state_->config.peer_link.get());
-    const int32_t result = KvafBatchGetTransportCreateWithPeerLinks(
+    const auto& core_fe_map = state_->config.get_core_fe_map;
+    const int32_t result = KvafBatchGetTransportCreateWithCoreFeMap(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
         state_->config.npu_core_count, state_->config.jettys_per_core,
         peer_links.data(), static_cast<uint32_t>(peer_links.size()), peer_local_eids, peer_local_eid_count,
-        &transport);
+        core_fe_map.data(), core_fe_map.size(), &transport);
     state_->get.transport = transport;
     state_->remote_region = remote_region;
     if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {

@@ -337,10 +337,12 @@ struct NpuRuntime::Impl {
       c.jettys_per_core = budget.jettys;
       c.batch_put_jettys_per_core = std::min(budget.jettys, 2U);
       c.batch_get_max_inflight_total = *budget.max_inflight_total;
-      if (get)
+      if (get) {
+        c.get_core_fe_map = options.get_core_fe_map;
         c.batch_get_kernel_object_path = budget.kernel_path;
-      else
+      } else {
         c.batch_put_kernel_object_path = budget.kernel_path;
+      }
       c.enable_get = get;
       if (get) c.batch_put_kernel_object_path.clear();
       return std::make_unique<DefaultAccessOperator>(std::move(c));

@@ -121,10 +121,13 @@ def validate_args(args: argparse.Namespace) -> str | None:
 
 
 def runtime_options(args):
-    return dict(
+    options = dict(
         batch_get_token_bytes=args.token_bytes, batch_get_tokens_per_block=args.tokens_per_block,
         device_id=args.device_id, npu_eids=args.npu_eids, peer_ub_device=args.peer_ub_device,
     )
+    if args.core_fe_map:
+        options["get_core_fe_map"] = args.core_fe_map
+    return options
 
 
 def device_profile_ms(profiles, clock_mhz):

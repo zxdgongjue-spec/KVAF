@@ -467,11 +467,12 @@ int32_t ReleaseTransport(KvafBatchGetTransport *transport) {
   return KVAF_BATCH_GET_SUCCESS;
 }
 
-extern "C" int32_t KvafBatchGetTransportCreateWithPeerLinks(void *host_ddr, uint64_t host_ddr_bytes,
+extern "C" int32_t KvafBatchGetTransportCreateWithCoreFeMap(void *host_ddr, uint64_t host_ddr_bytes,
                                 uint32_t aiv_core_count, uint32_t jettys_per_core,
                                 void *const *peer_links, uint32_t peer_link_count,
                                 const uint8_t *peer_local_eids,
                                 uint32_t peer_local_eid_count,
+                                const uint32_t *core_fe_map, size_t core_fe_count,
                                 KvafBatchGetTransport **transport) {
   const uint64_t entity_count_u64 =
       static_cast<uint64_t>(aiv_core_count) * jettys_per_core;
@@ -486,6 +487,15 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLinks(void *host_ddr, uint
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
   const uint32_t entity_count = static_cast<uint32_t>(entity_count_u64);
+  *transport = nullptr;
+  if (core_fe_count == 0) core_fe_map = nullptr;
+  else if (core_fe_map == nullptr || core_fe_count != aiv_core_count ||
+           std::any_of(core_fe_map, core_fe_map + core_fe_count,
+                       [peer_link_count](uint32_t fe) { return fe >= peer_link_count; })) {
+    std::fprintf(stderr, "[KVAF_AIV] invalid core FE map: expected %u entries in [0,%u), received %zu entries\n",
+                 aiv_core_count, peer_link_count, core_fe_count);
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  }
   for (uint32_t path_index = 0U; path_index < peer_local_eid_count; ++path_index) {
     const uint8_t *eid = peer_local_eids + static_cast<size_t>(path_index) * hccp::kEidBytes;
     if (std::all_of(eid, eid + hccp::kEidBytes,
@@ -500,8 +510,6 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLinks(void *host_ddr, uint
       }
     }
   }
-  *transport = nullptr;
-
   auto *state = new (std::nothrow) KvafBatchGetTransport();
   if (state == nullptr) {
     return KVAF_BATCH_GET_RUNTIME_ERROR;
@@ -557,7 +565,7 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLinks(void *host_ddr, uint
     const uint32_t core = entity_index / jettys_per_core;
     const uint32_t jetty_slot = entity_index % jettys_per_core;
     const uint32_t path_index = hccp::GetPathForWorker(entity_index, aiv_core_count, jettys_per_core,
-                                                     peer_local_eid_count, peer_link_count);
+                                                     peer_local_eid_count, peer_link_count, core_fe_map);
     auto& path = state->paths[path_index];
     DirectAivWorker &worker = state->workers[entity_index];
     worker.path_index = path_index;
@@ -667,8 +675,9 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLinks(void *host_ddr, uint
                "eid_paths=%u remote_fes=%u distribution=%s "
                "local_hbm=deferred_acquire\n",
                static_cast<unsigned long long>(host_ddr_bytes), entity_count,
-               path_count, peer_link_count, peer_link_count > 1 ? "core_major_peer_round_robin" :
-                                                                 "jetty_major_worker_round_robin");
+               path_count, peer_link_count, peer_link_count > 1
+                   ? (core_fe_map ? "core_fe_map" : "core_major_peer_round_robin")
+                   : "jetty_major_worker_round_robin");
   // All local paths of a single peer can share that peer's additional MR views.
   if (peer_link_count == 1) {
     state->remote_memories.emplace(1, RemoteMemoryRegistration{
@@ -682,6 +691,14 @@ failed:
   // owner can retry Close before releasing the peer region or its libraries.
   if (ReleaseTransport(state) != KVAF_BATCH_GET_SUCCESS) *transport = state;
   return result;
+}
+
+extern "C" int32_t KvafBatchGetTransportCreateWithPeerLinks(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *const *peer_links, uint32_t peer_link_count,
+    const uint8_t *peer_local_eids, uint32_t peer_local_eid_count, KvafBatchGetTransport **transport) {
+  return KvafBatchGetTransportCreateWithCoreFeMap(host_ddr, host_ddr_bytes, aiv_core_count, jettys_per_core,
+      peer_links, peer_link_count, peer_local_eids, peer_local_eid_count, nullptr, 0, transport);
 }
 
 extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(

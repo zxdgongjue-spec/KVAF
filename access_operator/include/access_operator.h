@@ -187,6 +187,7 @@ struct AccessOperatorConfig {
   // Ordered per-FE execution sessions for remote Direct Get. Empty uses peer_link.
   std::vector<std::shared_ptr<PeerLink>> peer_get_links;
   bool peer_local{true};
+  std::vector<std::uint32_t> get_core_fe_map{};
 };
 
 struct BatchGetKernelProfile {

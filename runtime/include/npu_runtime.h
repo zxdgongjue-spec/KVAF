@@ -52,6 +52,8 @@ struct NpuRuntimeOptions : ExecutionPolicy {
   std::string peer_ub_device{};
   CpuPullOptions cpu_pull_options;
   NpuPullOptions npu_pull_options;
+  // Optional CPU FE path index per AIV core for URMA Direct BatchGet.
+  std::vector<std::uint32_t> get_core_fe_map{};
 };
 
 // NPU role Runtime. HBM readers are independent of the optional DDR module

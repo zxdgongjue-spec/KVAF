@@ -54,7 +54,8 @@ void Doorbell(uint32_t value, uint32_t* address) {
 }
 }
 
-void Run(uint32_t cores, uint32_t per_core, uint32_t fes, const std::vector<unsigned>& expected) {
+void Run(uint32_t cores, uint32_t per_core, uint32_t fes, const std::vector<unsigned>& expected,
+         const std::vector<uint32_t>& core_fe_map = {}) {
   const auto workers = cores * per_core;
   const uint32_t count = workers * 128;
   jettys.clear();
@@ -75,7 +76,8 @@ void Run(uint32_t cores, uint32_t per_core, uint32_t fes, const std::vector<unsi
   for (unsigned i = 0; i < workers; ++i) {
     auto& j = jettys[i];
     j.fe = expected.at(i);
-    const auto path = kvaf::direct_hccp::GetPathForWorker(i, cores, per_core, 1, fes);
+    const auto path = kvaf::direct_hccp::GetPathForWorker(i, cores, per_core, 1, fes,
+                                                          core_fe_map.empty() ? nullptr : core_fe_map.data());
     Check(path == j.fe, "global Jetty to CPU FE mapping");
     auto& e = entities[i];
     e.magic = kEntityMagic;
@@ -127,4 +129,7 @@ int main() {
   Run(1, 2, 2, {0, 1});
   Run(2, 1, 2, {0, 1});
   Run(2, 2, 3, {0, 1, 2, 0});
+  Run(3, 2, 3, {0, 1, 2, 0, 1, 2});
+  Run(3, 2, 3, {0, 0, 0, 0, 1, 1}, {0, 0, 1});
+  Run(3, 2, 3, {2, 2, 2, 2, 1, 1}, {2, 2, 1});
 }

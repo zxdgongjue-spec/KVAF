@@ -53,7 +53,7 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
            device_id=0, transport_mode="urma", default_put=None, default_get=None,
            put_resources=None, get_resources=None, npu_eids=[], peer_ub_device="",
-           cpu_pull_options=None, npu_pull_options=None)
+           cpu_pull_options=None, npu_pull_options=None, get_core_fe_map=[])
 ```
 
 两个 token 布局参数可同时省略，以使用独立 Pull；普通缓存 Get 的 provider 首次准备时要求有效布局。
@@ -95,7 +95,8 @@ AICPU 首次准备时从 CANN 安装目录定位包，不接受资源项 kernel 
 `cores * jettys` 预算使用整组 EID 条带，Put/AICPU 使用首项。`peer_ub_device` 可固定
 CPU 侧设备。远端 URMA AIV Direct Get 默认选两个不同的 CPU FE，可在 NPU 进程设置
 `KVAF_DEFAULT_PEER_FE_COUNT=1` 改为一个，也可用 `peer_ub_device="devC,devA,devB"`
-按顺序显式选路。每次 `batch_get` 仍提交整个请求。详见[远端多 FE](../runtime/README.md#远端-ak-的多-fe-batchget)。
+按顺序显式选路。可用 `get_core_fe_map=[0,0,1]` 将三个 AIV 核的全部 Jetty 分别绑定到
+下标 0、0、1 的 CPU FE。空列表使用默认轮询。每次 `batch_get` 仍提交整个请求。详见[远端多 FE](../runtime/README.md#远端-ak-的多-fe-batchget)。
 UBmem 不使用 EID，CPU 内存分配依赖 Ascend HAL 与驱动。
 
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收调用方的

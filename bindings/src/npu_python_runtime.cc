@@ -300,7 +300,8 @@ class NpuPythonRuntime final {
                    const std::string& transport_mode, py::object default_put,
                    py::object default_get, py::object put_resources, py::object get_resources,
                    std::vector<std::string> npu_eids, std::string peer_ub_device,
-                   py::object cpu_pull_options, py::object npu_pull_options) {
+                   py::object cpu_pull_options, py::object npu_pull_options,
+                   std::vector<std::uint32_t> get_core_fe_map) {
     NpuRuntimeOptions options;
     if (batch_get_token_bytes.is_none() != batch_get_tokens_per_block.is_none())
       throw py::value_error("cache layout requires both token_bytes and tokens_per_block");
@@ -325,6 +326,7 @@ class NpuPythonRuntime final {
     options.device_id = device_id;
     options.npu_eids = std::move(npu_eids);
     options.peer_ub_device = std::move(peer_ub_device);
+    options.get_core_fe_map = std::move(get_core_fe_map);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
     if (const char* path = std::getenv("KVAF_GET_DISPATCH_TRACE"); path && *path)
       get_call_trace_ = std::make_unique<GetCallTrace>(std::string(path) + ".host.csv");

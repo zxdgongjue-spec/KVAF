@@ -27,6 +27,32 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
 测并发带宽。所有阶段使用已有 CPU service，脚本不会启动或重启服务。
 每卡单独初始化 DDR 数据区；测试的是这些访问对共享 CPU、内存与通信资源的竞争。
 
+## 双卡 3 核 × 2 Jetty，按核绑定 CPU FE
+
+在远端 URMA AIV Direct Get 场景，`--peer-ub-device` 指定 CPU FE 的顺序，
+`--device-core-fe-map DEVICE=FE,FE,FE` 给指定卡的核 0、1、2 分别选择 FE 下标。
+下标从 0 开始，同一核的两个 Jetty 使用同一个 FE。将下面的 `CPU_HOST:21111`
+换成远端 CPU service 地址，`E2,E3,E4` 换成服务端公布的三个 UB 设备名，顺序与图一致。
+
+```bash
+bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
+  --backend aiv --peer CPU_HOST:21111 --devices 0 1 \
+  --aiv-cores 3 --jettys-per-core 2 --peer-ub-device E2,E3,E4 \
+  --device-core-fe-map 0=0,0,1 --device-core-fe-map 1=2,2,1 \
+  --output reports/two-card-core-fe
+```
+
+| 设备 | 核 0（Jetty 0、1） | 核 1（Jetty 0、1） | 核 2（Jetty 0、1） |
+|---|---|---|---|
+| 0 | E2 | E2 | E3 |
+| 1 | E4 | E4 | E3 |
+
+卡号与 `--devices` 中的设备 ID 对应，独跑和并发共用映射。未指定映射的卡沿用轮询。
+测轮询基线时，删去两个 `--device-core-fe-map` 参数，保留相同 FE 列表和负载，并更换输出目录。
+在 `concurrent/device_0.log` 和 `concurrent/device_1.log` 中先用 `DIRECT_GET_FE` 核对下标和设备名，
+再看 `DIRECT_AIV_ENTITY_TEMPLATE_READY`。按 `entity_index` 排序，两张卡的 `eid_path`
+应分别为 `0,0,0,0,1,1` 和 `2,2,2,2,1,1`，轮询基线均为 `0,1,2,0,1,2`。
+
 ## 每张卡连接独立的 CPU service
 
 使用可重复的 `--device-peer DEVICE=HOST:PORT` 按设备号指定服务，映射与 `--devices`

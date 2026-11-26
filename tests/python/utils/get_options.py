@@ -50,6 +50,26 @@ def parallelism_field(backend):
     return "aicpu_workers" if backend in ("gather_read", "cpu_push_scatter") else "aiv_cores"
 
 
+def parse_core_fe_map(value):
+    fields = value.split(",")
+    if any(not field.isascii() or not field.isdecimal() for field in fields):
+        raise argparse.ArgumentTypeError("expected comma-separated nonnegative FE path indices")
+    indices = list(map(int, fields))
+    if max(indices) > 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("FE path index must fit uint32")
+    return indices
+
+
+def validate_core_fe_map(args, mapping, cores):
+    if args.backend != "aiv":
+        return "core FE mapping requires --backend aiv"
+    if cores is not None and len(mapping) != cores:
+        return f"core FE mapping needs one entry per AIV core (expected {cores}, got {len(mapping)})"
+    if args.peer_ub_device and max(mapping) >= len(args.peer_ub_device.split(",")):
+        return "core FE index outside the --peer-ub-device list"
+    return None
+
+
 def add_workload_arguments(parser, *, defaults=None, request_aliases=()):
     defaults = defaults or {}
 
@@ -128,6 +148,9 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--peer-ub-device", default="", metavar="DEVICE[,DEVICE...]",
                        help="CPU UB device or ordered remote Direct Get FE list (URMA). "
                             "Automatic remote FE count: KVAF_DEFAULT_PEER_FE_COUNT (default 2).")
+    if not sweep:
+        group.add_argument("--core-fe-map", type=parse_core_fe_map, metavar="FE[,FE...]",
+                           help="CPU FE path index for each AIV core, in core order (default: round robin)")
     return group
 
 
@@ -181,6 +204,10 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
+    if getattr(args, "core_fe_map", None):
+        error = validate_core_fe_map(args, args.core_fe_map, args.parallelism)
+        if error:
+            return error
     request_max = MAX_INT32
     if not 1 <= args.request_length <= request_max:
         return f"request-length must be in [1, {request_max}]"
@@ -270,7 +297,7 @@ def configure_backend_help(parser, argv=None):
     hidden = set()
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":
-        hidden.update(("jettys_per_core", "max_inflight_total"))
+        hidden.update(("jettys_per_core", "max_inflight_total", "core_fe_map", "device_core_fe_map"))
     if backend != "gather_read":
         hidden.update(("gather_ddr_bytes", "gather_read_wave_wrs"))
     if backend != "cpu_push_scatter":

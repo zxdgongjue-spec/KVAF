@@ -1,6 +1,7 @@
 #ifndef KVAF_AIV_BATCH_GET_H_
 #define KVAF_AIV_BATCH_GET_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "acl/acl.h"
@@ -46,6 +47,13 @@ int32_t KvafBatchGetTransportCreateWithPeerLinks(
     uint32_t jettys_per_core, void *const *peer_links, uint32_t peer_link_count,
     const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
     KvafBatchGetTransport **transport);
+// Optional CPU FE binding per core. Entries index peer_links in caller order.
+// An empty map uses the default path distribution.
+int32_t KvafBatchGetTransportCreateWithCoreFeMap(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *const *peer_links, uint32_t peer_link_count,
+    const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
+    const uint32_t *core_fe_map, size_t core_fe_count, KvafBatchGetTransport **transport);
 // Caller must stop submitting work and synchronize kernel streams first.
 // SUCCESS destroys transport. Failure keeps its handles for Close retry; no
 // further acquisitions/launches are allowed after a close attempt.

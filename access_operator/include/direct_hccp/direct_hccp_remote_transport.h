@@ -103,10 +103,12 @@ static_assert(EidPathIndexForWorker(0U, 15U, 1U, 16U) == 15U);
 static_assert(EidPathIndexForWorker(0U, 32U, 1U, 64U) == 32U);
 static_assert(EidPathIndexForWorker(0U, 63U, 1U, 64U) == 63U);
 
-// Remote sessions are in CPU-device order. Continue the rotation across core boundaries.
+// Remote sessions are in CPU-device order. A configured FE is shared by all
+// Jettys on its core. With one peer, local EID striping is independent of FE selection.
 inline constexpr std::uint32_t GetPathForWorker(std::uint32_t worker, std::uint32_t cores,
-    std::uint32_t jettys_per_core, std::uint32_t local_paths, std::uint32_t remote_fes) {
-  if (remote_fes > 1) return worker % remote_fes;
+    std::uint32_t jettys_per_core, std::uint32_t local_paths, std::uint32_t remote_fes,
+    const std::uint32_t* core_fe_map = nullptr) {
+  if (remote_fes > 1) return core_fe_map ? core_fe_map[worker / jettys_per_core] : worker % remote_fes;
   return EidPathIndexForWorker(worker / jettys_per_core, worker % jettys_per_core, cores, local_paths);
 }
 

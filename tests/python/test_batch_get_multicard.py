@@ -21,7 +21,7 @@ import os
 import sys
 import time
 
-from test_npu_batch_get_perf import parse_args, validate_args
+from test_npu_batch_get_perf import parse_args, runtime_options, validate_args
 from utils.get_options import parallelism_field
 
 args = parse_args(["--build-dir", sys.argv[1], *sys.argv[2:]])
@@ -45,6 +45,7 @@ result = dict(device=args.device_id, peer=args.peer, backend=args.backend,
               bandwidth_GBps=1000000 / (window["stop"] - window["start"]) / 1e9,
               verified=True, jettys_per_core=args.jettys_per_core)
 result[parallelism_field(args.backend)] = args.parallelism
+result["get_core_fe_map"] = runtime_options(args).get("get_core_fe_map")
 args.contention_result.write_text(json.dumps(result))
 """
 
@@ -152,6 +153,32 @@ class MultiCardServices(unittest.TestCase):
         directory = self.run_case("mixed", peers=(
             "--peer", "default:21111", "--device-peer", "1=other:21112"))
         self.check_case(directory, {"3": "default:21111", "1": "other:21112"})
+
+    def test_core_fe_maps_follow_device_through_both_phases(self):
+        for name, maps in (("both", {"1": [0, 0, 1], "3": [2, 2, 1]}),
+                           ("partial", {"1": [0, 0, 1]})):
+            with self.subTest(case=name):
+                options = ["--aiv-cores", "3", "--jettys-per-core", "2", "--peer-ub-device", "E2,E3,E4"]
+                for device, mapping in maps.items():
+                    options.extend(["--device-core-fe-map", f"{device}=" + ",".join(map(str, mapping))])
+                directory = self.run_case(name, "aiv", peers=options)
+                self.assertEqual(json.loads((directory / "config.json").read_text())["device_core_fe_maps"], maps)
+                for device in ("3", "1"):
+                    for phase in (f"isolated_{device}", "concurrent"):
+                        result = json.loads((directory / phase / f"device_{device}.json").read_text())
+                        self.assertEqual(result["get_core_fe_map"], maps.get(device))
+
+    def test_invalid_core_fe_maps_fail_before_workers_start(self):
+        output = self.directory / "invalid"
+        for options in (["--device-core-fe-map", "3=2,2,1"], ["--backend", "gather_read"],
+                        ["--aiv-cores", "2"], ["--peer-ub-device", "E2,E3"]):
+            self.invoke(["--backend", "aiv", "--devices", "3", "1", "--device-core-fe-map", "3=2,2,1",
+                         "--output", str(output), *options], expected=2)
+            self.assertFalse(output.exists())
+        for value in ("2=0,0,1", "3=-1,0,1", "3=0,,1", "3="):
+            self.invoke(["--backend", "aiv", "--devices", "3", "1", "--device-core-fe-map", value,
+                         "--output", str(output)], expected=2)
+            self.assertFalse(output.exists())
 
     def test_kernel_profile_sample_scope_timing_and_saved_summary(self):
         directory = self.run_case("profile", "aiv", peers=("--kernel-profile", "--graph-calls", "3",

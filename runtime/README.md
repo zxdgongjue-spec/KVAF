@@ -177,7 +177,9 @@ index 0，总 Jetty 数必须覆盖整个列表。单设备参数仍取该设备
 显式列表首项供 Put 和 AICPU 使用。本机链路和显式多个 NPU EID 的配置分别使用一个 CPU FE，
 同时指定多个 CPU FE 会返回错误。
 
-每个 FE 注册同一块 DDR。各 Jetty 按 `(core * jettys_per_core + slot) % active_fes` 选路，
+每个 FE 注册同一块 DDR。默认各 Jetty 按 `(core * jettys_per_core + slot) % active_fes` 选路。
+可在创建 Runtime 时传入 `get_core_fe_map=[0,0,1]`，让每个核的全部 Jetty 绑定对应 CPU FE。
+条目数须与实际 AIV 核数一致，下标从 0 开始，按本次选中的 CPU FE 顺序解释。
 一次 Get 只提交一个 kernel。小 batch 可能只用到部分 Jetty。初始化后首次使用或 warmup
 时查看 `DIRECT_GET_FE_SELECTION` 和 `DIRECT_GET_FE` 核对数量、设备和 EID，再按
 `DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty。部署时同步更新 NPU host 库

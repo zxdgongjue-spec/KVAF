@@ -16,7 +16,7 @@ import time
 
 from utils.get_options import (
     add_backend_arguments, add_kernel_profile_arguments, add_workload_arguments, configure_backend_help,
-    gather_read_wave_settings, parallelism_field,
+    gather_read_wave_settings, parallelism_field, parse_core_fe_map, validate_core_fe_map,
     resolve_backend, validate_workload, workload_command,
 )
 from utils.perf_execution import add_execution_metadata
@@ -52,6 +52,27 @@ def resolve_device_peers(args, parser):
 def peer_for_device(config, device):
     # JSON object keys are strings; old result directories only stored one peer.
     return config.get("device_peers", {}).get(str(device), config.get("peer", ""))
+
+
+def resolve_device_core_fe_maps(args, parser, counts):
+    maps = {}
+    for value in args.device_core_fe_map:
+        device, separator, fields = value.partition("=")
+        if not separator or not device.isascii() or not device.isdecimal() or int(device) not in args.devices:
+            parser.error("--device-core-fe-map expects DEVICE=FE[,FE...] for a device in --devices")
+        device = str(int(device))
+        if device in maps:
+            parser.error(f"--device-core-fe-map specified more than once for device {device}")
+        try:
+            mapping = parse_core_fe_map(fields)
+        except argparse.ArgumentTypeError as error:
+            parser.error(f"--device-core-fe-map device {device}: {error}")
+        for count in counts:
+            error = validate_core_fe_map(args, mapping, count)
+            if error:
+                parser.error(f"--device-core-fe-map device {device}: {error}")
+        maps[device] = mapping
+    return maps
 
 
 def worker_error(device, process, log_path, phase):
@@ -90,6 +111,9 @@ def run_group(args, devices, directory):
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
             ]
+            if str(device) in args.device_core_fe_maps:
+                mapping = args.device_core_fe_maps[str(device)]
+                command.extend(["--core-fe-map", ",".join(map(str, mapping))])
             if args.kernel_profile:
                 command.extend(["--kernel-profile", "--kernel-profile-clock-mhz", str(args.kernel_profile_clock_mhz)])
             print(f"MULTICARD_WORKER phase={directory.name} device={device} peer={peer} log={log_path}", flush=True)
@@ -265,6 +289,10 @@ def write_summary(directory, isolated, concurrent, config=None):
                 ("Jetty 数 / AIV 核", "jettys_per_core"),
                 ("未完成 READ 上限 / 卡", "max_inflight_total"),
             ) if key in config]
+            if config.get("device_core_fe_maps"):
+                settings.append(("CPU FE 顺序", config.get("peer_ub_device") or "按服务端候选顺序"))
+                settings.extend((f"设备 {device} 各核的 FE 下标", ", ".join(map(str, mapping)))
+                                for device, mapping in config["device_core_fe_maps"].items())
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
     device_rows = [
         (r["device"], r["peer"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
@@ -366,6 +394,8 @@ def main(argv=None):
                         help="default CPU service HOST:PORT for devices without --device-peer")
     parser.add_argument("--device-peer", action="append", type=parse_device_peer, default=[],
                         metavar="DEVICE=HOST:PORT", help="CPU service for one device; repeat for multiple devices")
+    parser.add_argument("--device-core-fe-map", action="append", default=[], metavar="DEVICE=FE[,FE...]",
+                        help="per-core CPU FE indices for this device (AIV Direct Get); repeat per device")
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summarize", type=Path,
@@ -398,6 +428,7 @@ def main(argv=None):
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
     resolve_device_peers(args, parser)
+    args.device_core_fe_maps = resolve_device_core_fe_maps(args, parser, counts)
     for name in ("seconds", "ready_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -408,6 +439,7 @@ def main(argv=None):
     config.update(graph_api="acl", graphs=1)
     config.pop("summarize")
     config.pop("device_peer")
+    config.pop("device_core_fe_map")
     config.pop("parallelism")
     config.pop("aicpu_workers" if field == "aiv_cores" else "aiv_cores")
     config["requests"] = args.request_length  # Existing report consumers use this capacity field.
