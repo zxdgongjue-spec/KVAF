@@ -170,3 +170,9 @@ implementation and delays provider consumption until CQ polling. It checks four
 independent WR/SGE chains, FIFO slot reuse and retention after a partial post
 failure. Resource resolution and Python forwarding/CSV checks preserve the
 default Head/Suffix mode and propagate the new opt-in flag.
+
+The AIV chunk model poisons publisher bookkeeping on every replay and checks
+that the Head notify is posted before either initializing that bookkeeping or
+publishing the owner's local Ready word. It also covers split Heads across SQ
+wrap, first-build rejection, empty replay after a non-empty request, profiling
+disabled, and a failed first control CQE before notify without a phantom tail.

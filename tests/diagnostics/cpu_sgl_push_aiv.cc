@@ -13,6 +13,7 @@ struct PushFixture : Fixture {
   uint64_t head_commit_cycle{};
   uint64_t later_chunk_cycle{};
   bool chunks{};
+  bool fail_first_control{};
   std::vector<std::function<void()>> source_checks;
   std::deque<std::vector<std::function<void()>>> pending_controls;
   uint32_t max_pending{};
@@ -63,12 +64,25 @@ struct PushFixture : Fixture {
       const std::vector<uint8_t> snapshot(reinterpret_cast<uint8_t*>(local), reinterpret_cast<uint8_t*>(local) + bytes);
       f.source_checks.push_back([snapshot, local, bytes] { assert(!std::memcmp(snapshot.data(), reinterpret_cast<void*>(local), bytes)); });
       if (bytes == 8) {
-        if (remote == base + 64) f.head_commit_cycle = AscendC::GetSystemCycle();
+        if (remote == base + 64) {
+          if (f.chunks) {
+            // Head must leave before clearing replay bookkeeping or bouncing
+            // the publisher's own Ready line through GM. Launch poisons this
+            // private state every round, including after a non-empty replay.
+            const auto* state = reinterpret_cast<const ChunkPushState*>(f.args.execution.workspace + f.layout.staging);
+            const auto* bytes = reinterpret_cast<const uint8_t*>(state->sent);
+            for (size_t i = 0; i < sizeof(state->sent) + sizeof(state->state); ++i) assert(bytes[i] == 0xa5);
+            const auto sequence = reinterpret_cast<const Request*>(base)->sequence;
+            assert((sgl_model::Load(f.args.execution.workspace + f.layout.ready) >> 32) != sequence);
+          }
+          f.head_commit_cycle = AscendC::GetSystemCycle();
+        }
         sgl_model::Store(remote, *reinterpret_cast<const uint64_t*>(local));
       }
       else std::memcpy(reinterpret_cast<void*>(remote), reinterpret_cast<void*>(local), bytes);
       if (w[0] & (1U << 21)) {
         f.cq[(f.produced % 64) * 8] = (1U - ((f.produced / 64) & 1U)) << 2;
+        if (f.fail_first_control && !f.produced) f.cq[0] |= 0x10000U;
         ++f.produced;
         f.pending_controls.push_back(std::move(f.source_checks)); f.source_checks.clear();
         f.max_pending = std::max(f.max_pending, uint32_t(f.pending_controls.size()));
@@ -77,7 +91,11 @@ struct PushFixture : Fixture {
     }
   }
   std::vector<std::future<void>> LaunchPush() {
-    later_chunk_cycle = 0;
+    later_chunk_cycle = head_commit_cycle = 0;
+    if (chunks) {
+      auto* state = reinterpret_cast<ChunkPushState*>(args.execution.workspace + layout.staging);
+      std::memset(state->sent, 0xa5, sizeof(state->sent) + sizeof(state->state));
+    }
     const CpuSglPushArgs pushed{args, {reinterpret_cast<uint64_t>(mailbox.data()), layout.staging,
         reinterpret_cast<uint64_t>(&context), 0, 0}};
     std::vector<std::future<void>> work;
@@ -146,6 +164,20 @@ struct PushFixture : Fixture {
 }
 int main() {
   {
+    // A split Head may fail before notify. Do not admit a phantom deferred
+    // CQE or consume stale replay state; conservatively retain the done wait.
+    PushFixture f(1, true); f.count = 1025; f.context.max_write_bytes = 64;
+    f.fail_first_control = true; f.args.execution.timeout_ms = 1;
+    auto work = f.LaunchPush(); f.Check(work, 1, Result::kTimeout);
+    assert(!f.head_commit_cycle && f.context.queue.poisoned);
+    assert(f.produced == 1 && f.context.queue.cq_consumer_index == 1 && f.pending_controls.empty());
+  }
+  {
+    PushFixture f(4, true); f.count = 9001; f.rows[0] = -1;
+    auto work = f.LaunchPush(); f.Check(work, 1, Result::kInvalidRequest);
+    assert(!f.head_commit_cycle && !f.produced && f.pending_controls.empty());
+  }
+  {
     // Owner 1 is stalled in its first build. Owner 2 must reach the CPU
     // without waiting for that builder or an all-workers barrier.
     PushFixture f(4, true); f.count = 9001;
@@ -179,6 +211,19 @@ int main() {
     PushFixture f(4, true); f.count = 9001; f.rows[7000] = 0;
     auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1, Result::kInvalidRequest);
     f.Check(work, 1, Result::kInvalidRequest);
+  }
+  {
+    PushFixture f(4, true); f.count = 1025; f.context.max_write_bytes = 64;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1); f.Check(work, 1, Result::kOk);
+    assert(f.pending_controls.empty() && f.context.queue.cq_consumer_index == f.produced);
+    assert(f.profiles[0].enter_ns + f.profiles[0].head_doorbell_ns >= f.head_commit_cycle);
+  }
+  {
+    PushFixture f(4, true); f.count = 7; f.args.execution.profile = 0;
+    auto work = f.LaunchPush(); f.WaitHead(1); f.FinishCpu(1);
+    for (auto& w : work) { assert(w.wait_for(5s) == std::future_status::ready); w.get(); }
+    assert(f.pending_controls.empty());
+    for (const auto& p : f.profiles) assert(!p.head_build_ns && !p.head_doorbell_ns && !p.head_profile_tag);
   }
   for (uint32_t workers : {1U, 4U, 8U}) {
     PushFixture f(workers);

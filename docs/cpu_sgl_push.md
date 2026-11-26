@@ -92,6 +92,13 @@ CPU 仍逐轮导入/释放输出 segment，这部分成本计入整体延迟。
    后续图回放按 sequence 区分进度，无需 Host 清零 mailbox。
 
 地址清单、请求头和进度全程无描述符 READ；CPU 源地址范围扫描保持关闭，无 payload scatter。
+其中 AIV 的 chunk 0 构建完成后直接推送，跳过通用转发状态机对本核进度和管理状态的回读。
+首段 doorbell 之后才初始化本轮 `sent/pending/notified/total`，并发布本核的本地进度；
+随后立即转发其他已就绪段，再继续本核下一段构建。管理状态使用逐字段 GM 写入，按 cache line
+集中刷回，并在下一次 SIMT 前持久化；每段 commit 源仍保留到控制 CQE 完成。
+空请求和首段构建失败在退出前初始化为未发布状态；部分提交失败保留已尝试通知的标记，
+继续按原失败完成/超时规则处理。此优化只需重建 NPU 的 AIV kernel，测试命令和多段开关不变。
+
 失败只发布一次带本轮 sequence 的错误进度，CPU 停止调度后续段并排空已接受的数据链，
 随后返回失败 done；STOP 同样排空已接受的数据。失败 output 不可消费。
 这是可重叠的“构建 → 推送地址 → CPU 更新/提交 → 数据 DMA”多段调度，
@@ -208,7 +215,8 @@ snapshot 的 doorbell 值相对核 0 自身入口；benchmark 根据各核入口
 这两个指标相互嵌套，并与原 `request/notify` 重叠，不能相加。
 它们不包含 CPU 观察 notify 的延迟及首次数据 WRITE 的准备时间，也不测出地址清单的纯网络耗时。
 默认仍为 Head/Suffix；启用多段时，Head 指第一段，以上两处打点保留。
-多段的 `request` 记录初始化与各次地址构建，`notify` 记录控制提交/CQE 等待，
+多段的 `request` 记录启动检查与各次地址构建，`notify` 记录控制提交/CQE 等待，
+以及 AIV 首段 doorbell 后的流水管理初始化，
 不将等待其他 builder 的空转计入 `request`。
 
 Head 打点使用带版本标记的现有 profile 槽位，记录大小仍为 192 B，旧算法的字段含义不变。
