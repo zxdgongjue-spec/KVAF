@@ -25,7 +25,8 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
   py::class_<ExecutionResources>(m, "ExecutionResources")
       .def(py::init([](std::uint32_t cores, std::uint32_t jettys, std::uint32_t capacity,
                        std::optional<std::uint32_t> inflight, std::string kernel,
-                       std::uint32_t cpu_threads, std::uint32_t sge_per_wr, bool sgl_payload_only, bool sgl_pipeline) {
+                       std::uint32_t cpu_threads, std::uint32_t sge_per_wr, bool sgl_payload_only, bool sgl_pipeline,
+                       bool sgl_push_chunked) {
              ExecutionResources r;
              r.cores = cores;
              r.jettys = jettys;
@@ -36,12 +37,15 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
              r.sge_per_wr = sge_per_wr;
              r.sgl_payload_only = sgl_payload_only;
              r.sgl_pipeline = sgl_pipeline;
+             r.sgl_push_chunked = sgl_push_chunked;
              return r;
            }),
            py::kw_only(), py::arg("cores") = 0, py::arg("jettys") = 0,
            py::arg("request_capacity") = 65536, py::arg("max_inflight_total") = py::none(),
            py::arg("kernel_path") = "", py::arg("cpu_threads") = 0, py::arg("sge_per_wr") = 0,
-           py::arg("sgl_payload_only") = false, py::arg("sgl_pipeline") = false)
+           py::arg("sgl_payload_only") = false, py::arg("sgl_pipeline") = false,
+           py::arg("sgl_push_chunked") = false)
+      .def_readonly("sgl_push_chunked", &ExecutionResources::sgl_push_chunked)
       .def_readonly("sgl_pipeline", &ExecutionResources::sgl_pipeline)
       .def_readonly("sgl_payload_only", &ExecutionResources::sgl_payload_only)
       .def_readonly("sge_per_wr", &ExecutionResources::sge_per_wr)

@@ -103,5 +103,12 @@ int main() {
   RunMailbox(4096, 4); RunMailbox(4096, 8); RunMailbox(8192, 13); RunMailbox(7, 4); RunMailbox(1024, 8); RunMailbox(1025, 4);
   RunMailbox(65536, 4); RunMailbox(4096, 4, true); RunMailbox(4096, 4, false, true); RunMailbox(4096, 4, false, false, true);
   RunMailbox(7, 4, false, true);
+  for (auto count : {7U, 1024U, 1025U, 8192U, 65536U}) RunChunks(count, 656, 0, true, false, 4, true);
+  RunChunks(8192, 656, 0, true, true, 5, true);
+  RunChunks(8192, 656, 1, true, false, 4, true);
+  RunChunks(8192, 656, 3, true, false, 4, true);
+  RunChunks(8192, 656, 4, true, false, 4, true);
+  RunChunks(8192, 656, 5, true, false, 4, true); // STOP drains the accepted first chunk.
+  RunChunks(8192, 656, 0, false, true, 4, true);
   std::cout << "CPU device-push mailbox/SGL transport passed (zero descriptor READs, source validation disabled)\n";
 }

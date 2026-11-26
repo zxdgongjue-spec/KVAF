@@ -37,9 +37,9 @@ __aicore__ inline uint64_t RetireDeferredMailbox(const MailboxLaunch& mailbox) {
   return result;
 }
 
-__aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const KernelArgs& a,
-    uint64_t descriptor_offset, uint64_t target_offset, uint32_t count, bool suffix, bool failed = false,
-    __gm__ volatile BatchGetWorkerProfile* profile = nullptr) {
+__aicore__ inline uint64_t PostMailboxRegions(const MailboxLaunch& mailbox, const KernelArgs& a,
+    const uint64_t* local_offsets, const uint64_t* remote_offsets, const uint64_t* lengths,
+    uint32_t regions, bool head_request, __gm__ volatile BatchGetWorkerProfile* profile = nullptr) {
   auto* context = reinterpret_cast<__gm__ AivMailboxContext*>(mailbox.aiv_context);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(mailbox.aiv_context + offsetof(AivMailboxContext, queue));
   if (!context || !state) return uint64_t(Result::kTransportError);
@@ -58,15 +58,7 @@ __aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const Kerne
     state->sq_producer_index = state->cq_consumer_index = 0;
   }
   const auto max_write_bytes = context->max_write_bytes;
-  // Never copy the intervening done/Ready lines: CPU owns them as WRITE
-  // sources and could still be retiring the previous request's final CQE.
-  const uint32_t head = count < kPipelineHeadRows ? count : kPipelineHeadRows;
-  const uint64_t offsets[4] = {suffix ? descriptor_offset + uint64_t(head) * 8 : 0,
-      suffix ? kSuffixNotifyOffset : target_offset, descriptor_offset, 64};
-  const uint64_t lengths[4] = {suffix ? (failed ? 0U : uint64_t(count - head) * 8) : 64,
-      suffix ? 8U : sizeof(OutputTarget), uint64_t(head) * 8, 8};
-  const uint32_t regions = suffix ? 2 : 4;
-  uint32_t region = suffix && failed ? 1U : 0U;
+  uint32_t region = 0;
   uint64_t offset = 0;
   const auto limit = e.sq_depth / 4 < 16U ?
       e.sq_depth / 4 : 16U;
@@ -88,8 +80,8 @@ __aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const Kerne
     while (wrs < limit && region < regions) {
       const auto remaining = lengths[region] - offset;
       const auto bytes = remaining < max_write_bytes ? static_cast<uint32_t>(remaining) : max_write_bytes;
-      const auto local = a.workspace + offsets[region] + offset;
-      const auto remote = e.remote_host_ddr_address + offsets[region] + offset;
+      const auto local = a.workspace + local_offsets[region] + offset;
+      const auto remote = e.remote_host_ddr_address + remote_offsets[region] + offset;
       offset += bytes;
       if (offset == lengths[region]) { ++region; offset = 0; }
       const bool tail = wrs + 1 == limit || region == regions;
@@ -121,11 +113,38 @@ __aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const Kerne
     // start payload DMA while core 0 retires this control completion.
     const bool last = region == regions;
     st_dev(static_cast<uint32_t>(pi + wrs), reinterpret_cast<__gm__ uint32_t*>(e.sq_db_va), 0);
-    if (last && !suffix && profile)
+    if (last && head_request && profile)
       profile->head_doorbell_ns = GetSystemCycle() - profile->enter_ns;
     if (last) return 0U;
     const auto result = WaitMailboxCqe(mailbox, &context->entity, state);
     if (result) return result;
   }
   return 0U;
+}
+
+__aicore__ inline uint64_t PostMailbox(const MailboxLaunch& mailbox, const KernelArgs& a,
+    uint64_t descriptor_offset, uint64_t target_offset, uint32_t count, bool suffix, bool failed = false,
+    __gm__ volatile BatchGetWorkerProfile* profile = nullptr) {
+  const uint32_t head = count < kPipelineHeadRows ? count : kPipelineHeadRows;
+  const uint64_t offsets[4] = {suffix ? descriptor_offset + uint64_t(head) * 8 : 0,
+      suffix ? kSuffixNotifyOffset : target_offset, descriptor_offset, 64};
+  const uint64_t lengths[4] = {suffix ? (failed ? 0U : uint64_t(count - head) * 8) : 64,
+      suffix ? 8U : sizeof(OutputTarget), uint64_t(head) * 8, 8};
+  return PostMailboxRegions(mailbox, a, offsets, offsets, lengths, suffix ? 2 : 4, !suffix, profile);
+}
+
+__aicore__ inline uint64_t PostChunkMailbox(const MailboxLaunch& mailbox, const KernelArgs& a,
+    uint64_t descriptor_offset, uint64_t target_offset, uint32_t count, uint32_t chunk,
+    uint32_t owner, bool first, bool failed, __gm__ volatile BatchGetWorkerProfile* profile) {
+  const auto staging = (descriptor_offset + uint64_t(kMaxRequests) * 8 + 63) & ~uint64_t(63);
+  const auto slot = failed ? kPushChunkCount + owner : chunk;
+  const auto commit = staging + uint64_t(slot) * sizeof(Word);
+  const auto descriptor = descriptor_offset + uint64_t(chunk) * kChunkRows * 8;
+  const auto rows = count - chunk * kChunkRows < kChunkRows ? count - chunk * kChunkRows : kChunkRows;
+  const uint64_t local[5] = {0, target_offset, descriptor, commit, 64};
+  const uint64_t remote[5] = {0, target_offset, descriptor, 192 + uint64_t(owner) * 64, 64};
+  const uint64_t lengths[5] = {64, sizeof(OutputTarget), failed ? 0U : uint64_t(rows) * 8, 8, 8};
+  if (failed) return PostMailboxRegions(mailbox, a, local + 3, remote + 3, lengths + 3, 1, false);
+  return PostMailboxRegions(mailbox, a, local + (first ? 0 : 2), remote + (first ? 0 : 2),
+      lengths + (first ? 0 : 2), first ? 5 : 2, first, profile);
 }

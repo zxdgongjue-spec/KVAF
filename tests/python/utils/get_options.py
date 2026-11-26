@@ -98,6 +98,8 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="maximum source SGEs per WRITE WR; CPU SGL backends (0=auto, 1..16)")
     group.add_argument("--sgl-pipeline", action="store_true",
                        help="pipeline 1024-row chunks through construction, descriptor READ and concurrent WRITEs; CPU SGL Write backends only")
+    group.add_argument("--sgl-push-chunked", action="store_true",
+                       help="device-WRITE each ready 1024-row chunk; cpu_sgl_push/aiv_cpu_sgl_push only")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")
@@ -111,7 +113,7 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
     args.backend_explicit = args.backend is not None
     args.backend = args.backend or ({"urma": "aiv", "ubmem": "ubmem"}.get(args.transport) or default_backend)
     if args.backend in ("cpu_sgl_push", "aiv_cpu_sgl_push"):
-        args.sgl_pipeline = True  # Device WRITE variants always use Head/Suffix.
+        args.sgl_pipeline = True  # Both device-WRITE modes are pipelined.
     expected = "ubmem" if args.backend == "ubmem" else "urma"
     if args.transport is not None and args.transport != expected:
         parser.error("--backend conflicts with --transport")
@@ -159,6 +161,8 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
+    if args.sgl_push_chunked and args.backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push"):
+        return "--sgl-push-chunked requires cpu_sgl_push or aiv_cpu_sgl_push"
     if args.sgl_pipeline and args.backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push"):
         return "--sgl-pipeline requires a CPU SGL Write backend"
     if not 0 <= args.sge_per_wr <= 16:
@@ -225,6 +229,8 @@ def workload_command(args):
         command += ["--sge-per-wr", str(args.sge_per_wr)]
         if getattr(args, "sgl_pipeline", False):
             command += ["--sgl-pipeline"]
+        if getattr(args, "sgl_push_chunked", False):
+            command += ["--sgl-push-chunked"]
     if args.npu_eids:
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:
@@ -248,6 +254,8 @@ def configure_backend_help(parser, argv=None):
         hidden.update(("jettys_per_core", "max_inflight_total"))
     if backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push"):
         hidden.update(("sge_per_wr", "sgl_payload_only", "sgl_pipeline"))
+    if backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push"):
+        hidden.add("sgl_push_chunked")
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

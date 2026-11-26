@@ -36,6 +36,7 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
     resources.sge_per_wr = configured->sge_per_wr;
     resources.sgl_payload_only = configured->sgl_payload_only;
     resources.sgl_pipeline = configured->sgl_pipeline;
+    resources.sgl_push_chunked = configured->sgl_push_chunked;
     resources.request_capacity = configured->request_capacity;
     if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
   }

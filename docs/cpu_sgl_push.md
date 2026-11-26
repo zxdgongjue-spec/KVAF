@@ -7,8 +7,8 @@
 
 | 算法/API | benchmark 后端 | 地址清单传输 | 流水 |
 | --- | --- | --- | --- |
-| AICPU `cpu_sgl_push` | `cpu_sgl_push` | 设备 WRITE 到 CPU | 内置 Head/Suffix |
-| AIV `cpu_sgl_push` | `aiv_cpu_sgl_push` | 设备 WRITE 到 CPU | 内置 Head/Suffix |
+| AICPU `cpu_sgl_push` | `cpu_sgl_push` | 设备 WRITE 到 CPU | 默认 Head/Suffix，可选多段 |
+| AIV `cpu_sgl_push` | `aiv_cpu_sgl_push` | 设备 WRITE 到 CPU | 默认 Head/Suffix，可选多段 |
 | AICPU `cpu_sgl_write` | `cpu_sgl_write` | CPU READ 设备 | 原整批或可选逐 chunk |
 | AIV `cpu_sgl_write` | `aiv_cpu_sgl_write` | CPU READ 设备 | 原整批或可选逐 chunk |
 
@@ -23,6 +23,7 @@
 get = kvaf.GetExecutionConfig("urma", "aiv", "cpu_sgl_push")
 # AICPU：kvaf.GetExecutionConfig("urma", "aicpu", "cpu_sgl_push")
 resources = kvaf.ExecutionResources(cores=4, sge_per_wr=4)
+# 多段设备推送：增加 sgl_push_chunked=True，原 Head/Suffix 默认不变。
 # default_get=get, get_resources=[(get, resources)]
 ```
 
@@ -30,8 +31,11 @@ resources = kvaf.ExecutionResources(cores=4, sge_per_wr=4)
 资源不接受 `jettys` 和 `max_inflight_total` 调整。`sge_per_wr` 与原 SGL 规则相同：
 0 自动选择 `min(16, max_jfs_sge)`，显式值 1..16 必须不超过硬件上限。
 
-Head/Suffix 始终启用，资源查询和性能脚本记录 `sgl_pipeline=True`，
-日志/CSV 标识 `sgl_pipeline_mode=device_push_head_suffix`。这里不选择原逐 chunk READ 路径。
+设备推送的资源查询和性能脚本记录 `sgl_pipeline=True`；默认采用 Head/Suffix，
+日志/CSV 标识 `sgl_pipeline_mode=device_push_head_suffix`。
+新增资源开关 `sgl_push_chunked=True`，对应 CLI `--sgl-push-chunked`，选择 1024 行多段设备推送，
+日志/CSV 标识 `sgl_pipeline_mode=device_push_chunked`，并记录 `sgl_push_chunked=1`。
+该开关仅适用于两个 `cpu_sgl_push` 后端，与原 `--sgl-pipeline` 的逐 chunk READ 模式分别保留。
 新算法不支持 `sgl_payload_only`；性能比较使用完整 kernel 和端到端计时。
 
 有效前缀的 `output_indices[i]` 必须等于 `i`，输出至少有
@@ -68,6 +72,31 @@ WQE 模板和有界 CQ 轮询；AICPU 使用原生 UMDK 的独立 post/wait 控�
 让 head DMA 与后缀构建重叠。CPU 请求头、output 描述、地址清单和进度均无 RDMA READ。
 CPU 仍逐轮导入/释放输出 segment，这部分成本计入整体延迟。
 
+### 可选多段设备推送
+
+启用 `--sgl-push-chunked` 后，AIV 和 AICPU 共用以下调度及 CPU service：
+
+1. 将有效前缀划分为 1024 行一段，段号 `chunk` 由 `chunk % workers` 对应的设备 worker
+   构建。每个 worker 逐段写 HBM 地址清单，再 release 发布本地完成段数。
+2. 核/worker 0 统一操作控制 SQ；每轮从各 worker 取一段已就绪清单，WRITE 到 CPU 对应切片，
+   最后 WRITE 该 worker 的 `Progress(sequence, completed)`。各 worker 间无需按段号全局排序。
+   第一段额外携带请求头、output 描述和 notify；仍需先完成第一段的构建与提交。
+3. 核 0 在自己的两次构建之间及等待其他 builder 时持续转发；某个 builder 未就绪时，
+   可转发其他已就绪段。控制侧最多四条链在途，满窗才回收最早的 CQE。
+   每段使用独立、已注册的 HBM commit 源槽位，保留到控制 CQE 完成；不直接 DMA
+   正在变化的 builder 进度行。AICPU 的每条在途链也独占 WR/SGE 数组。
+4. CPU acquire 读取本地 mailbox 的进度，从任意已就绪段更新 SGE 并提交数据 WRITE，
+   不等待整批后缀。仍为一个 CPU service 线程、四条数据 Jetty、最多四个在途数据计划，
+   并按 SQ 的 WR/SGE credits 排空；每个计划独占 WR/SGE 存储到数据 CQE。
+5. CPU 数据全部完成后发布 done；设备也须回收全部控制 CQE 才能退出。
+   后续图回放按 sequence 区分进度，无需 Host 清零 mailbox。
+
+地址清单、请求头和进度全程无描述符 READ；CPU 源地址范围扫描保持关闭，无 payload scatter。
+失败只发布一次带本轮 sequence 的错误进度，CPU 停止调度后续段并排空已接受的数据链，
+随后返回失败 done；STOP 同样排空已接受的数据。失败 output 不可消费。
+这是可重叠的“构建 → 推送地址 → CPU 更新/提交 → 数据 DMA”多段调度，
+并不保证所有阶段在每个时刻都重叠；核 0 自己构建时不同时操作控制 SQ。
+
 流水发布后发生后缀错误时，CPU 不提交错误后缀，排空已提交的合法数据后返回失败 done。
 失败请求可能已写入 head，output 不可消费；按现有执行资源失效和重建流程处理。
 Shutdown 先确认设备发送 kernel 已停止，再销毁描述符发送队列；CPU STOP 完成后才释放
@@ -77,6 +106,7 @@ HBM 注册。无法确认 kernel 结束时保留两端目标内存，报告 `Com
 
 CPU service、NPU Host/Python 和设备 kernel 均须使用此版本重建，重启两端进程。
 仅更新 Host 无法启用新协议；不自动回退到旧 READ 模式。
+多段设备推送使用 setup output mode 5；旧 CPU service 会拒绝该模式，须同步更新两端。
 
 ```bash
 # CPU 端
@@ -111,6 +141,31 @@ for backend in cpu_sgl_push aiv_cpu_sgl_push cpu_sgl_write aiv_cpu_sgl_write; do
     --output-dir "reports/${backend}"
 done
 ```
+
+对比两段与多段，只切换 `--sgl-push-chunked`，其余参数相同。以下使用 32768 容量、
+8192 miss、656 B token 和每 block 128 token；CPU 服务地址和卡号沿用环境变量：
+
+```bash
+for mode in head_suffix chunked; do
+  extra=()
+  if [[ "$mode" == chunked ]]; then extra=(--sgl-push-chunked); fi
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend aiv_cpu_sgl_push --aiv-cores 4 --sge-per-wr 4 "${extra[@]}" \
+    --request-length 32768 --table-capacity 1277952 --miss-count 8192 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+    --execution graph --warmup 10 --iterations 100 --kernel-profile \
+    --output-dir "reports/aiv_push_${mode}"
+done
+```
+
+AICPU 使用 `--backend cpu_sgl_push --aicpu-workers 4`，同样增加 `--sgl-push-chunked`。
+复测原来的 5 worker 配置则改为 `--aicpu-workers 5`。多段 CPU 日志前缀为
+`CPU_SGL_PUSH_CHUNK_PROFILE`，包含 `chunk_rows=1024 chunks=... descriptor_reads=0 ready_wrs=0`、
+`first_post_us`、`chunk_ready_us`（本地进度扫描）、`source_sge_update_us`、
+`payload_post_us`、`chunk_submit_us`、`chunk_cq_wait_us` 和 `max_inflight`。
+`local_progress_polls` 是本地扫描轮数。`payload_post_us` 只计 provider 提交调用；
+`chunk_submit_us` 也包含该段 SGE 更新等工作，两个值不能相加。
 
 AIV 的 `--kernel-profile-clock-mhz` 应按目标设备频率设置。另给旧后端加
 `--sgl-pipeline`、单独指定报告目录，可与旧逐 chunk 流水比较。
@@ -152,7 +207,9 @@ snapshot 的 doorbell 值相对核 0 自身入口；benchmark 根据各核入口
 
 这两个指标相互嵌套，并与原 `request/notify` 重叠，不能相加。
 它们不包含 CPU 观察 notify 的延迟及首次数据 WRITE 的准备时间，也不测出地址清单的纯网络耗时。
-当前仍为 Head/Suffix 两段流程，新增打点不会改为逐 chunk 发布。
+默认仍为 Head/Suffix；启用多段时，Head 指第一段，以上两处打点保留。
+多段的 `request` 记录初始化与各次地址构建，`notify` 记录控制提交/CQE 等待，
+不将等待其他 builder 的空转计入 `request`。
 
 Head 打点使用带版本标记的现有 profile 槽位，记录大小仍为 192 B，旧算法的字段含义不变。
 测这两个新指标须同步重建 NPU Host/Python 和所选 kernel；CPU 服务无需为此重建。
@@ -176,6 +233,10 @@ ASan/UBSan、GM 独立地址空间编译、Host 声明检查及 Python 配置回
 新模型检查实际 AIV WQE 编码/拆分/SQ-CQ 回绕、多轮 sequence、部分/空请求、
 head/suffix 错误、等待 done、零描述符 READ、head CQE 未收齐时提交 suffix，以及
 在途 WR/SGE 不被复用，并模拟 URMA 注册权限的互斥和依赖校验。
+多段模型还检查 1/4/5/8 worker、乱序段就绪、暂停一个 builder 时其他段仍可转发、
+跨轮次进度、错误/STOP 排空和零描述符 READ。原生 AICPU post/wait 检查四条在途链、
+FIFO 回收/槽位复用及部分提交失败后 WR/SGE 存储保留；资源解析和 Python/子命令/CSV
+回归检查新增开关确实传递到 Get 配置且默认关闭。
 没有 UMDK 头文件时跳过 CPU 传输模型和原生 UMDK 语法检查。
 
 这些检查不替代 CANN/ccec 编译、真实 DMA 可见性、注册退役及 NPU 图回放验证。

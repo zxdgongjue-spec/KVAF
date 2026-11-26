@@ -70,7 +70,9 @@ struct Queue {
   Sge single_local{}, single_remote{};
   urma_jfs_wr_t single_wr{};
   bool control_pending = false;
-  std::uint64_t control_context = 0, control_started = 0;
+  struct ControlFlight { RequestBuffer requests; std::uint64_t context{}, started{}; };
+  std::array<ControlFlight, 4> control_flights;
+  std::uint32_t control_head{}, control_count{};
   bool poisoned = false;
   urma_jfc_t* jfc = nullptr;
   urma_jfr_t* jfr = nullptr;

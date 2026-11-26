@@ -1,6 +1,7 @@
 #include "cpu_service/push/cpu_push_get_transport.h"
 #include "urma_device_abi.h"
 #include "batch_get_profile.h"
+#include "cpu_sgl_push_abi.h"
 
 #include <chrono>
 #include <cstddef>
@@ -44,15 +45,17 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      setup.output_mode > kChunkedOutput ||
+      setup.output_mode > (push ? kPushChunkedOutput : kChunkedOutput) ||
       setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode == kScatterOutput) ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode != kScatterOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
-  if (push && (!mailbox || setup.output_mode != kPipelinedOutput || !push->control_tp ||
+  if (push && (!mailbox || (setup.output_mode != kPipelinedOutput && setup.output_mode != kPushChunkedOutput) || !push->control_tp ||
       !push->control_psn || (push->control.bytes != 28 && push->control.bytes != 32)))
     return Status::InvalidArgument("invalid device-push mailbox setup");
+  if (push && setup.output_mode == kPushChunkedOutput && setup.hbm_bytes < layout_.bytes + sizeof(ChunkPushState))
+    return Status::InvalidArgument("missing device-push chunk commit storage");
   device_push_ = push != nullptr;
   context_ = context;
   source_ = source;
@@ -63,7 +66,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   token_bytes_ = setup.token_bytes;
   direct_output_ = setup.output_mode != kScatterOutput;
   payload_only_ = setup.output_mode == kPayloadOnlyOutput;
-  chunked_ = setup.output_mode == kChunkedOutput;
+  chunked_ = setup.output_mode == kChunkedOutput || setup.output_mode == kPushChunkedOutput;
   pipeline_ = chunked_ || setup.output_mode == kPipelinedOutput;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
@@ -845,7 +848,7 @@ Status Transport::WritePushed(const std::atomic<bool>* stop) {
   return Status::OK();
 }
 
-Status Transport::WriteChunks() {
+Status Transport::WriteChunks(const std::atomic<bool>* stop) {
   auto* p = profile_.enabled ? &profile_ : nullptr;
   const auto count = request().count;
   const auto chunks = (count + kChunkRows - 1) / kChunkRows;
@@ -866,31 +869,33 @@ Status Transport::WriteChunks() {
     return status;
   };
   while (submitted_chunks < chunks && batch_result_ == Result::kOk) {
+    if (stop && stop->load(std::memory_order_acquire)) { batch_result_ = Result::kTimeout; break; }
     std::uint32_t next = prefetched;
     if (next == chunks) for (std::uint32_t c = 0; c < chunks; ++c)
       if (!posted[c] && published[c % workers_] > c / workers_) { next = c; break; }
     if (next == chunks) {
       {
         BatchGetProfileScope timer(p ? &p->chunk_ready_ns : nullptr);
-        auto status = Transfer(false, layout_.ready, workers_ * sizeof(Ready));
+        auto status = device_push_ ? Status::OK() : Transfer(false, layout_.ready, workers_ * sizeof(Ready));
         if (!status.ok()) return status;
         if (p) ++p->progress_reads;
-      }
-      for (std::uint32_t w = 0; w < workers_; ++w) {
-        const auto token = reinterpret_cast<const Word*>(memory_ + layout_.ready)[w].value;
-        const auto sequence = token >> 32;
-        if (sequence < request().sequence) continue;
-        if (sequence > request().sequence) { batch_result_ = Result::kSequenceError; break; }
-        const auto progress = static_cast<std::uint32_t>(token);
-        if (progress & kChunkFailed) {
-          const auto error = progress & ~kChunkFailed;
-          batch_result_ = error >= std::uint32_t(Result::kInvalidRequest) && error <= std::uint32_t(Result::kCopyError)
-              ? static_cast<Result>(error) : Result::kInvalidRequest;
-          break;
+        for (std::uint32_t w = 0; w < workers_; ++w) {
+          const auto* progress_word = &reinterpret_cast<const Word*>(memory_ + layout_.ready)[w].value;
+          const auto token = device_push_ ? __atomic_load_n(progress_word, __ATOMIC_ACQUIRE) : *progress_word;
+          const auto sequence = token >> 32;
+          if (sequence < request().sequence) continue;
+          if (sequence > request().sequence) { batch_result_ = Result::kSequenceError; break; }
+          const auto progress = static_cast<std::uint32_t>(token);
+          if (progress & kChunkFailed) {
+            const auto error = progress & ~kChunkFailed;
+            batch_result_ = error >= std::uint32_t(Result::kInvalidRequest) && error <= std::uint32_t(Result::kCopyError)
+                ? static_cast<Result>(error) : Result::kInvalidRequest;
+            break;
+          }
+          const auto owned = chunks / workers_ + (w < chunks % workers_ ? 1U : 0U);
+          if (progress > owned || progress < published[w]) { batch_result_ = Result::kInvalidRequest; break; }
+          published[w] = progress;
         }
-        const auto owned = chunks / workers_ + (w < chunks % workers_ ? 1U : 0U);
-        if (progress > owned || progress < published[w]) { batch_result_ = Result::kInvalidRequest; break; }
-        published[w] = progress;
       }
       if (std::chrono::steady_clock::now() >= deadline) batch_result_ = Result::kTimeout;
       // Reap without waiting for an unpublished chunk; another producer may be ready.
@@ -901,7 +906,7 @@ Status Transport::WriteChunks() {
       continue;
     }
     const auto begin = next * kChunkRows, end = std::min(count, begin + kChunkRows);
-    {
+    if (!device_push_) {
       const auto reading = prefetched != chunks ? prefetch_start : p ? BatchGetProfileNowNs() : 0;
       auto status = prefetched != chunks ? Status::OK() :
           BeginControlRead(layout_.descriptor + std::uint64_t{begin} * 8, std::uint64_t{end - begin} * 8);
@@ -913,7 +918,7 @@ Status Transport::WriteChunks() {
     if (!ValidateSources(begin, end).ok()) { batch_result_ = Result::kInvalidRequest; break; }
     // Read the next known-ready descriptor slice while refreshing/posting this
     // chunk. Each READ lands in its own stable slice of the registered mirror.
-    for (std::uint32_t c = 0; c < chunks; ++c) {
+    for (std::uint32_t c = 0; !device_push_ && c < chunks; ++c) {
       if (c == next || posted[c] || published[c % workers_] <= c / workers_) continue;
       const auto first = c * kChunkRows, last = std::min(count, first + kChunkRows);
       prefetch_start = p ? BatchGetProfileNowNs() : 0;
@@ -963,7 +968,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     status = PrepareWrites(request().count);
   }
   if (!status.ok()) return status;
-  if (device_push_) return WritePushed(stop);
+  if (device_push_) return chunked_ ? WriteChunks(stop) : WritePushed(stop);
   if (payload_only_) return WritePayloadOnly();
   if (chunked_) return WriteChunks();
   if (pipeline_) return WritePipeline();
@@ -1024,6 +1029,21 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
 
 void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
+  if (device_push_ && chunked_) {
+    const auto& p = profile_;
+    std::fprintf(stderr, "CPU_SGL_PUSH_CHUNK_PROFILE sequence=%" PRIu64 " rows=%u chunk_rows=%u chunks=%u"
+        " descriptor_reads=0 ready_wrs=0 source_validation=disabled address_validate_us=%.3f"
+        " first_post_us=%.3f chunk_ready_us=%.3f chunk_submit_us=%.3f chunk_cq_wait_us=%.3f"
+        " source_sge_update_us=%.3f payload_post_us=%.3f done_post_us=%.3f done_cq_wait_us=%.3f cpu_total_us=%.3f"
+        " local_progress_polls=%u data_wrs=%u tail_cqes=%u post_calls=%u max_inflight=%u plan_reused=%u result=%u\n",
+        request().sequence, request().count, kChunkRows, p.chunks, p.address_validate_ns / 1000.0,
+        p.first_post_ns ? (p.first_post_ns - p.cpu_start_ns) / 1000.0 : 0,
+        p.chunk_ready_ns / 1000.0, p.chunk_submit_ns / 1000.0, p.chunk_cq_wait_ns / 1000.0,
+        p.source_sge_update_ns / 1000.0, p.post_ns / 1000.0, p.done_post_ns / 1000.0,
+        p.done_cq_wait_ns / 1000.0, p.cpu_total_ns / 1000.0, p.progress_reads, p.data_wrs,
+        p.tail_cqes, p.post_calls, p.max_inflight, unsigned(p.plan_reused), unsigned(batch_result_));
+    return;
+  }
   if (device_push_) {
     const auto& p = profile_;
     std::fprintf(stderr, "CPU_SGL_PUSH_PROFILE sequence=%" PRIu64 " rows=%u descriptor_reads=0 ready_wrs=0 source_validation=disabled"

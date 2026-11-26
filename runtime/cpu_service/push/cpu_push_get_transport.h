@@ -86,7 +86,7 @@ class Transport {
                       std::uint64_t* first_post_ns = nullptr);
   Status WritePayloadOnly();
   Status WritePipeline();
-  Status WriteChunks();
+  Status WriteChunks(const std::atomic<bool>* stop = nullptr);
   Status WritePushed(const std::atomic<bool>* stop);
   Status ValidateSources(std::uint32_t begin, std::uint32_t end);
   Status BeginControlRead(std::uint64_t offset, std::uint64_t bytes);

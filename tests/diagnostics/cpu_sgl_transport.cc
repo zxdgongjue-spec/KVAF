@@ -2,6 +2,7 @@
 // Requires the public UMDK headers, no URMA library or hardware.
 #include "cpu_service/push/cpu_push_get_transport.h"
 #include "urma_device_abi.h"
+#include "cpu_sgl_push_abi.h"
 
 #include <cassert>
 #include <cerrno>
@@ -231,17 +232,18 @@ std::string CaptureProfile(const kvaf::cpu_push::Transport& transport) {
 }
 void CheckProfile(const kvaf::cpu_push::Transport& transport,
                   const kvaf::CpuSglWriteSample& sample, std::uint32_t sequence,
-                  bool payload_only, bool profiling, bool pipeline = false, bool chunked = false) {
+                  bool payload_only, bool profiling, bool pipeline = false, bool chunked = false, bool pushed = false) {
   const auto log = CaptureProfile(transport);
   if (!profiling) { assert(log.empty()); return; }
   if (chunked) {
-    assert(log.find("CPU_SGL_CHUNK_PROFILE sequence=" + std::to_string(sequence)) == 0);
+    assert(log.find(std::string(pushed ? "CPU_SGL_PUSH_CHUNK_PROFILE sequence=" : "CPU_SGL_CHUNK_PROFILE sequence=") + std::to_string(sequence)) == 0);
     std::istringstream fields(log);
     std::map<std::string, double> values;
     std::string field;
     while (fields >> field) {
       const auto equals = field.find('=');
-      if (equals != std::string::npos) values[field.substr(0, equals)] = std::stod(field.substr(equals + 1));
+      if (equals != std::string::npos && field[equals + 1] >= '0' && field[equals + 1] <= '9')
+        values[field.substr(0, equals)] = std::stod(field.substr(equals + 1));
     }
     assert(values.at("chunk_rows") == kvaf::cpu_push::kChunkRows);
     assert(values.at("max_inflight") <= 4 && values.at("ready_wrs") == 0);
@@ -249,7 +251,9 @@ void CheckProfile(const kvaf::cpu_push::Transport& transport,
     assert(values.at("plan_reused") == (sequence == 2));
     if (values.at("result") == double(kvaf::cpu_push::Result::kOk))
       assert(values.at("chunks") == (uint32_t(values.at("rows")) + kvaf::cpu_push::kChunkRows - 1) / kvaf::cpu_push::kChunkRows);
-    for (const auto* name : {"chunk_ready_us", "chunk_read_us", "chunk_submit_us", "chunk_cq_wait_us", "cpu_total_us"})
+    if (pushed) assert(values.at("descriptor_reads") == 0 && values.at("address_validate_us") == 0);
+    else assert(values.at("chunk_read_us") >= 0);
+    for (const auto* name : {"chunk_ready_us", "chunk_submit_us", "chunk_cq_wait_us", "cpu_total_us"})
       assert(std::isfinite(values.at(name)) && values.at(name) >= 0);
     return;
   }
@@ -401,29 +405,35 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
 }
 // Release chunks only after a prior chunk has actually been posted. Chunk 2
 // precedes chunk 1, proving the consumer has no head-of-line builder barrier.
-void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault = 0, bool profiling = true, bool all_ready = false, std::uint32_t workers = 4) {
+void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault = 0, bool profiling = true, bool all_ready = false, std::uint32_t workers = 4, bool pushed = false) {
   using namespace kvaf::cpu_push;
   Layout layout;
   assert(MakeLayout(token_bytes, workers, &layout, true));
-  auto* hbm = static_cast<std::uint8_t*>(std::aligned_alloc(64, layout.bytes));
-  assert(hbm); std::memset(hbm, 0, layout.bytes);
+  const auto hbm_bytes = layout.bytes + (pushed ? sizeof(ChunkPushState) : 0);
+  auto* hbm = static_cast<std::uint8_t*>(std::aligned_alloc(64, hbm_bytes));
+  assert(hbm); std::memset(hbm, pushed ? 0xee : 0, hbm_bytes);
   std::vector<std::uint8_t> source(std::size_t(count) * token_bytes), output(source.size()), second(source.size());
   for (std::size_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 37 + i / token_bytes);
   urma_device_t device{}; urma_context_t context{}; context.dev = &device;
   urma_target_seg_t source_segment{};
   source_segment.seg.ubva.va = reinterpret_cast<std::uint64_t>(source.data()); source_segment.seg.len = source.size();
   urma_seg_t hbm_segment{};
-  hbm_segment.ubva.va = reinterpret_cast<std::uint64_t>(hbm); hbm_segment.len = layout.bytes;
+  hbm_segment.ubva.va = reinterpret_cast<std::uint64_t>(hbm); hbm_segment.len = hbm_bytes;
   kvaf::peer::OpenCpuPushGetRequest setup{};
-  setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = layout.bytes;
+  setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = hbm_bytes;
   setup.npu_tp = 1; setup.npu_psn = 1; setup.token_value = 7;
   setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = workers;
-  setup.output_mode = kChunkedOutput; setup.sge_per_wr = 4;
+  setup.output_mode = pushed ? kPushChunkedOutput : kChunkedOutput; setup.sge_per_wr = 4;
   std::memcpy(setup.segment, &hbm_segment, sizeof(hbm_segment));
   for (auto& channel : setup.channels) channel.bytes = 28;
   kvaf::peer::OpenCpuPushGetResponse response{};
   Transport transport;
-  assert(transport.Initialize(&context, &source_segment, setup, QueryTp, ImportJetty, 1, &response).ok());
+  kvaf::peer::OpenCpuSglPushRequest push{};
+  push.base = setup; push.control_tp = push.control_psn = 1; push.control.bytes = 28;
+  kvaf::peer::OpenCpuSglPushResponse mailbox{};
+  assert(transport.Initialize(&context, &source_segment, setup, QueryTp, ImportJetty, 1, &response, 0,
+      pushed ? &push : nullptr, pushed ? &mailbox : nullptr).ok());
+  auto* control = pushed ? reinterpret_cast<std::uint8_t*>(mailbox.mailbox_base) : hbm;
   done_address = setup.hbm_base + layout.done;
   const auto chunks = (count + kChunkRows - 1) / kChunkRows;
   retain_chunk_storage = true;
@@ -431,16 +441,17 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
     auto& result = sequence == 1 ? output : second;
     std::fill(result.begin(), result.end(), 0xa5);
     output_base = reinterpret_cast<std::uint64_t>(result.data()); output_bytes = result.size();
-    *reinterpret_cast<Request*>(hbm) = {kMagic, sequence, count, token_bytes, workers, kChunkedOutput, {kChunkRows}};
-    auto* target = reinterpret_cast<OutputTarget*>(hbm + layout.output_target);
+    *reinterpret_cast<Request*>(control) = {kMagic, sequence, count, token_bytes, workers, kChunkedOutput, {kChunkRows}};
+    auto* target = reinterpret_cast<OutputTarget*>(control + layout.output_target);
     *target = {}; target->base = output_base; target->bytes = output_bytes;
     target->token_value = 7; target->segment_bytes = sizeof(urma_seg_t);
     urma_seg_t segment{}; segment.ubva.va = output_base; segment.len = output_bytes;
     std::memcpy(target->segment, &segment, sizeof(segment));
-    auto* addresses = reinterpret_cast<std::uint64_t*>(hbm + layout.descriptor);
+    auto* addresses = reinterpret_cast<std::uint64_t*>(control + layout.descriptor);
     std::fill(addresses, addresses + count, UINT64_MAX);
     std::vector<bool> published(chunks), written(chunks);
     std::vector<std::uint64_t> written_bytes(chunks);
+    std::atomic<bool> stopped{false};
     const auto expected_address = [&](std::uint32_t row) {
       return source_segment.seg.ubva.va + std::uint64_t((count - row + sequence - 1) % count) * token_bytes;
     };
@@ -449,12 +460,13 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
       for (auto i = c * kChunkRows; i < std::min(count, (c + 1) * kChunkRows); ++i) addresses[i] = expected_address(i);
       if (fault == 2 && c == 1) addresses[kChunkRows] = source_segment.seg.ubva.va - 1;
       published[c] = true;
-      reinterpret_cast<Word*>(hbm + layout.ready)[c % workers].value = Progress(sequence, c / workers + 1);
+      __atomic_store_n(&reinterpret_cast<Word*>(control + layout.ready)[c % workers].value,
+                       Progress(sequence, c / workers + 1), __ATOMIC_RELEASE);
     };
     if (all_ready) for (uint32_t c = 0; c < chunks; ++c) publish(c);
     else publish(0);
-    if (fault == 3) reinterpret_cast<Word*>(hbm + layout.ready)[1].value = Progress(sequence + 1, 1);
-    if (fault == 4) reinterpret_cast<Word*>(hbm + layout.ready)[1].value = Progress(sequence, chunks / workers + 2);
+    if (fault == 3) reinterpret_cast<Word*>(control + layout.ready)[1].value = Progress(sequence + 1, 1);
+    if (fault == 4) reinterpret_cast<Word*>(control + layout.ready)[1].value = Progress(sequence, chunks / workers + 2);
     bool read_with_pending_data = false, multiple_pending_chunks = false, post_with_pending_read = false;
     chunk_read = [&](std::uint64_t address, std::uint32_t bytes) {
       const auto descriptors = setup.hbm_base + layout.descriptor;
@@ -471,10 +483,11 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
       for (const auto& cq : completions) pending += cq.second.size();
       multiple_pending_chunks |= pending > kJettyCount;
       if (written_bytes[c] != uint64_t(std::min(count, (c + 1) * kChunkRows) - c * kChunkRows) * token_bytes) return;
+      if (fault == 5) { stopped.store(true, std::memory_order_release); return; }
       if (all_ready) return;
       if (chunks > 2 && c == 0) { publish(2); return; }
       if (c == 2) {
-        if (fault == 1) reinterpret_cast<Word*>(hbm + layout.ready)[1].value = Progress(sequence, kChunkFailed | uint32_t(Result::kInvalidRequest));
+        if (fault == 1) reinterpret_cast<Word*>(control + layout.ready)[1].value = Progress(sequence, kChunkFailed | uint32_t(Result::kInvalidRequest));
         else publish(1);
         return;
       }
@@ -482,23 +495,25 @@ void RunChunks(std::uint32_t count, std::uint32_t token_bytes = 656, int fault =
       if (next < chunks) publish(next);
     };
     data_wrs = data_sges = ready_wrs = data_tails = 0;
-    reinterpret_cast<Word*>(hbm + layout.notify)->value = sequence | (profiling ? kProfileNotify : 0);
+    read_posts = 0;
+    reinterpret_cast<Word*>(control + layout.notify)->value = sequence | (profiling ? kProfileNotify : 0);
     std::uint64_t received = 0;
     assert(transport.ReadRequest(&received).ok() && received == sequence);
     assert(transport.ReadDescriptor(sequence).ok());
-    assert(transport.WriteBatch().ok());
-    assert(transport.batch_result() == (fault == 3 ? Result::kSequenceError : fault ? Result::kInvalidRequest : Result::kOk));
+    assert(transport.WriteBatch(pushed ? &stopped : nullptr).ok());
+    assert(transport.batch_result() == (fault == 5 ? Result::kTimeout : fault == 3 ? Result::kSequenceError : fault ? Result::kInvalidRequest : Result::kOk));
     assert(retained.empty() && unfenced.empty() && pending_sges.empty() && unfenced_sges.empty() && fenced_sges.empty());
     assert(transport.Complete(sequence, transport.batch_result()).ok());
     assert(reinterpret_cast<Completion*>(hbm + layout.done)->token == Progress(sequence, uint32_t(transport.batch_result())));
     assert(ready_wrs == 0);
     if (!fault && count == 8192 && token_bytes == 656) assert(data_wrs == 2048 && data_tails == 32 && data_sges == count);
-    CheckProfile(transport, {}, sequence, false, profiling, false, true);
-    if (all_ready && chunks > 1) assert(post_with_pending_read);
-    if (chunks > 1 && fault < 3) assert(read_with_pending_data);
+    CheckProfile(transport, {}, sequence, false, profiling, false, true, pushed);
+    if (pushed) assert(read_posts == 0);
+    if (!pushed && all_ready && chunks > 1) assert(post_with_pending_read);
+    if (!pushed && chunks > 1 && fault < 3) assert(read_with_pending_data);
     if (chunks > 2 && fault < 3 && device_message == 65536) assert(multiple_pending_chunks);
     for (uint32_t c = 0; c < chunks; ++c) {
-      if (fault) assert(written[c] == (fault < 3 && (c == 0 || c == 2)));
+      if (fault) assert(written[c] == (fault == 5 ? c == 0 : fault < 3 && (c == 0 || c == 2)));
       else assert(written[c]);
       for (auto i = c * kChunkRows; i < std::min(count, (c + 1) * kChunkRows); ++i)
         if (written[c]) assert(!std::memcmp(result.data() + uint64_t(i) * token_bytes, reinterpret_cast<void*>(expected_address(i)), token_bytes));

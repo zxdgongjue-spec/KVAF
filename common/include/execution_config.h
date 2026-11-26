@@ -53,6 +53,7 @@ struct ExecutionResources {
   std::uint32_t sge_per_wr{0};
   bool sgl_payload_only{false};
   bool sgl_pipeline{false};
+  bool sgl_push_chunked{false};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

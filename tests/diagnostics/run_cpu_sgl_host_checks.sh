@@ -50,6 +50,9 @@ done
   access_operator/algorithms/get/cpu_sgl_push/host/loader.cpp
 mkdir -p "$KVAF_SGL_BUILD/generated"
 cp runtime/cmake/npu_kernel_paths.h.in "$KVAF_SGL_BUILD/generated/npu_kernel_paths.h"
+"$KVAF_SGL_CXX" -std=c++17 "${includes[@]}" -I"$KVAF_SGL_BUILD/generated" \
+  tests/diagnostics/cpu_sgl_resources.cc runtime/src/npu_runtime_config.cc -o "$KVAF_SGL_BUILD/resources"
+"$KVAF_SGL_BUILD/resources"
 "$KVAF_SGL_CXX" -std=c++17 -fsyntax-only -DKVAF_ENABLE_AIV_BATCH_GET=1 "${includes[@]}" \
   -Itests/diagnostics/aiv_sgl_model -Imeta_manager/include \
   -Iaccess_operator/algorithms/get/direct/urma_aiv/include -I"$KVAF_SGL_BUILD/generated" \
@@ -75,8 +78,11 @@ if [[ -n "${KVAF_TEST_URMA_INCLUDE_DIR:-}" ]]; then
     tests/diagnostics/cpu_sgl_push_transport.cc runtime/cpu_service/push/cpu_push_get_transport.cc \
     -o "$KVAF_SGL_BUILD/push-transport"
   "$KVAF_SGL_BUILD/push-transport"
-  "$KVAF_SGL_CXX" -std=c++17 -fsyntax-only "${includes[@]}" \
-    -I"$KVAF_TEST_URMA_INCLUDE_DIR" access_operator/transports/aicpu_urma/kernel/transfer.cc
+  "$KVAF_SGL_CXX" -std=c++17 -g -pthread -fsanitize=address,undefined "${includes[@]}" \
+    -I"$KVAF_TEST_URMA_INCLUDE_DIR" -Iaccess_operator/transports/aicpu_urma/kernel \
+    tests/diagnostics/aicpu_control_flights.cc access_operator/transports/aicpu_urma/kernel/transfer.cc \
+    -o "$KVAF_SGL_BUILD/control-flights"
+  "$KVAF_SGL_BUILD/control-flights"
   "$KVAF_SGL_CXX" -std=c++17 -fsyntax-only -DKVAF_CPU_HAS_URMA=1 "${includes[@]}" \
     -Iruntime -Iruntime/src -Imeta_manager/include -I"$KVAF_TEST_URMA_INCLUDE_DIR" \
     runtime/cpu_service/backends/urma_cpu_backend.cc runtime/memory/execution_cpu_backend.cc

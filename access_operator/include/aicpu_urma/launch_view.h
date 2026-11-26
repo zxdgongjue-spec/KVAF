@@ -73,5 +73,6 @@ struct ScatterLaunchView {
   bool sgl_pipeline{false};
   bool device_push{false};
   cpu_push::MailboxLaunch mailbox;
+  bool sgl_push_chunked{false};
 };
 }  // namespace kvaf::aicpu_urma

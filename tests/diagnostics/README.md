@@ -159,3 +159,12 @@ profiling disabled, final Head doorbells across multiple WQE batches, and
 submission timestamps before control-CQE retirement. Python checks verify
 cycle/ns conversion, late publisher entry, nested timing bounds, missing Host/
 kernel fields, and console/CSV reporting without adding overlapping stages.
+
+The optional `--sgl-push-chunked` mode is covered by the same runner: 1024-row
+chunks, 1/4/5/8 builders, out-of-order readiness, a stalled AIV builder while
+other owners reach the CPU, replay, failed progress, STOP/draining, and no
+descriptor READs. `aicpu_control_flights.cc` links the real native post/wait
+implementation and delays provider consumption until CQ polling. It checks four
+independent WR/SGE chains, FIFO slot reuse and retention after a partial post
+failure. Resource resolution and Python forwarding/CSV checks preserve the
+default Head/Suffix mode and propagate the new opt-in flag.

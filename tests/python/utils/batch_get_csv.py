@@ -10,7 +10,7 @@ SUMMARY_FIELDS = (
     "backend", "transport", "execution",
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
     "payload_bytes_per_call", "aiv_cores", "aicpu_workers", "jettys_per_core", "max_inflight_total",
-    "sge_per_wr", "sgl_pipeline", "sgl_pipeline_mode",
+    "sge_per_wr", "sgl_pipeline", "sgl_pipeline_mode", "sgl_push_chunked",
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
@@ -53,7 +53,8 @@ class BatchGetCsv:
             max_inflight_total=args.max_inflight_total if args.backend == "aiv" else None,
             sge_per_wr=args.sge_per_wr if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push") else None,
             sgl_pipeline=int(getattr(args, "sgl_pipeline", False)),
-            sgl_pipeline_mode="device_push_head_suffix" if args.backend in ("cpu_sgl_push", "aiv_cpu_sgl_push") else "chunked" if getattr(args, "sgl_pipeline", False) else "disabled",
+            sgl_pipeline_mode="device_push_chunked" if getattr(args, "sgl_push_chunked", False) else "device_push_head_suffix" if args.backend in ("cpu_sgl_push", "aiv_cpu_sgl_push") else "chunked" if getattr(args, "sgl_pipeline", False) else "disabled",
+            sgl_push_chunked=int(getattr(args, "sgl_push_chunked", False)),
         )
 
     def add_summary(self, execution, measurements):

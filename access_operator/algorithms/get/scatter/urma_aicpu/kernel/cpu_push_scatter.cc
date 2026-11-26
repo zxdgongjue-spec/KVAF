@@ -1,6 +1,7 @@
 #include "cpu_push_scatter.h"
 #include "cpu_push_pipeline.h"
 #include "get/cpu_sgl_push/kernel/aicpu_mailbox.h"
+#include "cpu_sgl_push_chunks.h"
 
 namespace kvaf::cpu_push {
 namespace {
@@ -48,6 +49,47 @@ struct Execution {
   const MailboxLaunch* mailbox{};
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
+  ChunkPushState& ChunkState() const { return *reinterpret_cast<ChunkPushState*>(Memory() + layout.staging); }
+  std::uint64_t ProgressWord(std::uint32_t owner) { Barrier(); return Load(reinterpret_cast<Word*>(Memory() + layout.ready)[owner]); }
+  std::uint32_t Sent(std::uint32_t owner) { return ChunkState().sent[owner].value; }
+  void SetSent(std::uint32_t owner, std::uint32_t value) { ChunkState().sent[owner].value = value; }
+  std::uint32_t Pending() { return ChunkState().state.reserved[0]; }
+  void SetPending(std::uint32_t value) { ChunkState().state.reserved[0] = value; }
+  bool Notified() { return ChunkState().state.reserved[1] != 0; }
+  void SetNotified() { ChunkState().state.reserved[1] = 1; }
+  bool ErrorSent() { return ChunkState().state.reserved[2] != 0; }
+  void SetErrorSent() { ChunkState().state.reserved[2] = 1; }
+  std::uint32_t Total() { return ChunkState().state.value; }
+  void SetTotal(std::uint32_t value) { ChunkState().state.value = value; }
+  void InitChunks() {
+    for (auto& word : ChunkState().sent) word.value = 0;
+    ChunkState().state = {};
+  }
+  std::uint64_t Post(std::uint32_t chunk, std::uint32_t owner, std::uint32_t progress, bool first) {
+    BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
+    Store(ChunkState().commits[chunk], Progress(args.sequence, progress));
+    if (first) Store(*reinterpret_cast<Word*>(Memory() + layout.notify), args.sequence | (profile ? kProfileNotify : 0));
+    Barrier();
+    const auto result = PostChunkDescriptorMailbox(*mailbox, args, layout, request_count, chunk, owner, first, false);
+    if (result) return std::uint64_t(Result::kTransportError);
+    if (first) {
+      if (profile) profile->head_doorbell_ns = BatchGetProfileNowNs() - profile->enter_ns;
+      Store(coordination.published, args.sequence);
+    }
+    return 0;
+  }
+  std::uint64_t Error(std::uint32_t owner, std::uint32_t error) {
+    BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
+    Store(ChunkState().commits[kPushChunkCount + owner], Progress(args.sequence, kChunkFailed | error));
+    Barrier();
+    return PostChunkDescriptorMailbox(*mailbox, args, layout, request_count, 0, owner, false, true)
+        ? std::uint64_t(Result::kTransportError) : 0;
+  }
+  std::uint64_t Wait() {
+    BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
+    return RetireDescriptorMailbox(*mailbox) ? std::uint64_t(Result::kTransportError) : 0;
+  }
+  std::uint32_t request_count{};
   void Relax(bool check_remote = true) {
     // Sample remote errors every 32 stalled polls.
     if (check_remote && (++idle_polls & 31) == 0) {
@@ -138,7 +180,7 @@ struct Execution {
     const auto build_range = !pipeline ? *range : !worker ? Range{0, head} :
         Range{std::max(range->begin, head), std::max(range->end, head)};
     {
-      BatchGetProfileScope head_timer(mailbox && profile && !worker && *count ? &profile->head_build_ns : nullptr);
+      BatchGetProfileScope head_timer(mailbox && !chunked && profile && !worker && *count ? &profile->head_build_ns : nullptr);
       if (!chunked && !FillSources(build_range)) return false;
     }
     if (!worker) {
@@ -191,10 +233,12 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   }
   Execution io{*args, output_target, layout, c, CounterNow(),
       CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox};
+  if (mailbox && chunked && !worker) io.InitChunks();
   std::uint32_t count = 0;
   Range range{};
   if (io.Status() == Result::kPending && !io.Build(worker, &count, &range))
     Fail(c, Result::kInvalidRequest);
+  io.request_count = count;
   bool head_notified = false;
   if (chunked) {
     range = {};
@@ -207,13 +251,18 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
       if (io.Status() != Result::kPending) continue;
       {
         BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
+        BatchGetProfileScope head_timer(mailbox && profile && !chunk ? &profile->head_build_ns : nullptr);
         if (!io.FillSources(part)) Fail(c, Result::kInvalidRequest);
         Barrier();
       }
       if (io.Status() != Result::kPending) continue;
       Store(*progress, Progress(args->sequence, ++completed));
       Barrier();
-      if (!worker && !head_notified) {
+      if (!worker && mailbox) {
+        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence);
+        if (result) Fail(c, static_cast<Result>(result));
+        head_notified = io.Notified();
+      } else if (!worker && !head_notified) {
         io.Notify(count);
         head_notified = true;
         Store(c.published, args->sequence);
@@ -236,7 +285,25 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   // Empty slices participate as well, keeping the target independent of shape.
   __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
   if (!worker) {
-    const bool built = io.Wait(c.built, target, false);
+    bool built = false;
+    if (mailbox && chunked) {
+      while (Load(c.built) < target && io.Check(false) == Result::kPending) {
+        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence);
+        if (result) Fail(c, static_cast<Result>(result));
+        io.Relax(false);
+      }
+      built = Load(c.built) >= target;
+      const auto chunks = (count + kChunkRows - 1) / kChunkRows;
+      while (built && io.Total() < chunks && io.Check(false) == Result::kPending) {
+        const auto result = RelayReadyChunks(io, count, args->workers, args->sequence);
+        if (result) Fail(c, static_cast<Result>(result));
+      }
+      if (io.Check(false) == Result::kTimeout) Fail(c, Result::kTimeout);
+      if (io.Status() != Result::kPending) (void)FailChunkControl(io, 0, std::uint32_t(io.Status()));
+      const auto retired = DrainChunkControls(io);
+      if (retired) Fail(c, static_cast<Result>(retired));
+      head_notified = io.Notified();
+    } else built = io.Wait(c.built, target, false);
     if (head_notified && !chunked) {
       const auto result = io.Status() == Result::kPending && built ? Result::kOk : io.Status();
       auto* suffix = reinterpret_cast<Word*>(io.Memory() + layout.notify);
@@ -316,6 +383,7 @@ std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
 
 namespace kvaf::cpu_push {
 std::uint32_t ExecuteCpuSglPush(CpuSglPushArgs* args) {
-  return args ? ExecuteCpuPush(&args->write.execution, &args->write.output_target, true, false, &args->mailbox) : 1;
+  const bool chunks = args && (args->write.execution.sequence & kChunkPipelineLaunch);
+  return args ? ExecuteCpuPush(&args->write.execution, &args->write.output_target, !chunks, chunks, &args->mailbox) : 1;
 }
 }  // namespace kvaf::cpu_push

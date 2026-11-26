@@ -137,7 +137,7 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
       {profile ? profile->device : s.profile_device, profile ? profile->host : s.profile_host,
        s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling, s.config.direct_output,
       s.bound_outputs.count(s.invocation) ? s.outputs.at(s.bound_outputs.at(s.invocation)).target : OutputTarget{},
-      s.config.sgl_pipeline, s.config.device_push, s.mailbox};
+      s.config.sgl_pipeline, s.config.device_push, s.mailbox, s.config.sgl_push_chunked};
 }
 bool CpuPushTransport::direct_output() const { return impl_->config.direct_output; }
 Status CpuPushTransport::RegisterOutput(const MutableBufferView& output) {
@@ -389,10 +389,13 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     return Status::InvalidArgument("sgl_payload_only requires CPU SGL Write");
   if (s.config.sgl_pipeline && (!s.config.direct_output || s.config.sgl_payload_only))
     return Status::InvalidArgument("sgl_pipeline requires CPU SGL Write without sgl_payload_only");
+  if (s.config.sgl_push_chunked && (!s.config.device_push || !s.config.direct_output))
+    return Status::InvalidArgument("sgl_push_chunked requires device-pushed direct output");
   if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.config.direct_output) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
       s.config.kernel_json.empty())
     return Status::InvalidArgument("CPU push requires a kernel path, PeerLink, local EID and valid shape");
+  if (s.config.sgl_push_chunked) s.layout.bytes += sizeof(ChunkPushState);
   bool loaded = false;
   if (s.config.aiv) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -460,7 +463,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
   if (s.config.sgl_payload_only) open.output_mode = kPayloadOnlyOutput;
   if (s.config.sgl_pipeline) open.output_mode = kChunkedOutput;
-  if (s.config.device_push) open.output_mode = kPipelinedOutput;
+  if (s.config.device_push) open.output_mode = s.config.sgl_push_chunked ? kPushChunkedOutput : kPipelinedOutput;
   open.sge_per_wr = s.config.sge_per_wr;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
@@ -682,7 +685,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.status = detail::PointerValue(view.completion.device);
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
-  if (view.sgl_pipeline && !view.device_push) args.sequence = kChunkPipelineLaunch;
+  if ((view.sgl_pipeline && !view.device_push) || view.sgl_push_chunked) args.sequence = kChunkPipelineLaunch;
   const CpuSglWriteArgs direct_args{args, view.output_target};
   const CpuSglPushArgs pushed_args{direct_args, view.mailbox};
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);

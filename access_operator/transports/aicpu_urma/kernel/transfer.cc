@@ -72,8 +72,8 @@ bool SubmitQueue(Queue& worker, std::vector<urma_jfs_wr_t>& requests, std::uint3
 
 bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                     std::uint32_t& transfer_index, std::uint64_t& offset,
-                    UmdkControlStatus& status) {
-  auto& requests = worker.requests;
+                    UmdkControlStatus& status, RequestBuffer* output = nullptr) {
+  auto& requests = output ? *output : worker.requests;
   requests.local_sges.clear();
   requests.remote_sges.clear();
   requests.wrs.clear();
@@ -215,16 +215,18 @@ std::uint32_t UmdkTransferPost(const UmdkContext* args, const UmdkTransfer* tran
   if (args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= CurrentState().worker_count) return 16;
   std::lock_guard<std::mutex> control_lock(session->control_mutexes[worker_index]);
   auto* q = FindQueue(kUmdkControlQueueIndex + worker_index);
-  if (!q || q->poisoned || q->control_pending || !q->target || !CurrentState().remote.handle()) return 16;
+  if (!q || q->poisoned || q->control_count == q->control_flights.size() || !q->target || !CurrentState().remote.handle()) return 16;
   for (std::uint32_t i = 0; i < count; ++i) if (!transfers[i].bytes || transfers[i].bytes > 1024 * 1024) return 16;
   UmdkControlStatus status{};
   std::uint32_t index = 0; std::uint64_t offset = 0;
-  if (!BuildTransfers(*q, true, transfers, count, index, offset, status) || index != count || offset) return 16;
-  q->control_context = q->requests.wrs.back().user_ctx;
-  q->control_started = NowNs();
+  auto& flight = q->control_flights[(q->control_head + q->control_count) % q->control_flights.size()];
+  if (!BuildTransfers(*q, true, transfers, count, index, offset, status, &flight.requests) || index != count || offset) return 16;
+  flight.context = flight.requests.wrs.back().user_ctx;
+  flight.started = NowNs();
   // Even a partial post failure owns the WR/SGE arrays until queue destruction.
   q->control_pending = true;
-  if (!PostBatch(*q, q->requests.wrs.data(), &q->requests.wrs.back(), status)) return 16;
+  ++q->control_count;
+  if (!PostBatch(*q, flight.requests.wrs.data(), &flight.requests.wrs.back(), status)) return 16;
   return 0;
 }
 std::uint32_t UmdkTransferWait(const UmdkContext* args, std::uint32_t worker_index) {
@@ -237,8 +239,10 @@ std::uint32_t UmdkTransferWait(const UmdkContext* args, std::uint32_t worker_ind
   auto* q = FindQueue(kUmdkControlQueueIndex + worker_index);
   if (!q || q->poisoned || !q->control_pending) return 16;
   UmdkControlStatus status{};
-  if (!WaitCompletion(*q, q->control_context, q->control_started, 30000, status)) return 16;
-  q->control_pending = false;
+  auto& flight = q->control_flights[q->control_head];
+  if (!WaitCompletion(*q, flight.context, flight.started, 30000, status)) return 16;
+  q->control_head = (q->control_head + 1) % q->control_flights.size();
+  q->control_pending = --q->control_count != 0;
   return 0;
 }
 

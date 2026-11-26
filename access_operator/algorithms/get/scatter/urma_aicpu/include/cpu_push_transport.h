@@ -20,6 +20,7 @@ struct Config {
   bool aiv{false};
   bool sgl_pipeline{false};
   bool device_push{false};
+  bool sgl_push_chunked{false};
 };
 class CpuPushTransport {
  public:

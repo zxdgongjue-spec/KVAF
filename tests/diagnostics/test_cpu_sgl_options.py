@@ -16,6 +16,37 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_device_push_chunk_mode_is_opt_in_and_forwarded(self):
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        for backend, executor in (("cpu_sgl_push", "aicpu"), ("aiv_cpu_sgl_push", "aiv")):
+            self.assertFalse(parse_args(["--backend", backend]).sgl_push_chunked)
+            args = parse_args(["--backend", backend, "--sgl-push-chunked", "--sge-per-wr", "4"])
+            self.assertIsNone(validate_args(args))
+            self.assertTrue(parse_args(workload_command(args)).sgl_push_chunked)
+            execution = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push",
+                                           get_cores=4, sge_per_wr=4, sgl_push_chunked=True)
+            budget = execution.runtime_kwargs["get_resources"][0][1]
+            self.assertTrue(budget["sgl_push_chunked"])
+            self.assertNotIn("sgl_push_chunked", execution.runtime_kwargs["put_resources"][0][1])
+            self.assertNotIn("jettys", budget)
+            self.assertNotIn("max_inflight_total", budget)
+            default = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push")
+            self.assertNotIn("sgl_push_chunked", default.runtime_kwargs["get_resources"][0][1])
+            with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+                args.output_dir = Path(directory)
+                report = BatchGetCsv(args)
+                report.add_summary("graph", {})
+                report.write()
+                with report.summary_path.open() as source:
+                    row = next(csv.DictReader(source))
+                    self.assertEqual(row["sgl_push_chunked"], "1")
+                    self.assertEqual(row["sgl_pipeline_mode"], "device_push_chunked")
+            self.assertIsNotNone(validate_args(parse_args(["--backend", backend, "--sgl-push-chunked", "--sgl-payload-only"])))
+        for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter", "cpu_sgl_write", "aiv_cpu_sgl_write"):
+            self.assertIn("--sgl-push-chunked", validate_args(parse_args(["--backend", backend, "--sgl-push-chunked"])))
+
     def test_head_profiles_use_publisher_and_preserve_clock_and_overlap(self):
         for backend in ("aiv_cpu_sgl_push", "cpu_sgl_push"):
             aiv = backend.startswith("aiv_")
@@ -107,6 +138,7 @@ class CpuSglOptionsTest(unittest.TestCase):
                     row = next(csv.DictReader(source))
                     self.assertEqual(row["sgl_pipeline_mode"], "device_push_head_suffix")
                     self.assertEqual(row["sgl_pipeline"], "1")
+                    self.assertEqual(row["sgl_push_chunked"], "0")
         for backend in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
             self.assertFalse(parse_args(["--backend", backend]).sgl_pipeline)
 
