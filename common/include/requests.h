@@ -65,8 +65,7 @@ struct BatchGetRangesRequest {
   ConstBufferView output_offsets;
   MutableBufferView output;
   AccessTableDeviceView device_access_table;
-  // Optional physical READ byte limit. Zero uses the backend default
-  // (AIV: uint32 WQE length, AICPU GatherRead: 64 KiB).
+  // Optional software limit on bytes per READ WR. Zero disables byte splitting.
   std::uint32_t read_chunk_bytes{0};
 };
 

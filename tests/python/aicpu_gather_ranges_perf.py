@@ -16,7 +16,6 @@ from test_npu_batch_get_ranges import pattern
 MIB = 1024 * 1024
 TOKEN_BYTES = 656
 MAX_REQUESTS = 65536
-DEFAULT_READ_BYTES = 64 * 1024
 
 
 def worker_payloads(lengths, workers):
@@ -40,7 +39,7 @@ def parse_args(argv=None):
     p.add_argument("--repeat", type=int, default=2, help="repeat the size list, one Key per tensor")
     p.add_argument("--workers", type=int, nargs="+", choices=range(1, 9), default=[2])
     p.add_argument("--read-chunk-bytes", type=int, nargs="+", default=[0, 16 * 1024, 32 * 1024],
-                   help="0 uses 64 KiB. Positive values are capped at 64 KiB")
+                   help="READ WR byte limit. 0 uses whole ranges as SGEs; positive values split by bytes")
     p.add_argument("--slot-size", type=int, default=0,
                    help="0 sizes slots to cover the heaviest lane across all requested worker counts")
     p.add_argument("--request-order", choices=["sequential", "reverse", "random"], default="sequential")
@@ -141,9 +140,7 @@ def run(a):
 
     def emit(plan, operation, scope, samples, chunk=None):
         row = dict(plan, device=a.device, allocation_mode="append_only", operation=operation,
-                   scope=scope, read_chunk_bytes=chunk,
-                   effective_read_chunk_bytes=(min(chunk or DEFAULT_READ_BYTES, DEFAULT_READ_BYTES)
-                                               if chunk is not None else None),
+                   scope=scope, read_chunk_bytes=chunk, effective_read_chunk_bytes=chunk,
                    **summarize(samples, payload_bytes, bandwidth=scope != "submit"))
         rows.append(row)
         print("AICPU_GATHER_RANGES_PERF_RESULT " + json.dumps(row, separators=(",", ":")), flush=True)

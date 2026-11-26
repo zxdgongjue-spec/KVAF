@@ -20,10 +20,9 @@ void EnsureSlots(std::vector<T>& slots, std::size_t count) {
 }
 
 constexpr std::uint32_t kGatherWaveWrs = 4096U;
-constexpr std::uint32_t kGatherWrBytes = 65536U;
 
 struct FixedReadSpans {
-  static constexpr std::uint32_t max_wr_bytes = kGatherWrBytes;
+  static constexpr std::uint32_t max_wr_bytes = 65536U;
   std::uint32_t token_bytes;
   const std::int32_t* rows;
 
@@ -42,8 +41,7 @@ struct RangeReadSpans {
   const std::int64_t* destinations;
 
   explicit RangeReadSpans(const AicpuBatchGetRangesInput& request)
-      : max_wr_bytes(request.read_chunk_bytes ? std::min(request.read_chunk_bytes, kGatherWrBytes)
-                                              : kGatherWrBytes),
+      : max_wr_bytes(request.read_chunk_bytes),
         lengths(reinterpret_cast<const std::int64_t*>(request.lengths)),
         destinations(reinterpret_cast<const std::int64_t*>(request.output_offsets)) {}
   std::uint32_t Length(std::uint32_t i) const { return static_cast<std::uint32_t>(lengths[i]); }
@@ -101,20 +99,32 @@ void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, const ReadSp
     const auto local_begin = local_index;
     std::uint32_t bytes = 0U, local_count = 0U;
     const auto source = layout.staging + source_position;
-    while (index < last && local_count < layout.sgl_size && bytes < spans.max_wr_bytes) {
-      const auto span_length = spans.Length(index);
-      const auto length = std::min(span_length - offset, spans.max_wr_bytes - bytes);
-      const auto target = layout.output + spans.Destination(index) + offset;
-      local[local_index++] = {target, length, layout.local_segment, nullptr};
-      ++local_count;
-      bytes += length;
-      source_position += length;
-      offset += length;
-      if (offset == span_length) {
-        ++index;
-        offset = 0U;
+    if (spans.max_wr_bytes == 0U) {
+      // One complete range per SGE. The validated lane payload fits uint32,
+      // so the sum of these lengths fits the source SGE's byte field.
+      local_count = std::min(last - index, layout.sgl_size);
+      for (std::uint32_t row = 0; row < local_count; ++row, ++index) {
+        const auto length = spans.Length(index);
+        const auto target = layout.output + spans.Destination(index);
+        local[local_index++] = {target, length, layout.local_segment, nullptr};
+        bytes += length;
+      }
+    } else {
+      while (index < last && local_count < layout.sgl_size && bytes < spans.max_wr_bytes) {
+        const auto span_length = spans.Length(index);
+        const auto length = std::min(span_length - offset, spans.max_wr_bytes - bytes);
+        const auto target = layout.output + spans.Destination(index) + offset;
+        local[local_index++] = {target, length, layout.local_segment, nullptr};
+        ++local_count;
+        bytes += length;
+        offset += length;
+        if (offset == span_length) {
+          ++index;
+          offset = 0U;
+        }
       }
     }
+    source_position += bytes;
     remote[wr_index] = {source, bytes, layout.remote_segment, nullptr};
     auto wr = layout.prototype;
     wr.user_ctx = ++sequence;
@@ -207,10 +217,11 @@ bool ReadBatches(Queue& worker, const ReadSpans& spans,
   if (!layout.local_segment) return Fail(error, "READ output is not registered");
   GatherPrefix prefix{args, status, args.worker_index, 0U, profile};
   if (profile) profile->read_setup_ns += BatchGetProfileNowNs() - setup_start;
-  // A WR ends at the SGL limit, the byte limit, or the end of this slice.
-  const auto max_wrs = (static_cast<std::uint64_t>(args.bytes) + spans.max_wr_bytes - 1U) /
-                           spans.max_wr_bytes +
-                       (args.source_span_count + layout.sgl_size - 1U) / layout.sgl_size;
+  std::uint64_t max_wrs = (args.source_span_count + layout.sgl_size - 1U) / layout.sgl_size;
+  // A nonzero byte limit can also end a WR partway through an SGE.
+  if (spans.max_wr_bytes != 0U)
+    max_wrs += (static_cast<std::uint64_t>(args.bytes) + spans.max_wr_bytes - 1U) /
+               spans.max_wr_bytes;
   const auto wave_wrs = static_cast<std::uint32_t>(std::min<std::uint64_t>(kGatherWaveWrs, max_wrs));
   std::uint32_t span_offset = 0;
   std::uint64_t remote_offset = 0;

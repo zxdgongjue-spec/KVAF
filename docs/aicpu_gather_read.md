@@ -42,9 +42,10 @@ Put 源和 Get 输出 Tensor 到 Runtime 关闭。Range Get 使用 eager，工�
 使用该 Runtime 捕获过定长图后应换用新 Runtime 执行 range。Range API 的 `profile=True`
 不可用。
 
-物理 READ 每条最多 64 KiB。传 `read_chunk_bytes=0` 使用这个默认值，非零值取
-`min(read_chunk_bytes, 64 KiB)`。例如单独读取 32 MiB 时默认提交 512 条 READ。
-这个分段影响 READ 提交，staging 容量仍按整个 worker 的请求总量检查。
+变长 Get 默认 `read_chunk_bytes=0`，每个完整输出区间使用一个 SGE，最多将 6 个 SGE
+合入一条 READ WR。单独读取 32 MiB 会构建一条 READ WR。指定正数时，按给定字节数
+限制单条 WR，例如 `65536` 恢复 64 KiB 分段。单条 WR 仍须满足实际设备及链路能力，
+staging 容量仍按整个 worker 的请求总量检查。
 
 在已启动 URMA CPU 服务、加载 CANN 环境的目标机上，从仓库根目录执行：
 
@@ -75,7 +76,7 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999 \
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
   tests/run_remote_cpu_aicpu_gather_ranges_perf.sh "$PWD/build-aicpu-urma" \
   --workers 2 4 6 --tensor-bytes 1048576 33554432 --repeat 6 \
-  --slot-size 134217728 --read-chunk-bytes 0 16384 32768 \
+  --slot-size 134217728 --read-chunk-bytes 0 65536 1048576 \
   --warmup 5 --iterations 30 --output-csv /tmp/aicpu_ranges_perf.csv
 ```
 
