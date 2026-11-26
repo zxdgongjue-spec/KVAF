@@ -22,7 +22,7 @@ constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
 constexpr uint32_t kMaxGatherSpans = 65536U;
 constexpr uint32_t kChannelSharedTp = 1U;
-// StatusResponse::reserved bits returned by a successful kEnableGatherLanes.
+// StatusResponse::reserved capability bits from successful Gather lane setup.
 constexpr uint32_t kGatherLanesPullGroups = 1U;
 constexpr uint32_t kGatherLanesChunkedPullGroups = 2U;
 constexpr uint32_t kDeviceNameBytes = 64U;
@@ -44,10 +44,10 @@ enum class Command : uint16_t {
   kPrepareGatherRoute = 17U,
   kEnableAivGatherLanes = 18U,
   kStopGatherLanes = 19U,
-  kOpenCpuPushMailbox = 20U,
   kOpenAivCpuGatherPushGet = 21U,
+  kOpenCpuPushMailbox = 22U,
   kAllocateUbmemRegion = 6U,
-  // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
+  // IDs 7 and 8 were test-only fill/check. ID 20 used the fixed-four-Jetty mailbox setup.
 };
 
 inline constexpr bool IsAivCpuPushCommand(Command command) {
@@ -239,9 +239,9 @@ struct CpuPushChannelKey {
 struct OpenCpuPushMailboxRequest {
   MessageHeader header;
   uint64_t session_id, source_bytes, hbm_base, hbm_bytes, npu_tp;
-  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers, window_capacity;
+  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers, window_capacity, payload_jettys;
   uint8_t eid[kEidBytes], segment[kSegKeyBytes];
-  CpuPushChannelKey channels[4];
+  CpuPushChannelKey channels[cpu_push::kMaxJettyCount];
 };
 // AIV keeps its fixed workspace and the V8/V9 wire layout.
 struct OpenAivCpuPushGetRequest {
@@ -256,7 +256,7 @@ struct OpenCpuPushMailboxResponse {
   int32_t result;
   uint64_t cpu_tp;
   uint32_t cpu_psn;
-  CpuPushChannelKey channels[4];
+  CpuPushChannelKey channels[cpu_push::kMaxJettyCount];
   AllocateRegionResponse mailbox;
 };
 struct OpenAivCpuPushGetResponse {
@@ -311,9 +311,9 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
-static_assert(sizeof(OpenCpuPushMailboxRequest) == 428U, "CPU push mailbox setup ABI changed");
-static_assert(offsetof(OpenCpuPushMailboxResponse, mailbox) == 300U);
-static_assert(sizeof(OpenCpuPushMailboxResponse) == 432U, "CPU push mailbox response ABI changed");
+static_assert(sizeof(OpenCpuPushMailboxRequest) == 2336U, "CPU push mailbox setup ABI changed");
+static_assert(offsetof(OpenCpuPushMailboxResponse, mailbox) == 2204U);
+static_assert(sizeof(OpenCpuPushMailboxResponse) == 2336U, "CPU push mailbox response ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetRequest) == 424U, "AIV CPU push setup ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetResponse) == 392U, "AIV CPU push setup response ABI changed");
 static_assert(sizeof(OpenAivCpuPushJettyRequest) == 2332U && sizeof(OpenAivCpuPushJettyResponse) == 2296U,

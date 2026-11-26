@@ -3,12 +3,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <numeric>
+#include "gather_prefix_layout.h"
 
 namespace kvaf {
 
 inline constexpr std::uint64_t kGatherPullPlanMagic = 0x4b56414650554c31ULL;
 inline constexpr std::uint32_t kGatherPullEnabled = 0x50554c31U;
-inline constexpr std::uint64_t kGatherChunkedPullMagic = 0x4b56414650554c32ULL;
 inline constexpr std::uint32_t kGatherChunkedPullEnabled = 0x50554c32U;
 inline constexpr std::uint32_t kGatherMaxPullGroups = 8;
 

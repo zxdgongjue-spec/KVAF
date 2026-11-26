@@ -11,7 +11,9 @@
 #include "get_host_timing.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <urma_api.h>
@@ -36,12 +38,13 @@ struct CpuPushTransport::Impl {
   void* status_host{};
   void* profile_device{};
   void* profile_host{};
-  std::array<std::unique_ptr<d::TargetChannel>, kJettyCount> channels;
+  std::array<std::unique_ptr<d::TargetChannel>, kMaxJettyCount> channels;
   std::unique_ptr<aicpu_urma::UmdkSession> mailbox_session;
   void* mailbox_source{};
   std::uint64_t mailbox_remote{};
   Layout layout;
-  std::uint32_t window_capacity{};
+  std::uint32_t window_capacity{}, payload_jettys{kJettyCount};
+  bool head_start{};
   using Invocation = aicpu_urma::AicpuGetInvocation;
   ExecutionViewState views;
   Invocation default_invocation{this};
@@ -120,7 +123,7 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
        s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling,
       s.mailbox_session ? aicpu_urma::UmdkContext{s.mailbox_session->session(), s.mailbox_session->owner_pid()} :
                           aicpu_urma::UmdkContext{},
-      s.mailbox_source, s.mailbox_remote};
+      s.mailbox_source, s.mailbox_remote, s.payload_jettys, s.head_start};
 }
 Status CpuPushTransport::Impl::Drain() {
   aicpu_urma::ScatterLaunchView view;
@@ -283,18 +286,33 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
         " is outside the supported range 1.." + std::to_string(worker_limit) +
         (known_worker_limit ? "" : " (device AICPU core count unavailable)"));
   }
-  s.window_capacity = ScatterWindowCapacity(s.config.token_bytes, s.config.workers, s.config.hbm_bytes);
+  s.payload_jettys = kJettyCount;
+  s.head_start = false;
+  if (const auto* value = std::getenv("KVAF_AICPU_SCATTER_PAYLOAD_JETTYS")) {
+    const auto end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, s.payload_jettys);
+    if (parsed.ec != std::errc{} || parsed.ptr != end ||
+        !s.payload_jettys || s.payload_jettys > kMaxJettyCount)
+      return Status::InvalidArgument("KVAF_AICPU_SCATTER_PAYLOAD_JETTYS must be in [1, 32]");
+  }
+  if (const auto* value = std::getenv("KVAF_AICPU_SCATTER_HEAD_START")) {
+    if (std::strcmp(value, "0") && std::strcmp(value, "1"))
+      return Status::InvalidArgument("KVAF_AICPU_SCATTER_HEAD_START must be 0 or 1");
+    s.head_start = value[0] == '1';
+  }
+  s.window_capacity = ScatterWindowCapacity(s.config.token_bytes, s.config.workers,
+                                            s.config.hbm_bytes, s.payload_jettys);
   if (!s.window_capacity)
     return Status::InvalidArgument("Scatter HBM budget cannot fit a window (minimum 4096 rows)");
-  if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.window_capacity) ||
+  if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.window_capacity, s.payload_jettys) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
       !aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str()))
     return Status::InvalidArgument("CPU push requires kernel JSON, PeerLink, local EID and valid shape");
   std::fprintf(stderr, "[KVAF] SCATTER_WINDOW capacity=%u budget=%llu bytes=%llu request_control=mailbox_write"
-      " workers=%u worker_limit=%lld device_aicpu_cores_known=%u\n",
+      " workers=%u worker_limit=%lld device_aicpu_cores_known=%u payload_jettys=%u head_start=%u\n",
       s.window_capacity, static_cast<unsigned long long>(s.config.hbm_bytes),
       static_cast<unsigned long long>(s.layout.bytes + s.layout.staging), s.config.workers,
-      static_cast<long long>(worker_limit), unsigned(known_worker_limit));
+      static_cast<long long>(worker_limit), unsigned(known_worker_limit), s.payload_jettys, unsigned(s.head_start));
   s.source = source;
   peer::PeerRegion region;
   auto result = s.config.peer_link->LookupRegion(source.base, &region);
@@ -344,13 +362,14 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.token_bytes = s.config.token_bytes;
   open.workers = s.config.workers;
   open.window_capacity = s.window_capacity;
+  open.payload_jettys = s.payload_jettys;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
   std::uint64_t npu_tp = 0;
   if (!d::GetPeerTp(s.api, s.context, s.config.local_eid, region.eid, "cpu_push_get", &npu_tp))
     return Error("query NPU CTP");
   open.npu_tp = npu_tp;
-  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+  for (std::uint32_t q = 0; q < s.payload_jettys; ++q) {
     s.channels[q] = std::make_unique<d::TargetChannel>(s.api, s.context);
     result = s.channels[q]->Initialize(s.token, token_value, 1024, 1024, 16384);
     if (!result.ok()) return result;
@@ -365,7 +384,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   result = s.config.peer_link->OpenCpuPushMailbox(source.base, open, &reply, &mailbox);
   if (!result.ok()) return result;
   s.mailbox_remote = mailbox.base;
-  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+  for (std::uint32_t q = 0; q < s.payload_jettys; ++q) {
     d::QpImportInfoT info{};
     if (!d::ImportPeerJetty(s.api, s.context, reply.channels[q].key, reply.channels[q].bytes,
         token_value, open.npu_tp, reply.cpu_tp, open.npu_psn, reply.cpu_psn, "cpu_push_get",
@@ -474,6 +493,8 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.mailbox_context = view.mailbox_context;
   args.mailbox_source = detail::PointerValue(view.mailbox_source);
   args.mailbox_remote = view.mailbox_remote;
+  args.payload_jettys = view.payload_jettys;
+  args.head_start = view.head_start;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.completion_checked = false;
   call.pending = call.last_stream = stream;

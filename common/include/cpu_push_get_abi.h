@@ -48,8 +48,8 @@ struct alignas(64) Completion {
   // One aligned word publishes both sequence and result without a torn pair.
   std::uint64_t token{}, reserved[7]{};
 };
-// Preserve the legacy four-Jetty record, including its reserved words. AIV
-// extended pools use ReadyStride and byte offsets for additional progress.
+// Preserve the default four-Jetty record, including its reserved words.
+// Larger pools use ReadyStride and byte offsets for additional progress.
 struct alignas(64) Ready { std::uint64_t jetty[kJettyCount]{}, reserved[4]{}; };
 KVAF_CPU_PUSH_INLINE constexpr std::uint32_t ReadyStride(std::uint32_t jettys) {
   return (jettys + 7U) / 8U * sizeof(Ready);
@@ -61,6 +61,7 @@ struct alignas(64) Coordination {
   // Launch tickets remain one per worker/call. Wire sequences advance once
   // per window, including the empty window used for a zero-count replay.
   Word window_next, launch_first_window, launch_count, started;
+  Word head_built;
 };
 struct alignas(64) WorkerStatus {
   std::uint64_t magic{kMagic}, sequence{}, result{}, worker{}, consumed{};

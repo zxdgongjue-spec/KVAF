@@ -74,7 +74,7 @@ void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
     KvafScatterBatchGetAivKernelV1(ScatterLaunchArgs(a));
   } else {
-    KvafGatherBatchGetAivKernelV11({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV12({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
@@ -1083,7 +1083,7 @@ int main() {
     } catch (const std::invalid_argument&) {
     }
   }
-  const auto& metadata = KvafGatherBatchGetAivKernelV11_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV12_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
   // Stage 1: WQEs precede the final ACK, but no payload READ does. Stage 2's
   // prefix gate must also submit a short ready slice of a 128-WR UB bank.

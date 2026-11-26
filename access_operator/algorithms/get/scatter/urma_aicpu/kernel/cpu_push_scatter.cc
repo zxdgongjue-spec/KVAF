@@ -100,12 +100,13 @@ struct Execution {
   }
   ReadySnapshot ReadReady(std::uint32_t w) {
     Barrier();
-    auto* ready = reinterpret_cast<volatile Ready*>(Memory() + layout.ready) + w;
-    RefreshWindowMemory(const_cast<const Ready*>(ready), sizeof(Ready));
+    const auto stride = ReadyStride(args.payload_jettys);
+    const auto* ready = reinterpret_cast<const std::uint64_t*>(Memory() + layout.ready + std::uint64_t{w} * stride);
+    RefreshWindowMemory(ready, stride);
     if (profile) ++profile->ready_queries;
-    ReadySnapshot snapshot;
-    for (std::uint32_t q = 0; q < kJettyCount; ++q)
-      snapshot[q] = __atomic_load_n(&ready->jetty[q], __ATOMIC_ACQUIRE);
+    ReadySnapshot snapshot{};
+    for (std::uint32_t q = 0; q < args.payload_jettys; ++q)
+      snapshot[q] = __atomic_load_n(ready + q, __ATOMIC_ACQUIRE);
     return snapshot;
   }
   void FinishRange() { Barrier(); }
@@ -126,43 +127,48 @@ struct Execution {
     if (profile) profile->scatter_copies += range.end - range.begin;
     return copied;
   }
-  bool Build(std::uint32_t worker, std::uint32_t count, Range* range) {
+  bool Build(std::uint32_t worker, std::uint32_t count, Range* range,
+             Range stage, std::uint32_t head) {
     const auto& r = args.request;
     BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
     if (!r.miss_count || !r.address_table || !r.indices || !r.offsets || !r.output_indices ||
         !args.output || count > args.window_capacity) return false;
     *range = WorkerRange(count, r.token_bytes, worker, args.workers);
-    if (range->begin == range->end) return true;
+    const auto begin = std::max(stage.begin, range->begin);
+    const auto end = std::min(stage.end, range->end);
     const auto* addresses = reinterpret_cast<const std::uint64_t*>(r.address_table);
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(RequestMemory() + layout.descriptor);
-    for (auto i = range->begin; i < range->end; ++i) {
+    for (auto i = begin; i < end; ++i) {
       const auto global = args.window_base + i;
       sources[i] = addresses[indices[global]] + static_cast<std::uint32_t>(offsets[global]);
     }
-    if (!worker) {
+    if (!worker && !stage.begin) {
       auto* header = reinterpret_cast<Request*>(RequestMemory() + layout.request);
-      *header = {kMagic, args.sequence, count, r.token_bytes, args.workers, 0, {}};
+      *header = {kMagic, args.sequence, count, r.token_bytes, args.workers,
+                 head ? kHeadStart : 0U, {head}};
     }
-    FlushMemory(sources + range->begin, std::uint64_t{range->end - range->begin} * sizeof(*sources));
+    if (begin < end) FlushMemory(sources + begin, std::uint64_t{end - begin} * sizeof(*sources));
     return true;
   }
-  void Notify() {
+  void Notify(Range stage) {
     BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
-    const auto count = reinterpret_cast<const Request*>(RequestMemory() + layout.request)->count;
-    const auto descriptor_bytes = std::uint64_t{count} * sizeof(std::uint64_t);
-    auto* notify = reinterpret_cast<Word*>(RequestMemory() + layout.notify);
-    Store(*notify, args.sequence | (profile ? kProfileNotify : 0));
-    FlushMemory(RequestMemory(), layout.notify + sizeof(notify->value));
-    // All writers have flushed their descriptor rows and crossed built.
-    // UMDK orders the trailing notify WRITE after the header and list.
+    const auto descriptor = layout.descriptor + std::uint64_t{stage.begin} * sizeof(std::uint64_t);
+    const auto descriptor_bytes = std::uint64_t{stage.end - stage.begin} * sizeof(std::uint64_t);
+    const bool suffix = stage.begin != 0U;
+    const auto marker = suffix ? kSuffixNotifyOffset : layout.notify;
+    auto* word = reinterpret_cast<std::uint64_t*>(RequestMemory() + marker);
+    __atomic_store_n(word, args.sequence | (!suffix && profile ? kProfileNotify : 0), __ATOMIC_RELEASE);
+    if (suffix) FlushMemory(word, sizeof(*word));
+    else FlushMemory(RequestMemory(), layout.notify + sizeof(*word));
+    // Each stage publishes its marker after its descriptor writes.
     const aicpu_urma::UmdkTransfer writes[] = {
         {args.mailbox_remote + layout.request, args.mailbox_source + layout.request, sizeof(Request)},
-        {args.mailbox_remote + layout.descriptor, args.mailbox_source + layout.descriptor, descriptor_bytes},
-        {args.mailbox_remote + layout.notify, args.mailbox_source + layout.notify, sizeof(notify->value)},
+        {args.mailbox_remote + descriptor, args.mailbox_source + descriptor, descriptor_bytes},
+        {args.mailbox_remote + marker, args.mailbox_source + marker, sizeof(*word)},
     };
-    if (mailbox_transfer(&args.mailbox_context, true, writes, 3, 0))
+    if (mailbox_transfer(&args.mailbox_context, true, suffix ? writes + 1 : writes, suffix ? 2 : 3, 0))
       Fail(coordination, Result::kTransportError);
   }
 };
@@ -173,7 +179,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, MailboxTransfer mailbox_tr
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !args->request.miss_count ||
       !args->mailbox_remote || !args->mailbox_source || !args->mailbox_context.session || !mailbox_transfer ||
-      !MakeLayout(args->request.token_bytes, args->workers, &layout, args->window_capacity)) return 1;
+      !MakeLayout(args->request.token_bytes, args->workers, &layout, args->window_capacity, args->payload_jettys)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.
   if (Load(c.result)) return 1;
@@ -219,12 +225,22 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, MailboxTransfer mailbox_tr
     const auto target = current.sequence * args->workers;
     io.start = CounterNow(); io.idle_polls = 0;
     Range range{};
-    if (!io.Build(worker, window_count, &range)) Fail(c, Result::kInvalidRequest);
+    const auto head = args->head_start && window_count > kChunkRows ? kChunkRows : 0U;
+    if (args->head_start) {
+      if (head && !io.Build(worker, window_count, &range, {0, head}, head))
+        Fail(c, Result::kInvalidRequest);
+      // The counter follows the window sequence, including unsplit windows.
+      __atomic_fetch_add(&c.head_built.value, 1, __ATOMIC_ACQ_REL);
+      if (head && !worker && io.Wait(c.head_built, target, false) && io.Status() == Result::kPending)
+        io.Notify({0, head});
+    }
+    if (!io.Build(worker, window_count, &range, {head, window_count}, head))
+      Fail(c, Result::kInvalidRequest);
     // Every worker participates in every window, including empty tail slices.
     __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
     if (!worker) {
       if (io.Wait(c.built, target, false) && io.Status() == Result::kPending) {
-        if (window_count) io.Notify();
+        if (window_count) io.Notify({head, window_count});
         Store(c.published, current.sequence);
       }
     } else io.Wait(c.published, current.sequence, false);
@@ -232,7 +248,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, MailboxTransfer mailbox_tr
     if (io.Status() == Result::kPending && range.begin < range.end) {
       BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
       const auto result = Consume(window_count, args->request.token_bytes, args->workers, worker,
-                                  current.sequence, io.start, io.timeout, io, &window_consumed);
+                                  current.sequence, io.start, io.timeout, io, &window_consumed, args->payload_jettys);
       if (result != Result::kOk) Fail(c, result);
     }
     consumed += window_consumed;

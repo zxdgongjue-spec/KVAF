@@ -39,6 +39,19 @@ CPU 线程数仍按整批 payload 决定，复制和相邻源合并均在 1024 �
 ready_bytes 仍只表示已完成的 payload。超时/停止会中止等待，并在全部 helper 退出后
 返回错误。probe 保留完整清单后 notify；READ 阶段仍在全部清单发布后进入。
 
+## 分组推进
+
+N 端设置 `KVAF_AIV_GATHER_GROUPED=1`，AIV Gather Read 使用和 AICPU 相同的分组地址与 Ready 协议。
+AIV 每 lane 先发送对应 32 条 READ 的源地址并通知 CPU，后续最多合并三组源地址提交。
+CPU 线程协作复制每组并发布连续 Ready。AIV 准备并提交已有 Ready 的 READ，同时按进度发送后续地址。
+最终 Ready 只有在 CPU 发布成功 ACK 后才可见。
+
+该模式默认关闭。开启后自动启用 READ 提前准备，并替代
+`KVAF_AIV_GATHER_CHUNK_BYTES`、`KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR` 和
+`KVAF_AIV_GATHER_COOPERATIVE_CHUNKS` 的调度配置。
+适用条件为 `token_bytes × SGL <= 65536` 且未启用探针。
+`GATHER_OPTIONS pipeline=grouped` 表示已启用，K 端服务与 N 端 Host 和 AIV kernel 须同步更新。
+
 ## 输出连续与 SGE 合并
 
 性能脚本用 `KVAF_GATHER_OUTPUT_LAYOUT` 选择目标索引：
@@ -156,7 +169,7 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 
 ## ABI 与兼容性
 
-- kernel `KvafGatherBatchGetAivKernelV11`，args 256 B。V11 在图回放时由 AIV 推进请求序号，loader 拒绝旧内核。
+- kernel `KvafGatherBatchGetAivKernelV12`，args 256 B。图回放仍由 AIV 推进请求序号，loader 拒绝旧内核。
 - profile PRF5、256 B；CSV schema 10。profile 直接写每核独占的 GM 记录。
 - GDR2：整批/普通 byte-prefix；GDR4：均分协作块；均为 48 B header + 16 B span 数组。
 - GDR5：CPU 继续接受固定 1/32 首块 + 4 尾块的旧格式。

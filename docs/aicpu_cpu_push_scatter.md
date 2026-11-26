@@ -41,15 +41,22 @@ Scatter 的 payload 使用 Host direct HCCP/RA 建链，mailbox 控制和 Put �
 UMDK 根据选定 EID 匹配 device/index，匹配或准备失败会报错，不再提供独立过滤参数。
 控制参数有更新，Host 库和设备包必须一起重建；仍保留单一 UMDK 控制入口。
 Ready/Done 和 payload 沿用 V3 数据布局，请求使用 K 端 mailbox。
-CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
+CPU 由所属服务线程在 payload Jetty 间按批轮转提交预构建链。
 资源项 `cores` / `--aicpu-workers` 控制 AICPU worker 数。
+
+| N 端环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `KVAF_AICPU_SCATTER_PAYLOAD_JETTYS` | `4` | 每个 Scatter transport 共用的 payload Jetty 总数，允许 `1` 至 `32`。实际建链容量由设备资源决定。 |
+| `KVAF_AICPU_SCATTER_HEAD_START` | `0` | 设为 `1` 后，超过 1024 行的窗口先通知前 1024 行。K 端边发送头部，设备边准备后缀。 |
+
+两个参数均在创建 transport 时读取。启动日志 `SCATTER_WINDOW` 显示生效的参数。
 
 ## 构建并验证
 
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
 逐行复制源于 `codex/aicpu-ordered-write` 的
 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24），Ready 由 AICPU 按 Jetty 分片消费。
-当前设备入口为 `KvafAicpuCpuPushScatterExecutionV5`。主机库和设备 SO 必须一起更新，
+当前设备入口为 `KvafAicpuCpuPushScatterExecutionV6`。主机库和设备 SO 必须一起更新，
 包括移除废弃排序字段后的 profile 布局。以下命令从各自仓库根目录执行。
 CPU 端构建服务：
 
@@ -163,7 +170,7 @@ AICPU 建立 UMDK 控制队列后才激活驻留 CPU worker。
    看到新序号后校验请求头、源地址范围并更新预构建 SGL。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
-6. AICPU 读取四个 Ready 字，独立推进各 Jetty 的消费进度。将本次新就绪的连续 staging
+6. AICPU 按配置读取 Ready 字，独立推进各 Jetty 的消费进度。将本次新就绪的连续 staging
    行合并为一个复制区间，再按原始 `output_indices[i]` 逐行执行 `memcpy_sp`。
    Ready 读取前、复制前及 worker 复制完成后执行 `dsb sy`。
 7. CPU 收齐数据链尾 CQE 后发布 done；全部 scatter 与 done 均完成后 kernel 结束。
@@ -178,11 +185,11 @@ ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64
 
 CPU 数据面沿用该提交 V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描，
 CPU 与设备共享 worker 分区和 chunk 枚举逻辑。
-每个 chunk 按连续行分到四个 Jetty；请求数量不变时复用数据/ready 链，每轮只更新源地址和序号。
-所属线程按 post 更新 SGL 并轮转提交四路队列，收齐数据链尾 CQE 后提交预构建的 done 链，
-消除每轮 OpenMP team 唤醒和多次 barrier；多 wave 请求仍逐 wave 排空再复用 SQ。
+每个 chunk 按连续行分到配置的 Jetty。请求数量不变时复用数据和 Ready 链，每轮更新源地址和序号。
+启用头部提前通知时，后缀全部可见后才校验其源地址。队列 credit 充足时可在回收头部 CQE 前提交后缀，
+分片跨越头尾边界时仍等完整分片写完才发布 Ready。多 wave 请求按 wave 排空再复用 SQ，最终收齐数据 CQE 后发送 Done。
 每个 Jetty 的 SQ 深度为 8192，每次 post 最多 128 个 payload WR，尾随的 Ready WR
-留在同一次 post 内。CQ batch 为 8，每 32 次扫描检查超时。
+留在同一次 post 内。CQ 在各 Jetty 间轮转查询，每 32 次未收齐批次的扫描检查超时。
 超出单 wave 容量的请求分 wave 执行，完成前保留全部 WR/SGL；每个 ready 使用独立的注册源字。
 Runtime 按每次 BatchGet 启动 kernel，接收本轮动态源地址和 `output_indices`。
 ready 热循环与 V24 一样只读 worker 协调状态；Runtime 的远端错误完成字在阻塞时每

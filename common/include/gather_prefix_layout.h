@@ -26,6 +26,8 @@ namespace kvaf {
 inline constexpr std::uint64_t kGatherHeadStartFlag = std::uint64_t{1} << 63;
 inline constexpr std::uint32_t kGatherHeadRows = 1024;
 inline constexpr std::uint32_t kGatherSuffixOffset = 24;
+inline constexpr std::uint64_t kGatherChunkedPullMagic = 0x4b56414650554c32ULL;
+inline constexpr std::uint32_t kGatherDefaultAddressGroupsPerPost = 3U;
 // GDR4 changes CPU copy ownership only. The 48-byte GDR2 envelope, mutable
 // byte prefix and final ACK keep their meanings.
 inline constexpr std::uint64_t kGatherCooperativeMagic = 0x4b56414647445234ULL;

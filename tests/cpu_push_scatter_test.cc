@@ -30,17 +30,19 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
                        const std::vector<std::int32_t>& rows, std::uint32_t active,
                        std::uint32_t bytes, std::uint32_t workers,
                        const std::vector<std::uint8_t>& staging,
-                       const std::vector<std::uint8_t>& expected) {
+                       const std::vector<std::uint8_t>& expected, std::uint32_t jettys = kJettyCount,
+                       bool head_start = false) {
   Layout layout;
-  CHECK(MakeLayout(bytes, workers, &layout));
+  CHECK(MakeLayout(bytes, workers, &layout, kvaf::kDefaultGetWindow, jettys));
   std::vector<CacheLine> workspace((layout.bytes + 63) / 64);
   auto* memory = reinterpret_cast<std::uint8_t*>(workspace.data());
   if (!staging.empty()) std::memcpy(memory + layout.staging, staging.data(), staging.size());
   reinterpret_cast<Completion*>(memory + layout.done)->token = Progress(1, 1);
-  auto* ready = reinterpret_cast<Ready*>(memory + layout.ready);
-  for (std::uint32_t w = 0; w < workers; ++w)
-    for (auto& token : ready[w].jetty)
-      token = Progress(1, ChunkCount(WorkerRange(active, bytes, w, workers)));
+  for (std::uint32_t w = 0; w < workers; ++w) {
+    auto* ready = reinterpret_cast<std::uint64_t*>(memory + layout.ready + w * ReadyStride(jettys));
+    for (std::uint32_t q = 0; q < jettys; ++q)
+      ready[q] = Progress(1, ChunkCount(WorkerRange(active, bytes, w, workers)));
+  }
   Coordination coordination{};
   std::vector<WorkerStatus> statuses(workers);
   std::vector<kvaf::BatchGetWorkerProfile> profiles(workers);
@@ -60,6 +62,8 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   args.profile = Pointer(profiles.data());
   args.sequence = 1;
   args.workers = workers;
+  args.payload_jettys = jettys;
+  args.head_start = head_start;
   args.timeout_ms = 5000;
   std::vector<std::thread> threads;
   for (std::uint32_t w = 0; w < workers; ++w)
@@ -69,6 +73,12 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   const auto notify = reinterpret_cast<Word*>(mailbox.data() + layout.notify)->value;
   CHECK((notify & ~kProfileNotify) == (active ? 1U : 0U));
   CHECK(((notify & kProfileNotify) != 0) == (active != 0));
+  const auto* request = reinterpret_cast<const Request*>(mailbox.data() + layout.request);
+  const auto suffix = *reinterpret_cast<const std::uint64_t*>(mailbox.data() + kSuffixNotifyOffset);
+  const bool split = head_start && active > kChunkRows;
+  CHECK(bool(request->reserved & kHeadStart) == split);
+  CHECK(request->reserved_words[0] == (split ? kChunkRows : 0));
+  CHECK(suffix == (split ? 1U : 0U));
   const auto* sources = reinterpret_cast<const std::uint64_t*>(mailbox.data() + layout.descriptor);
   for (std::uint32_t i = 0; i < active; ++i)
     CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
@@ -127,6 +137,9 @@ void CheckRound(std::uint32_t capacity, std::uint32_t active, std::uint32_t byte
       (capacity == 4096 && step == 1 && workers == 4) ||
       (capacity == 4103 && step == 2 && workers == 8))
     CheckDeviceKernel(addresses, indices, offsets, rows, active, bytes, workers, staging, expected);
+  if (capacity == 4103 && step == 2 && workers == 8 && bytes == 656)
+    CheckDeviceKernel(addresses, indices, offsets, rows, active, bytes, workers, staging, expected,
+                      kMaxJettyCount, true);
   CHECK(indices == original_indices && offsets == original_offsets && rows == original_rows);
 }
 

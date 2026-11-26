@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -12,7 +13,7 @@
 #include "status.h"
 
 namespace kvaf::cpu_push {
-// One service thread owns and submits the four prepared Jetty chains.
+// One service thread owns and submits the prepared payload Jetty chains.
 class Transport {
  public:
   ~Transport();
@@ -21,7 +22,7 @@ class Transport {
                     peer::OpenCpuPushMailboxResponse*, std::uint64_t canonical_base);
   std::uint64_t MailboxSequence();
   Status ValidateRequest(std::uint64_t sequence);
-  Status WriteBatch();
+  Status WriteBatch(const std::atomic<bool>* stop = nullptr);
   Status Complete(std::uint64_t sequence, Result result);
   void PrintProfile() const;
   Status Shutdown();
@@ -31,7 +32,7 @@ class Transport {
   struct Profile {
     bool enabled{};
     std::uint64_t address_validate_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
-    std::uint64_t first_post_ns{}, last_cqe_ns{};
+    std::uint64_t first_post_ns{}, last_cqe_ns{}, suffix_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
   } profile_;
@@ -39,7 +40,7 @@ class Transport {
     cpu_runtime_detail::UrmaChannel channel;
     bool poisoned{};
   };
-  using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
+  using Tracker = cpu_urma_detail::AivIndexedAsyncWriteTracker;
   struct PreparedQueue {
     struct Post { std::uint32_t wr, first_sge, end_sge; };
     struct Source { std::uint32_t local, row, offset; };
@@ -53,24 +54,30 @@ class Transport {
     std::vector<Marker> markers;
   };
   struct PreparedWrite {
-    std::array<PreparedQueue, kJettyCount> queues;
-    std::array<Tracker::Fence, kJettyCount> fences;
+    std::array<PreparedQueue, kMaxJettyCount> queues;
+    std::array<Tracker::Fence, kMaxJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
+    bool suffix{};
   };
-  Status PrepareWrites(std::uint32_t count);
+  Status PrepareWrites(std::uint32_t count, std::uint32_t head);
+  Status ValidateSources(Range);
+  Status WaitSuffix(const std::atomic<bool>* stop);
+  Status DrainPrepared(Profile*);
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
-  Status BeginPrepared(PreparedWrite&, std::uint64_t id);
+  Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_for_credits = nullptr,
+                       bool allow_drain = false);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
-  std::array<Queue, kJettyCount> queues_;
+  std::array<Queue, kMaxJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
   PreparedWrite done_;
+  std::uint32_t jetty_count_{kJettyCount};
   Tracker tracker_{kJettyCount, 8192};
-  std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
+  std::uint32_t prepared_count_{UINT32_MAX}, prepared_head_{}, next_poll_queue_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};

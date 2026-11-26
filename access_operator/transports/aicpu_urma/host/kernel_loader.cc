@@ -19,7 +19,7 @@ struct KernelEntry {
 };
 KernelEntry functions[] = {
     {"KvafAicpuUmdkControlSessionsV5"}, {"KvafAicpuBatchPut"},
-    {"KvafAicpuGatherReadExecutionV5"}, {"KvafAicpuCpuPushScatterExecutionV5"}};
+    {"KvafAicpuGatherReadExecutionV5"}, {"KvafAicpuCpuPushScatterExecutionV6"}};
 
 aclrtFuncHandle ResolveFunction(const char* name) {
   for (auto& entry : functions) {
@@ -95,7 +95,7 @@ Status PrepareUmdkKernel(const std::string& json, UmdkKernelKind kind) {
     case UmdkKernelKind::Control: mode = "control"; break;
     case UmdkKernelKind::Put: mode = "put"; entry = "KvafAicpuBatchPut"; break;
     case UmdkKernelKind::Gather: mode = "gather_read"; entry = "KvafAicpuGatherReadExecutionV5"; break;
-    case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV5"; break;
+    case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV6"; break;
     default: return Status::InvalidArgument("unknown AICPU kernel kind");
   }
   const std::string context = "AICPU mode=" + std::string(mode) + " json=" + json;

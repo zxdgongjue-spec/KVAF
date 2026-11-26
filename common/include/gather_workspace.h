@@ -3,6 +3,7 @@
 #include <optional>
 #include <string_view>
 #include "get_window.h"
+#include "gather_prefix_layout.h"
 
 namespace kvaf {
 // A pair of zeros selects the fixed 128-KiB layout. Sized chunks use
@@ -32,7 +33,6 @@ inline constexpr std::uint32_t kGatherChunkBytes = 131072U;
 inline constexpr std::uint32_t kGatherMaxReadWaveWrs = 4096U;
 // Internal zero selects the per-launch policy; public ExecutionResources uses None.
 inline constexpr std::uint32_t kGatherDefaultReadWaveWrs = 0U;
-inline constexpr std::uint32_t kGatherDefaultAddressGroupsPerPost = 3U;
 inline bool ResolveGatherAddressGroupsPerPost(std::optional<std::uint32_t> configured,
                                              const char* environment, std::uint32_t* groups) {
   if (configured) {

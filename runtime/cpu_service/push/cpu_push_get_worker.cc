@@ -46,7 +46,7 @@ void Worker::Run() {
         std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str());
         return;
       }
-      status = transport_->WriteBatch();
+      status = transport_->WriteBatch(&stop_);
       if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
       else (void)transport_->Complete(sequence, Result::kTransportError);
     } catch (const std::exception& error) {

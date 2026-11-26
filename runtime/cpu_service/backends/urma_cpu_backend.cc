@@ -1506,8 +1506,8 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       const bool aiv = command == Command::kEnableAivGatherLanes;
       const auto result = service->EnableGatherLanes(request.session_id, request.control_address,
                                                       request.lanes, aiv);
-      SendStatus(fd, command, result, header.version, aiv ? 0U :
-                 peer::kGatherLanesPullGroups | peer::kGatherLanesChunkedPullGroups);
+      SendStatus(fd, command, result, header.version, peer::kGatherLanesChunkedPullGroups |
+                 (aiv ? 0U : peer::kGatherLanesPullGroups));
       return;
     }
 

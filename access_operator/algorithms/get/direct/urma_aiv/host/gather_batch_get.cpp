@@ -249,7 +249,12 @@ struct GatherBatchGet::Impl {
     if (KvafBatchGetLocalBufferAcquire(gather_transport, workspace, args.workspace_bytes,
         &workspace_buffer, &args.workspace_entity)) return Error("register gather workspace");
     gather_enabled = true;  // STOP also handles an uncertain enable response.
-    return config.peer_link->EnableGatherLanes(region.base, args.remote_control, workers, true);
+    uint32_t capabilities = 0;
+    status = config.peer_link->EnableGatherLanesWithCapabilities(
+        region.base, args.remote_control, workers, capabilities, true);
+    if (status.ok() && args.grouped_addresses && !(capabilities & peer::kGatherLanesChunkedPullGroups))
+      return Error("CPU service does not support grouped AIV Gather");
+    return status;
   }
 
   Status Shutdown() {
@@ -299,6 +304,11 @@ Status GatherBatchGet::Impl::CaptureProfile() {
   latest_profile.cores.reserve(config.npu_core_count);
   for (uint32_t i = 0; i < config.npu_core_count; ++i) {
     const auto& p = profiles[i];
+    const auto payload_bytes = p.requests * config.batch_get_token_bytes;
+    const auto chunk_bytes = !p.requests ? 0 : args.grouped_addresses ?
+        std::min<uint64_t>(p.requests, KVAF_GATHER_GROUP_WRS * args.sgl_size) * config.batch_get_token_bytes :
+        args.cooperative_chunks ? GatherCooperativeChunkBytes(
+            payload_bytes, args.cooperative_chunks, args.first_chunk_divisor) : args.pipeline_chunk_bytes;
     const char* reason = nullptr;
     if (p.magic != KVAF_GATHER_PROFILE_MAGIC) reason = "magic";
     else if (p.sequence != sequence) reason = "sequence";
@@ -306,7 +316,7 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.valid_mask != KVAF_GATHER_PROFILE_ALL_EVENTS) reason = "valid_mask";
     else if (p.kernel_start_cycle > p.input_done_cycle) reason = "timestamp_start_input";
     else if (p.input_done_cycle > p.descriptor_done_cycle) reason = "timestamp_input_descriptor";
-    else if (!(args.head_start && !args.probe && p.requests > kGatherHeadRows) &&
+    else if (!args.grouped_addresses && !(args.head_start && !args.probe && p.requests > kGatherHeadRows) &&
              p.descriptor_done_cycle > p.notify_done_cycle) reason = "timestamp_descriptor_notify";
     else if (p.notify_done_cycle > p.ack_done_cycle) reason = "timestamp_notify_ack";
     else if (!p.pipeline_chunk_bytes && p.ack_done_cycle > p.read_done_cycle) reason = "timestamp_ack_read";
@@ -315,10 +325,7 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.read_done_cycle > p.kernel_finish_cycle) reason = "timestamp_read_finish";
     else if (p.requests != statuses[i].requests) reason = "requests";
     else if (p.data_wrs != statuses[i].data_wrs) reason = "data_wrs";
-    else if (p.pipeline_chunk_bytes != (p.requests ? args.cooperative_chunks ?
-        GatherCooperativeChunkBytes(p.requests * config.batch_get_token_bytes,
-            args.cooperative_chunks, args.first_chunk_divisor) :
-        args.pipeline_chunk_bytes : 0)) reason = "pipeline_chunk_bytes";
+    else if (p.pipeline_chunk_bytes != chunk_bytes) reason = "pipeline_chunk_bytes";
     else if (p.prepare_ahead != (p.requests ? args.prepare_ahead : 0)) reason = "prepare_ahead";
     else if (p.cooperative_chunks != (p.requests ? args.cooperative_chunks : 0)) reason = "cooperative_chunks";
     else if (p.pipeline_chunk_bytes &&
@@ -417,43 +424,53 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
   const bool fast_read = uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size <= 65536;
-  s.args.pipeline_chunk_bytes = kGatherChunkBytes;
-  const char* chunk = std::getenv("KVAF_AIV_GATHER_CHUNK_BYTES");
-  if (chunk && *chunk) {
-    const auto parsed = std::from_chars(chunk, chunk + std::strlen(chunk), s.args.pipeline_chunk_bytes);
-    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
-        (s.args.pipeline_chunk_bytes &&
-         (s.args.pipeline_chunk_bytes < 64 || s.args.pipeline_chunk_bytes % 64)))
-      return Status::InvalidArgument("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64");
+  const char* grouped = std::getenv("KVAF_AIV_GATHER_GROUPED");
+  if (grouped && *grouped && std::strcmp(grouped, "0") && std::strcmp(grouped, "1"))
+    return Status::InvalidArgument("KVAF_AIV_GATHER_GROUPED must be 0 or 1");
+  s.args.grouped_addresses = grouped && std::strcmp(grouped, "1") == 0;
+  if (s.args.grouped_addresses && (s.args.probe || !fast_read))
+    return Status::InvalidArgument("grouped gather requires no probe and token_bytes * SGL <= 65536");
+  if (s.args.grouped_addresses) {
+    s.args.prepare_ahead = 1;
+  } else {
+    s.args.pipeline_chunk_bytes = kGatherChunkBytes;
+    const char* chunk = std::getenv("KVAF_AIV_GATHER_CHUNK_BYTES");
+    if (chunk && *chunk) {
+      const auto parsed = std::from_chars(chunk, chunk + std::strlen(chunk), s.args.pipeline_chunk_bytes);
+      if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
+          (s.args.pipeline_chunk_bytes &&
+           (s.args.pipeline_chunk_bytes < 64 || s.args.pipeline_chunk_bytes % 64)))
+        return Status::InvalidArgument("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64");
+    }
+    // Probes and split-token reads retain whole-batch ACK semantics.
+    if (s.args.probe || !fast_read)
+      s.args.pipeline_chunk_bytes = 0;
+    const char* cooperative = std::getenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
+    if (cooperative && *cooperative) {
+      const auto parsed = std::from_chars(cooperative, cooperative + std::strlen(cooperative), s.args.cooperative_chunks);
+      if (parsed.ec != std::errc{} || *parsed.ptr != '\0')
+        return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer");
+    }
+    const char* first = std::getenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
+    if (first && *first) {
+      const auto parsed = std::from_chars(first, first + std::strlen(first), s.args.first_chunk_divisor);
+      if (parsed.ec != std::errc{} || *parsed.ptr != '\0' || s.args.first_chunk_divisor == 1)
+        return Status::InvalidArgument("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or a uint32 >=2");
+    }
+    if (!GatherCooperativeLayoutValid(s.args.cooperative_chunks, s.args.first_chunk_divisor))
+      return Status::InvalidArgument("COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode, "
+                                    "or 1..32 with FIRST_CHUNK_DIVISOR>=2");
+    if (s.args.cooperative_chunks && (!s.args.pipeline_chunk_bytes || s.args.probe || !fast_read))
+      return Status::InvalidArgument("cooperative gather requires nonzero chunk mode, no probe, token_bytes * SGL <= 65536");
+    const char* prepare = std::getenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
+    if (prepare && *prepare && std::strcmp(prepare, "0") && std::strcmp(prepare, "1"))
+      return Status::InvalidArgument("KVAF_AIV_GATHER_PREPARE_AHEAD must be 0 or 1");
+    s.args.prepare_ahead = prepare && *prepare ? std::strcmp(prepare, "1") == 0 : bool(s.args.cooperative_chunks);
+    if (s.args.cooperative_chunks && !s.args.prepare_ahead)
+      return Status::InvalidArgument("cooperative gather requires KVAF_AIV_GATHER_PREPARE_AHEAD=1");
+    if (s.args.prepare_ahead && (s.args.probe || !fast_read))
+      return Status::InvalidArgument("gather prepare-ahead requires whole-batch/prefix, no probe, token_bytes * SGL <= 65536");
   }
-  // Probes and split-token reads retain whole-batch ACK semantics.
-  if (s.args.probe || !fast_read)
-    s.args.pipeline_chunk_bytes = 0;
-  const char* cooperative = std::getenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
-  if (cooperative && *cooperative) {
-    const auto parsed = std::from_chars(cooperative, cooperative + std::strlen(cooperative), s.args.cooperative_chunks);
-    if (parsed.ec != std::errc{} || *parsed.ptr != '\0')
-      return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer");
-  }
-  const char* first = std::getenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
-  if (first && *first) {
-    const auto parsed = std::from_chars(first, first + std::strlen(first), s.args.first_chunk_divisor);
-    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' || s.args.first_chunk_divisor == 1)
-      return Status::InvalidArgument("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or a uint32 >=2");
-  }
-  if (!GatherCooperativeLayoutValid(s.args.cooperative_chunks, s.args.first_chunk_divisor))
-    return Status::InvalidArgument("COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode, "
-                                  "or 1..32 with FIRST_CHUNK_DIVISOR>=2");
-  if (s.args.cooperative_chunks && (!s.args.pipeline_chunk_bytes || s.args.probe || !fast_read))
-    return Status::InvalidArgument("cooperative gather requires nonzero chunk mode, no probe, token_bytes * SGL <= 65536");
-  const char* prepare = std::getenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
-  if (prepare && *prepare && std::strcmp(prepare, "0") && std::strcmp(prepare, "1"))
-    return Status::InvalidArgument("KVAF_AIV_GATHER_PREPARE_AHEAD must be 0 or 1");
-  s.args.prepare_ahead = prepare && *prepare ? std::strcmp(prepare, "1") == 0 : bool(s.args.cooperative_chunks);
-  if (s.args.cooperative_chunks && !s.args.prepare_ahead)
-    return Status::InvalidArgument("cooperative gather requires KVAF_AIV_GATHER_PREPARE_AHEAD=1");
-  if (s.args.prepare_ahead && (s.args.probe || !fast_read))
-    return Status::InvalidArgument("gather prepare-ahead requires whole-batch/prefix, no probe, token_bytes * SGL <= 65536");
   const char* coalesce = std::getenv("KVAF_AIV_GATHER_COALESCE_SGES");
   if (coalesce && *coalesce && std::strcmp(coalesce, "0") && std::strcmp(coalesce, "1"))
     return Status::InvalidArgument("KVAF_AIV_GATHER_COALESCE_SGES must be 0 or 1");
@@ -484,10 +501,11 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u first_chunk_divisor=%u\n",
-      s.args.first_chunk_divisor ? "bootstrap_prefix" : s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
+  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u first_chunk_divisor=%u group_wrs=%u\n",
+      s.args.grouped_addresses ? "grouped" : s.args.first_chunk_divisor ? "bootstrap_prefix" : s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
       s.args.prepare_ahead ? "prepared" : "baseline",
-      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks, s.args.first_chunk_divisor);
+      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks, s.args.first_chunk_divisor,
+      s.args.grouped_addresses ? KVAF_GATHER_GROUP_WRS : 0U);
   return Status::OK();
 }
 Status GatherBatchGet::DrainGet() {
@@ -617,7 +635,7 @@ Status GatherBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
       auto args = s.args;
       status = Input(exec, s.config, &args.request);
       if (!status.ok()) return status;
-      args.head_start = exec.execution.trusted_npu_request;
+      args.head_start = exec.execution.trusted_npu_request && !args.grouped_addresses;
       args.request.core_status = Ptr(s.status_device);
       args.request.queue_state = Ptr(s.queues);
       args.request.channel_entity = s.graph.output_entity;
@@ -647,7 +665,7 @@ Status GatherBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     s.latest_profile = {};
   }
   auto args = s.args;
-  args.head_start = exec.execution.trusted_npu_request && !args.probe;
+  args.head_start = exec.execution.trusted_npu_request && !args.probe && !args.grouped_addresses;
   if (exec.execution.trusted_npu_request) FillInput(*exec.request, s.config, &args.request);
   else result = Input(exec, s.config, &args.request);
   if (!result.ok()) return result;

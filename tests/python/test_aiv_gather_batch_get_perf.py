@@ -59,7 +59,16 @@ COUNTERS = (
 )
 
 
+def configured_grouped() -> bool:
+    value = os.environ.get("KVAF_AIV_GATHER_GROUPED", "")
+    if value not in ("", "0", "1"):
+        raise ValueError("KVAF_AIV_GATHER_GROUPED must be 0 or 1")
+    return value == "1"
+
+
 def configured_chunk_bytes() -> int:
+    if configured_grouped():
+        return 0
     value = os.environ.get("KVAF_AIV_GATHER_CHUNK_BYTES", "") or "131072"
     if not value.isascii() or not value.isdecimal():
         raise ValueError("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64")
@@ -70,6 +79,8 @@ def configured_chunk_bytes() -> int:
 
 
 def configured_cooperative_chunks() -> int:
+    if configured_grouped():
+        return 0
     value = os.environ.get("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "0") or "0"
     if not value.isascii() or not value.isdecimal():
         raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer")
@@ -83,6 +94,8 @@ def configured_cooperative_chunks() -> int:
 
 
 def configured_prepare_ahead() -> int:
+    if configured_grouped():
+        return 1
     value = os.environ.get("KVAF_AIV_GATHER_PREPARE_AHEAD", "")
     if value not in ("", "0", "1"):
         raise ValueError("KVAF_AIV_GATHER_PREPARE_AHEAD must be 0 or 1")
@@ -90,6 +103,8 @@ def configured_prepare_ahead() -> int:
 
 
 def configured_first_chunk_divisor() -> int:
+    if configured_grouped():
+        return 0
     value = os.environ.get("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "0") or "0"
     if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= (1 << 32) - 1 or int(value) == 1:
         raise ValueError("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or a uint32 >=2")
@@ -210,7 +225,16 @@ def check_coalesced_profile(profile) -> None:
                                "rebuild and deploy both gather Host and kernel")
 
 
-def check_first_chunk_profile(profile) -> None:
+def check_progress_profile(profile) -> None:
+    if configured_grouped():
+        for lane in profile["cores"]:
+            rows = int(lane["requests"])
+            expected = min(rows, 32 * GATHER_SGL_SIZE) * TOKEN_BYTES
+            if (int(lane["pipeline_chunk_bytes"]) != expected or
+                    int(lane["cooperative_chunks"]) != 0 or
+                    int(lane["prepare_ahead"]) != int(rows != 0)):
+                raise RuntimeError("grouped Gather was not applied; rebuild and deploy CPU service, Host and kernel")
+        return
     divisor = configured_first_chunk_divisor()
     if not divisor:
         return
@@ -349,6 +373,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
         "tokens_per_block": TOKENS_PER_BLOCK, "sgl": GATHER_SGL_SIZE, "seed": SEED,
         "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "coalesce_sges": int(os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES", "0") or "0"),
+        "configured_grouped": configured_grouped(),
         "configured_chunk_bytes": configured_chunk_bytes(),
         "configured_prepare_ahead": configured_prepare_ahead(),
         "configured_cooperative_chunks": configured_cooperative_chunks(),
@@ -522,7 +547,8 @@ def main(argv=None) -> int:
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware benchmark was requested but NPU Runtime is unavailable")
     coalesce = os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1"
-    if (profile_samples or coalesce or configured_first_chunk_divisor()) and not all(
+    check_schedule = coalesce or configured_grouped() or configured_first_chunk_divisor()
+    if (profile_samples or check_schedule) and not all(
         hasattr(kvaf.NpuRuntime, method) for method in (
         "start_gather_batch_get_profile", "gather_batch_get_profile", "stop_gather_batch_get_profile",
     )):
@@ -556,6 +582,7 @@ def main(argv=None) -> int:
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"populate_chunk_entries={POPULATE_CHUNK_ENTRIES} "
             f"coalesce_sges={metadata['coalesce_sges']} "
+            f"configured_grouped={int(metadata['configured_grouped'])} "
             f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
             f"configured_first_chunk_divisor={metadata['configured_first_chunk_divisor']} "
             f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={profile_samples} "
@@ -620,15 +647,15 @@ def main(argv=None) -> int:
                 torch.npu.synchronize()
 
         # Check all payload bytes and the two untouched guard rows outside timing.
-        if coalesce or configured_first_chunk_divisor():
+        if check_schedule:
             runtime.start_gather_batch_get_profile()
         batch_get(checked=True)
-        if coalesce or configured_first_chunk_divisor():
+        if check_schedule:
             preflight_profile = runtime.gather_batch_get_profile()
             runtime.stop_gather_batch_get_profile()
             if coalesce:
                 check_coalesced_profile(preflight_profile)
-            check_first_chunk_profile(preflight_profile)
+            check_progress_profile(preflight_profile)
         expected = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8)
         source_ids = indices_cpu.to(torch.int64) * TOKENS_PER_BLOCK + slots_cpu
         for start in range(0, REQUEST_COUNT, 128):

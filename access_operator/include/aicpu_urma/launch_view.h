@@ -77,5 +77,6 @@ struct ScatterLaunchView {
   UmdkContext mailbox_context{};
   void* mailbox_source{};
   std::uint64_t mailbox_remote{};
+  std::uint32_t payload_jettys{cpu_push::kJettyCount}, head_start{};
 };
 }  // namespace kvaf::aicpu_urma

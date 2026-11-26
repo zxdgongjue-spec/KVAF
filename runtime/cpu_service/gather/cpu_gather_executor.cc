@@ -26,8 +26,7 @@ bool IsPullGroupFormat(std::uint64_t magic) {
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header, bool extended) {
-  if (header.span_count == 0U || header.ready_bytes != 0U ||
-      header.span_count == 0U ||
+  if (header.span_count == 0U ||
       header.ready_bytes != 0U ||
       (header.pipeline_chunk_bytes != 0U &&
        (header.pipeline_chunk_bytes < 64U || header.pipeline_chunk_bytes % 64U != 0U)))
@@ -54,8 +53,6 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   const auto* descriptor = workspace_memory_ + (descriptor_address - workspace_base_);
   GatherDescriptorHeader header;
   std::memcpy(&header, descriptor, sizeof(header));
-  if (read_mode_ == GatherReadMode::kAicpu && header.magic != kGatherDescriptorMagic)
-    return 0U;
   const bool aiv = read_mode_ == GatherReadMode::kAiv;
   const bool head_start = aiv && (header.magic & kGatherHeadStartFlag) != 0;
   if (head_start) header.magic &= ~kGatherHeadStartFlag;
@@ -64,8 +61,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   cooperative_ = configured || bootstrap || (aiv && header.magic == kGatherCooperativeMagic);
   const bool sized = !aiv && header.magic == kGatherSizedChunksMagic;
   const bool head256 = !aiv && header.magic == kGatherHead256Magic;
-  chunked_addresses_ = !aiv && header.magic == kGatherChunkedPullMagic;
-  pull_groups_ = !aiv && IsPullGroupFormat(header.magic);
+  chunked_addresses_ = header.magic == kGatherChunkedPullMagic;
+  pull_groups_ = chunked_addresses_ || (!aiv && IsPullGroupFormat(header.magic));
   const bool extended = configured || sized || head256 || pull_groups_;
   if (header.sequence != sequence || header.span_count > max_spans ||
       (header.magic != kGatherDescriptorMagic && !cooperative_ && !extended) ||
@@ -153,7 +150,8 @@ bool CpuGatherExecutor::Copy() {
   CopyWorker(0U);
   if (!thread_profiles_.empty())
     copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
-  const bool publish_tasks = read_mode_ == GatherReadMode::kAiv && pipeline_ready_ && !cooperative_;
+  const bool publish_tasks = read_mode_ == GatherReadMode::kAiv && pipeline_ready_ &&
+      !cooperative_ && !pull_groups_;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
     if (publish_tasks) PublishTaskReady();
     GatherSpinPause();
@@ -169,7 +167,8 @@ bool CpuGatherExecutor::Copy() {
 }
 
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
-  const bool finish_barrier = pipeline_ready_ == nullptr || read_mode_ == GatherReadMode::kAicpu;
+  const bool finish_barrier = pipeline_ready_ == nullptr || read_mode_ == GatherReadMode::kAicpu ||
+      pull_groups_;
   if (thread_profiles_.empty()) {
     (void)ProcessSource(worker);
     if (finish_barrier) GatherBarrier();

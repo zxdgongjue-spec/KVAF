@@ -27,14 +27,15 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
   return true;
 }
 inline std::uint32_t ScatterWindowCapacity(std::uint32_t token_bytes, std::uint32_t workers,
-                                         std::uint64_t budget) {
+                                         std::uint64_t budget,
+                                         std::uint32_t jettys = kJettyCount) {
   if (!budget) {
     Layout layout;
-    return MakeLayout(token_bytes, workers, &layout) ? kDefaultGetWindow : 0U;
+    return MakeLayout(token_bytes, workers, &layout, kDefaultGetWindow, jettys) ? kDefaultGetWindow : 0U;
   }
   return LargestGetWindow([&](std::uint32_t capacity) {
     Layout layout;
-    return MakeLayout(token_bytes, workers, &layout, capacity) &&
+    return MakeLayout(token_bytes, workers, &layout, capacity, jettys) &&
         layout.bytes + layout.staging <= budget;
   });
 }

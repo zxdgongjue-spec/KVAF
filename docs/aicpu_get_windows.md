@@ -105,7 +105,7 @@ Gather 的 lane 工作区互相独立。每个 worker 遍历全局窗口，处�
 worker 间不新增窗口屏障；只在初始化和外层 Host 执行生命周期中共享资源所有权。
 
 Scatter 所有 worker 协同推进同一全局窗口：构建源地址列表、built 屏障、通知 CPU，
-随后沿用每 worker 1024 条、四 Jetty ready 的生产/消费流水线。
+随后沿用每 worker 1024 条、每 payload Jetty 独立 Ready 的生产和消费流水线。
 所有 worker 消费完成且 CPU done 已发布后才切换下一窗；空尾片段也参与屏障。
 同一次 launch 中复用 staging 的后续窗口，在 ready 确认后刷新对应源区间并执行屏障，
 避免复用地址残留上一窗口的缓存数据；ready/done 查询及描述符/notify 发布也处理同一次
@@ -124,7 +124,7 @@ Scatter 软件超时按窗口重新计时；CANN 单次 launch 的总时限仍�
 ## 部署和验证
 
 Gather 的 READ 波次参数使用入口 `KvafAicpuGatherReadExecutionV5`。
-Scatter 的 mailbox 请求使用入口 `KvafAicpuCpuPushScatterExecutionV5`。
+Scatter 的 mailbox 请求使用入口 `KvafAicpuCpuPushScatterExecutionV6`。
 自动策略沿用 V5 布局，以内部 0 表示自动模式；部署本次默认值变更也须重编并更新 AICPU 包。
 必须一起更新 CPU 服务、Host 库、Python binding 和 AICPU 包并重启进程，避免旧布局混用。
 新增的 Gather 窗口协商消息和 Scatter setup 的窗口字段在初始化阶段传递，不增加逐窗 Host RPC

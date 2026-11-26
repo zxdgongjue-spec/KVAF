@@ -25,7 +25,7 @@ export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.
 python -u tests/python/test_aiv_gather_batch_get.py
 ```
 
-启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV11 args_bytes=256`。
+启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV12 args_bytes=256`。
 功能脚本校验 payload/guard、空批及重复调用；probe 结果不能当完整回归 PASS。
 环境变量在 Runtime 初始化时捕获，换组须新建 Runtime。
 

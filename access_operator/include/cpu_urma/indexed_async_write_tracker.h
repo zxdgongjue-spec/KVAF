@@ -99,8 +99,8 @@ class BasicIndexedAsyncWriteTracker {
   std::array<Batch, kMaxBatches> batches_{};
 };
 
-// Keep the legacy AICPU queue layout/context encoding; only AIV Scatter uses
-// the extended pool. Both specializations share the same credit/CQE logic.
+// Preserve the smaller context encoding for callers that use legacy pools.
+// Push Scatter can share the 32-queue specialization on either device executor.
 using IndexedAsyncWriteTracker = BasicIndexedAsyncWriteTracker<4>;
 using AivIndexedAsyncWriteTracker = BasicIndexedAsyncWriteTracker<5>;
 

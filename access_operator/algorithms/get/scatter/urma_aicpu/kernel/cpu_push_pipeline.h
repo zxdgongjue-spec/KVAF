@@ -10,20 +10,21 @@
 #endif
 
 namespace kvaf::cpu_push {
-using ReadySnapshot = std::array<std::uint64_t, kJettyCount>;
+using ReadySnapshot = std::array<std::uint64_t, kMaxJettyCount>;
 
 // Advance each Jetty independently. Coalesce consecutive staging rows from
 // the same snapshot, including across chunk boundaries when all are ready.
 template <class IO>
 Result Consume(std::uint32_t count, std::uint32_t bytes, std::uint32_t workers,
                std::uint32_t worker, std::uint64_t sequence, std::uint64_t start,
-               std::uint64_t timeout, IO& io, std::uint32_t* consumed) {
+               std::uint64_t timeout, IO& io, std::uint32_t* consumed,
+               std::uint32_t jettys = kJettyCount) {
   const auto range = WorkerRange(count, bytes, worker, workers);
   const auto chunks = ChunkCount(range);
   if (!chunks) return Result::kOk;
-  std::array<std::uint32_t, kJettyCount> copied{}, required{};
-  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-    const auto last = JettyRange(ChunkRange(range, chunks - 1), q);
+  std::array<std::uint32_t, kMaxJettyCount> copied{}, required{};
+  for (std::uint32_t q = 0; q < jettys; ++q) {
+    const auto last = JettyRange(ChunkRange(range, chunks - 1), q, jettys);
     required[q] = chunks - (last.begin == last.end);
   }
   while (*consumed < chunks) {
@@ -32,7 +33,7 @@ Result Consume(std::uint32_t count, std::uint32_t bytes, std::uint32_t workers,
     auto ready = copied;
     auto first = chunks;
     std::uint32_t last = 0;
-    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+    for (std::uint32_t q = 0; q < jettys; ++q) {
       const auto seq = snapshot[q] >> 32;
       const auto progress = static_cast<std::uint32_t>(snapshot[q]);
       if (seq > sequence || (seq == sequence &&
@@ -49,9 +50,9 @@ Result Consume(std::uint32_t count, std::uint32_t bytes, std::uint32_t workers,
     Range span{};
     for (auto chunk = first; chunk < last; ++chunk) {
       const auto part = ChunkRange(range, chunk);
-      for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+      for (std::uint32_t q = 0; q < jettys; ++q) {
         if (chunk < copied[q] || chunk >= ready[q]) continue;
-        const auto shard = JettyRange(part, q);
+        const auto shard = JettyRange(part, q, jettys);
         if (span.end != shard.begin) {
           if (span.begin != span.end && !io.Copy(span)) return Result::kCopyError;
           span.begin = shard.begin;
@@ -62,7 +63,7 @@ Result Consume(std::uint32_t count, std::uint32_t bytes, std::uint32_t workers,
     if (!io.Copy(span)) return Result::kCopyError;
     copied = ready;
     *consumed = chunks;
-    for (std::uint32_t q = 0; q < kJettyCount; ++q)
+    for (std::uint32_t q = 0; q < jettys; ++q)
       if (copied[q] < required[q]) *consumed = std::min(*consumed, copied[q]);
   }
   io.FinishRange();

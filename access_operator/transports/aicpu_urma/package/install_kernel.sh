@@ -31,7 +31,7 @@ check_artifacts() {
   grep -Fq '"KvafAicpuGatherReadExecutionV5"' "$dir/kernel.json" || die "GatherRead V5 missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
   if [[ "$require_scatter" == true ]]; then
-    grep -Fq '"KvafAicpuCpuPushScatterExecutionV5"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
+    grep -Fq '"KvafAicpuCpuPushScatterExecutionV6"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
   fi
 }
 
@@ -44,7 +44,7 @@ check_installed() {
   grep -Fq '"KvafAicpuGatherReadExecutionV5"' "$config_dir/$json" || die "installed JSON lacks GatherRead V5"
   grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
   if [[ "$require_scatter" == true ]]; then
-    grep -Fq '"KvafAicpuCpuPushScatterExecutionV5"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
+    grep -Fq '"KvafAicpuCpuPushScatterExecutionV6"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
   fi
   count="$(grep -Fxc "$header" "$load_config" || true)"
   [[ "$count" == 1 ]] || die "expected one $header entry in $load_config, found $count"

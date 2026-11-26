@@ -121,5 +121,6 @@ struct KernelArgs {
   std::uint64_t window_base{};
   aicpu_urma::UmdkContext mailbox_context{};
   std::uint64_t mailbox_source{}, mailbox_remote{};
+  std::uint32_t payload_jettys{kJettyCount}, head_start{};
 };
 }  // namespace kvaf::cpu_push
