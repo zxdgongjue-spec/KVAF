@@ -264,6 +264,12 @@ NPU raw Pull 默认使用本次构建目录下的 `.o`，可通过 `NpuPullOptio
 其他后端不使用这两个 `--gather-*` 参数。服务启动后打印 `LISTEN`。
 按实际路由可增加 `--ub-device NAME --eid-index N`。
 CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
+
+URMA DDR 默认使用透明大页（THP）。如果要使用显式 HugeTLB，先在 CPU 服务所在的 Linux
+宿主机为目标 NUMA 节点预留大页，再在上述启动命令末尾加上与页池匹配的
+`--memory-page-mode`，例如 `--memory-page-mode hugetlb-1g`。页数计算、预留命令和
+完整启动示例见 [URMA DDR 大页配置](runtime/README.md#urma-ddr-大页配置)。
+
 远端 A+K 的 AIV Direct 和 AICPU Gather BatchGet 共用 FE 选择，默认使用两个 CPU FE。NPU 端可用
 `KVAF_DEFAULT_PEER_FE_COUNT=1` 改为单 FE，或用 `--peer-ub-device devA,devB,devC` 指定设备顺序。
 初始化与首次使用的边界见 [Runtime](runtime/README.md)；两端需使用匹配产物。
