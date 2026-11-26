@@ -289,6 +289,10 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 追加 `--multi-graph-check` 可在计时前验证多节点报告隔离，以及自动预热/捕获、
 不同 stream 上由调用方串行执行的多图、图与普通 Get 共用输出。
 
+同卡同时运行 AIV Direct READ 与 CPU SGL WRITE/AICPU Scatter，比较单独和并发带宽：
+使用 `tests/run_remote_cpu_batch_get_aiv_scatter_perf.sh`，详见
+[AIV/Scatter 并发测试](docs/batch_get_aiv_scatter_contention.md)。
+
 Put 使用 `tests/run_remote_cpu_batch_put_perf.sh`，支持 URMA AIV、UBMEM AIV、URMA AICPU。
 三种 Put 的命令、输入复用及验证范围见[性能验证步骤](docs/cache_transport_execution_validation.md)。
 

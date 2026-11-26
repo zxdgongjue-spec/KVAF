@@ -121,6 +121,8 @@ Get 性能使用本文入口，数据预检和输出校验保留在计时之外�
 
 ## Python 入口与公共模块
 
+同卡两路异构 Get 的吞吐干扰测试见 [AIV direct / AICPU scatter 并发带宽](batch_get_aiv_scatter_contention.md)。
+
 `tests/python/` 只保留性能入口和 trace 汇总工具：
 
 - `test_npu_batch_get_perf.py`：四种 Get 的统一性能测试。
