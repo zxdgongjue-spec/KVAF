@@ -550,8 +550,7 @@ class RoceSession {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     if (!Usable()) return Status::InvalidState("RoCE session is unavailable");
 
-    const std::size_t window = read ? std::min(connection_->depth(), connection_->read_depth())
-                                    : connection_->depth();
+    const std::size_t window = read ? read_window() : connection_->depth();
     std::vector<ibv_send_wr> requests(window);
     std::vector<ibv_sge> entries(window);
     std::vector<bool> seen(window);
@@ -612,6 +611,10 @@ class RoceSession {
       begin += count;
     }
     return Status::OK();
+  }
+
+  std::size_t read_window() const {
+    return std::min(connection_->depth(), connection_->read_depth());
   }
 
  private:
@@ -707,6 +710,9 @@ class RoceOperator final : public AccessOperator {
 
   Status Shutdown() override {
     for (const auto& job : pending_) WaitForGet(*job);
+    pending_range_ = nullptr;
+    range_stream_ = nullptr;
+    range_status_ = Status::OK();
     pending_.clear();
     staging_bytes_ = 0;
     StopWorker();
@@ -743,6 +749,8 @@ class RoceOperator final : public AccessOperator {
   }
 
   Status ExecuteBatchPut(const BatchPutExecRequest& exec) override try {
+    auto status = FinishPendingRange();
+    if (!status.ok()) return status;
     ReapCompleted();
     const auto& request = *exec.request;
     const auto base = reinterpret_cast<std::uintptr_t>(request.input.data);
@@ -764,7 +772,7 @@ class RoceOperator final : public AccessOperator {
       transfers.push_back({base + request.input_offsets[i], target,
                            static_cast<std::uint32_t>(bytes)});
     }
-    auto status = CheckStream(exec.execution.stream, session_->device_id());
+    status = CheckStream(exec.execution.stream, session_->device_id());
     if (!status.ok()) return status;
     status = Synchronize(static_cast<aclrtStream>(exec.execution.stream));
     if (!status.ok()) return status;
@@ -787,12 +795,92 @@ class RoceOperator final : public AccessOperator {
     return Status::OutOfMemory("cannot stage RoCE BatchPut");
   }
 
-  Status ExecuteBatchGet(const BatchGetExecRequest& exec) override {
+  Status ExecuteBatchGet(const BatchGetExecRequest& exec) override try {
     const auto& request = *exec.request;
-    if (request.output.device != DeviceKind::kNpu) {
+    const auto token = request.output_block_bytes;
+    if (token == 0 || token > std::numeric_limits<std::uint32_t>::max()) {
+      return Status::InvalidArgument("RoCE Get WR size exceeded");
+    }
+    auto job = std::make_unique<GetJob>();
+    job->handle = request.access_table;
+    job->capacity = request.indices.bytes / sizeof(std::int32_t);
+    job->table_size = request.device_access_table.valid.bytes;
+    job->rows = request.output.bytes / token;
+    job->token = static_cast<std::uint32_t>(token);
+    job->block_bytes = token * request.tokens_per_block;
+    const auto& table = request.device_access_table;
+    return EnqueueGet(std::move(job), request.output, exec.execution,
+                      {table.addresses, request.miss_count, request.indices, request.offsets,
+                       request.output_indices, table.valid});
+  } catch (const std::bad_alloc&) {
+    return Status::OutOfMemory("cannot stage RoCE BatchGet");
+  }
+
+  Status ExecuteBatchGetRanges(const BatchGetRangesExecRequest& exec) override try {
+    const auto& request = *exec.request;
+    auto job = std::make_unique<GetJob>();
+    job->handle = request.access_table;
+    job->ranges = true;
+    job->capacity = request.indices.bytes / sizeof(std::int32_t);
+    job->table_size = exec.host_access_table.size;
+    job->chunk_bytes = request.read_chunk_bytes;
+    const auto& table = request.device_access_table;
+    return EnqueueGet(std::move(job), request.output, exec.execution,
+                      {table.addresses, request.request_count, request.indices, request.source_offsets,
+                       request.output_offsets, table.valid, request.lengths, table.lengths});
+  } catch (const std::bad_alloc&) {
+    return Status::OutOfMemory("cannot stage RoCE range Get");
+  }
+
+  Status CheckBatchGetRangesStatus(void* stream) override {
+    if (!range_stream_) return Status::InvalidState("no RoCE range Get has been submitted");
+    if (stream != range_stream_)
+      return Status::InvalidArgument("range Get status requires its execution stream");
+    (void)FinishPendingRange();
+    return range_status_;
+  }
+
+ private:
+  struct GetJob {
+    ~GetJob() {
+      if (staging != nullptr && aclrtFreeHost(staging) != ACL_SUCCESS)
+        UnsafeTeardown("cannot release RoCE Get staging");
+    }
+
+    RoceOperator* owner{};
+    aclrtStream stream{};
+    AccessTableHandle handle;
+    bool synchronous{};
+    bool ranges{};
+    std::size_t capacity{};
+    std::size_t table_size{};
+    std::uintptr_t output{};
+    std::size_t output_bytes{};
+    std::size_t rows{};
+    std::uint32_t token{};
+    std::uint32_t chunk_bytes{};
+    std::uint64_t block_bytes{};
+    std::size_t staging_bytes{};
+    void* staging{};
+    std::array<void*, 8> data{};
+    std::shared_ptr<void> hbm_owner;
+    std::shared_ptr<void> hbm_region_lease;
+    std::shared_ptr<HbmRegistration> registration;
+    Status result;
+    GetJob* next{nullptr};
+    bool worker_done{false};
+    std::atomic<bool> done{false};
+  };
+
+  Status EnqueueGet(std::unique_ptr<GetJob> job, MutableBufferView output,
+                    const BatchGetExecutionOptions& execution,
+                    const std::array<ConstBufferView, 8>& inputs) {
+    if (output.device != DeviceKind::kNpu) {
       return Status::InvalidArgument("RoCE Get requires NPU tensors");
     }
-    auto status = CheckStream(exec.execution.stream, session_->device_id());
+    auto status = CheckStream(execution.stream, session_->device_id());
+    if (!status.ok()) return status;
+    status = FinishPendingRange();
     if (!status.ok()) return status;
     ReapCompleted();
     if (pending_.size() == kMaxPendingGets) {
@@ -800,18 +888,13 @@ class RoceOperator final : public AccessOperator {
       ReapCompleted();
     }
 
-    const auto& table = request.device_access_table;
-    const std::array<ConstBufferView, 6> inputs{
-        table.addresses, request.miss_count, request.indices, request.offsets,
-        request.output_indices, table.valid};
     struct MetadataCopy {
       const void* source{};
       std::size_t bytes{};
       std::size_t prefix{};
       std::size_t stride{};
     };
-    std::array<MetadataCopy, 6> copies{};
-    const auto capacity = request.indices.bytes / sizeof(std::int32_t);
+    std::array<MetadataCopy, 8> copies{};
     std::size_t staging_bytes = kAclCopyAlignment - 1;
     for (std::size_t i = 0; i < inputs.size(); ++i) {
       const auto& input = inputs[i];
@@ -836,45 +919,36 @@ class RoceOperator final : public AccessOperator {
       copies[i] = {reinterpret_cast<const void*>(address - prefix), bytes, prefix, stride};
       staging_bytes += stride;
     }
-    const auto output = reinterpret_cast<std::uintptr_t>(request.output.data);
-    const auto token = request.output_block_bytes;
-    if (capacity > kMaxGetRequests || token > std::numeric_limits<std::uint32_t>::max() ||
-        request.output.bytes > std::numeric_limits<std::uint64_t>::max() - output) {
-      return Status::InvalidArgument("RoCE Get capacity, output range or WR size exceeded");
+    job->output = reinterpret_cast<std::uintptr_t>(output.data);
+    if (job->capacity > kMaxGetRequests ||
+        output.bytes > std::numeric_limits<std::uint64_t>::max() - job->output) {
+      return Status::InvalidArgument("RoCE Get capacity or output range exceeded");
     }
 
-    auto job = std::make_unique<GetJob>();
     job->owner = this;
-    job->stream = static_cast<aclrtStream>(exec.execution.stream);
-    job->handle = request.access_table;
-    job->synchronous = exec.execution.synchronize;
-    job->capacity = capacity;
-    job->table_size = table.valid.bytes;
-    job->output = output;
-    job->rows = request.output.bytes / token;
-    job->token = static_cast<std::uint32_t>(token);
-    job->block_bytes = token * request.tokens_per_block;
+    job->stream = static_cast<aclrtStream>(execution.stream);
+    job->synchronous = execution.synchronize;
+    job->output_bytes = output.bytes;
     job->staging_bytes = staging_bytes;
     // Keep the owner through completion even when cache pressure requires a
     // temporary MR. Reaping on the caller thread also keeps Python destruction
     // off the worker while the submitting thread may be waiting with the GIL.
-    job->hbm_owner = exec.execution.hbm_owner;
-    if (exec.execution.hbm_region) {
-      if (!session_->Owns(exec.execution.hbm_region)) {
+    job->hbm_owner = execution.hbm_owner;
+    if (execution.hbm_region) {
+      if (!session_->Owns(execution.hbm_region)) {
         return Status::InvalidArgument("BatchGet HBM region belongs to a different RoCE session or NPU");
       }
-      status = exec.execution.hbm_region->Pin(request.output.data, request.output.bytes,
-                                               &job->hbm_region_lease);
+      status = execution.hbm_region->Pin(output.data, output.bytes, &job->hbm_region_lease);
       if (status.ok()) {
-        auto region = std::dynamic_pointer_cast<RoceHbmRegion>(exec.execution.hbm_region);
+        auto region = std::dynamic_pointer_cast<RoceHbmRegion>(execution.hbm_region);
         if (!region) return Status::InvalidArgument("BatchGet HBM region has an unsupported implementation");
         job->registration = region->registration();
         if (!job->registration) return Status::InvalidState("BatchGet HBM region is closed");
       }
     } else {
-      status = session_->Register(request.output.data, request.output.bytes, true,
+      status = session_->Register(output.data, output.bytes, true,
                                   job->hbm_owner, &job->registration, mr_timing_,
-                                  exec.execution.hbm_storage);
+                                  execution.hbm_storage);
     }
     if (!status.ok()) return status;
     if (aclrtMallocHost(&job->staging, staging_bytes) != ACL_SUCCESS)
@@ -888,7 +962,7 @@ class RoceOperator final : public AccessOperator {
     auto* to = reinterpret_cast<std::uint8_t*>(
         (staging + kAclCopyAlignment - 1) / kAclCopyAlignment * kAclCopyAlignment);
     for (std::size_t i = 0; i < copies.size(); ++i) {
-      if (i == 1) std::memset(to, 0xff, copies[i].stride);  // Invalid miss_count until copied.
+      if (i == 1) std::memset(to, 0xff, copies[i].stride);  // Invalid count until copied.
       const auto& copy = copies[i];
       queued.data[i] = to + copy.prefix;
       if (copy.bytes != 0 &&
@@ -901,6 +975,11 @@ class RoceOperator final : public AccessOperator {
     if (aclrtLaunchHostFunc(queued.stream, RunGetOnStream, &queued) != ACL_SUCCESS) {
       return CancelEnqueue(queued, "cannot enqueue RoCE Get host task");
     }
+    if (queued.ranges) {
+      pending_range_ = &queued;
+      range_stream_ = queued.stream;
+      return queued.synchronous ? FinishPendingRange() : Status::OK();
+    }
     if (!queued.synchronous) return Status::OK();
 
     status = Synchronize(queued.stream);
@@ -911,35 +990,6 @@ class RoceOperator final : public AccessOperator {
     ReapCompleted();
     return status;
   }
-
- private:
-  struct GetJob {
-    ~GetJob() {
-      if (staging != nullptr && aclrtFreeHost(staging) != ACL_SUCCESS)
-        UnsafeTeardown("cannot release RoCE Get staging");
-    }
-
-    RoceOperator* owner{};
-    aclrtStream stream{};
-    AccessTableHandle handle;
-    bool synchronous{};
-    std::size_t capacity{};
-    std::size_t table_size{};
-    std::uintptr_t output{};
-    std::size_t rows{};
-    std::uint32_t token{};
-    std::uint64_t block_bytes{};
-    std::size_t staging_bytes{};
-    void* staging{};
-    std::array<void*, 6> data{};
-    std::shared_ptr<void> hbm_owner;
-    std::shared_ptr<void> hbm_region_lease;
-    std::shared_ptr<HbmRegistration> registration;
-    Status result;
-    GetJob* next{nullptr};
-    bool worker_done{false};
-    std::atomic<bool> done{false};
-  };
 
   static void RunGetOnStream(void* data) {
     auto& job = *static_cast<GetJob*>(data);
@@ -952,7 +1002,7 @@ class RoceOperator final : public AccessOperator {
       op.worker_changed_.notify_all();
       op.worker_changed_.wait(lock, [&job] { return job.worker_done; });
     }
-    if (!job.result.ok() && !job.synchronous) {
+    if (!job.result.ok() && !job.synchronous && !job.ranges) {
       std::fprintf(stderr, "[KVAF_ROCE] asynchronous BatchGet failed: %s\n",
                    job.result.message().c_str());
       // This callback has no error return to the stream. Letting it return
@@ -972,7 +1022,7 @@ class RoceOperator final : public AccessOperator {
       if (work_head_ == nullptr) work_tail_ = &work_head_;
       lock.unlock();
       try {
-        job.result = ExecuteGet(job);
+        job.result = job.ranges ? ExecuteRangeGet(job) : ExecuteGet(job);
         // A borrowed output may be freed as soon as the caller stream completes.
         // Release temporary MR/HAL references before the host task unblocks it.
         job.registration.reset();
@@ -1033,6 +1083,83 @@ class RoceOperator final : public AccessOperator {
     return session_->ExecuteRegistered(*job.registration, transfers, true);
   }
 
+  Status ExecuteRangeGet(const GetJob& job) {
+    const auto count = ReadMetadata<std::int32_t>(job.data[1], 0);
+    if (count < 0 || static_cast<std::size_t>(count) > job.capacity)
+      return Status::InvalidArgument("RoCE range Get request_count exceeds capacity");
+    if (count == 0) return Status::OK();
+
+    struct Range {
+      std::uint64_t local;
+      std::uint64_t remote;
+      std::uint64_t bytes;
+    };
+    const auto& region = session_->region();
+    const auto* valid = static_cast<const std::uint8_t*>(job.data[5]);
+    const auto window = session_->read_window();
+    std::vector<Range> ranges;
+    std::vector<Transfer> transfers;
+    try {
+      ranges.reserve(count);
+      transfers.reserve(window);
+    } catch (const std::bad_alloc&) {
+      return Status::OutOfMemory("cannot prepare RoCE range READs");
+    }
+    // Validate the active prefix before issuing any DMA. Padding rows in the
+    // device table are outside the live Host table.
+    for (std::int32_t i = 0; i < count; ++i) {
+      const auto index = ReadMetadata<std::int32_t>(job.data[2], i);
+      const auto source = ReadMetadata<std::int64_t>(job.data[3], i);
+      const auto destination = ReadMetadata<std::int64_t>(job.data[4], i);
+      const auto bytes = ReadMetadata<std::int64_t>(job.data[6], i);
+      if (index < 0 || static_cast<std::size_t>(index) >= job.table_size || !valid[index] ||
+          source < 0 || destination < 0 || bytes <= 0 ||
+          (!job.chunk_bytes && static_cast<std::uint64_t>(bytes) > UINT32_MAX)) {
+        return Status::InvalidArgument("invalid RoCE range Get descriptor at index " +
+                                       std::to_string(i));
+      }
+      const auto address = ReadMetadata<Address>(job.data[0], index);
+      const auto package_bytes = ReadMetadata<std::uint64_t>(job.data[7], index);
+      if (!Contains(region.base, region.bytes, address, package_bytes) ||
+          !Contains(0, package_bytes, source, bytes) ||
+          !Contains(0, job.output_bytes, destination, bytes)) {
+        return Status::InvalidArgument("RoCE range Get source/output out of bounds at index " +
+                                       std::to_string(i));
+      }
+      ranges.push_back({job.output + static_cast<std::uint64_t>(destination),
+                        address + static_cast<std::uint64_t>(source),
+                        static_cast<std::uint64_t>(bytes)});
+    }
+
+    const std::uint64_t limit = job.chunk_bytes ? job.chunk_bytes : UINT32_MAX;
+    for (const auto& range : ranges) {
+      for (std::uint64_t offset = 0; offset < range.bytes;) {
+        const auto bytes = std::min(range.bytes - offset, limit);
+        transfers.push_back({range.local + offset, range.remote + offset,
+                             static_cast<std::uint32_t>(bytes)});
+        offset += bytes;
+        if (transfers.size() == window) {
+          auto status = session_->ExecuteRegistered(*job.registration, transfers, true);
+          if (!status.ok()) return status;
+          transfers.clear();
+        }
+      }
+    }
+    return session_->ExecuteRegistered(*job.registration, transfers, true);
+  }
+
+  Status FinishPendingRange() {
+    if (!pending_range_) return Status::OK();
+    auto& job = *pending_range_;
+    range_status_ = Synchronize(job.stream);
+    if (!job.done.load(std::memory_order_acquire))
+      UnsafeTeardown("cannot drain RoCE range Get host task");
+    if (range_status_.ok()) range_status_ = std::move(job.result);
+    pending_range_ = nullptr;
+    ReapCompleted();
+    return range_status_;
+  }
+
   static void WaitForGet(const GetJob& job) {
     if (job.done.load(std::memory_order_acquire)) return;
     (void)Synchronize(job.stream);
@@ -1042,7 +1169,7 @@ class RoceOperator final : public AccessOperator {
 
   void ReapCompleted() {
     pending_.remove_if([this](const auto& job) {
-      if (!job->done.load(std::memory_order_acquire)) return false;
+      if (job.get() == pending_range_ || !job->done.load(std::memory_order_acquire)) return false;
       staging_bytes_ -= job->staging_bytes;
       return true;
     });
@@ -1058,6 +1185,9 @@ class RoceOperator final : public AccessOperator {
   std::shared_ptr<RoceSession> session_;
   const bool mr_timing_{MrTimingEnabled()};
   std::list<std::unique_ptr<GetJob>> pending_;
+  GetJob* pending_range_{nullptr};
+  aclrtStream range_stream_{};
+  Status range_status_;
   std::size_t staging_bytes_{};
   std::mutex worker_mutex_;
   std::condition_variable worker_changed_;

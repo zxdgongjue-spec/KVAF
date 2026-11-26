@@ -312,7 +312,8 @@ class NpuPythonRuntime final {
                    std::string allocation_mode, std::string rdma_device,
                    int rdma_port, int gid_index,
                    bool roce_cache_hbm)
-      : roce_cache_hbm_(transport == "roce" && roce_cache_hbm),
+      : roce_backend_(transport == "roce"),
+        roce_cache_hbm_(roce_backend_ && roce_cache_hbm),
         runtime_identity_(next_python_runtime_identity.fetch_add(1, std::memory_order_relaxed)) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
@@ -611,7 +612,8 @@ class NpuPythonRuntime final {
                       const py::object& source_offsets, const py::object& lengths,
                       const py::object& request_count, const py::object& output_offsets,
                       const py::object& output, const py::object& stream,
-                      bool synchronize, bool profile, std::int64_t read_chunk_bytes) {
+                      bool synchronize, bool profile, std::int64_t read_chunk_bytes,
+                      const py::object& hbm_region) {
     if (profile) throw py::value_error("range Get does not support stage profiling");
     if (read_chunk_bytes < 0 || static_cast<std::uint64_t>(read_chunk_bytes) > UINT32_MAX)
       throw py::value_error("read_chunk_bytes must be in [0, UINT32_MAX]; 0 disables software splitting");
@@ -638,8 +640,14 @@ class NpuPythonRuntime final {
     const BatchGetRangesRequest request{table.source(), buffer(i), buffer(s), buffer(l),
         buffer(c), buffer(d), {o.data, o.bytes, DeviceKind::kNpu},
         {buffer(a), buffer(v), buffer(z)}, static_cast<std::uint32_t>(read_chunk_bytes)};
-    ThrowIfError(native_->core().BatchGetRanges(
-        request, {ResolveStream(stream), synchronize, nullptr}));
+    BatchGetExecutionOptions execution{ResolveStream(stream), synchronize, nullptr};
+    if (!hbm_region.is_none()) {
+      if (!roce_backend_) throw py::value_error("range Get hbm_region requires RoCE");
+      execution.hbm_region = ResolveHbmRegion(hbm_region);
+    } else {
+      execution.hbm_owner = AcquireHbmOwner(output, o, &execution.hbm_storage);
+    }
+    ThrowIfError(native_->core().BatchGetRanges(request, execution));
   }
 
   void CheckBatchGetRangesStatus(const py::object& stream) {
@@ -783,6 +791,7 @@ class NpuPythonRuntime final {
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   bool aicpu_backend_{false};
+  const bool roce_backend_;
   const bool roce_cache_hbm_;
   const std::uint64_t runtime_identity_;
   std::unordered_map<std::uintptr_t, std::weak_ptr<void>> hbm_owners_;
@@ -815,8 +824,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       py::arg("lengths"), py::arg("request_count"), py::arg("output_offsets"),
       py::arg("output"), py::arg("stream") = py::none(),
       py::arg("synchronize") = false, py::arg("profile") = false,
-      py::kw_only(), py::arg("read_chunk_bytes") = 0,
-      "Read variable byte ranges on AIV URMA or AICPU GatherRead in eager mode. "
+      py::kw_only(), py::arg("read_chunk_bytes") = 0, py::arg("hbm_region") = py::none(),
+      "Read variable byte ranges on AIV URMA, AICPU GatherRead, or Host CPU RoCE in eager mode. "
       "Caller owns Tensor lifetimes and disjoint output ranges.")
       .def("check_batch_get_ranges_status", &NpuPythonRuntime::CheckBatchGetRangesStatus,
            py::arg("stream") = py::none(), "Wait and check the latest range Get on its execution stream.");
