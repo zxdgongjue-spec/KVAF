@@ -72,8 +72,8 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 预算按 provider 配置。`cores=0` 时，URMA AIV Put 用 2 核、Get 在本机用 2 核、远端 A+K 用 4 核，UBMEM AIV
 Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 6 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
 Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Direct Get 接受 `max_inflight_total`，默认 2048，显式 0 按 SQ/CQ 容量自动分组，非零须至少为
-`2 * cores`。`request_capacity` 默认 65536。支持分窗的 Get 将其作为预热提示；AIV Gather/Scatter 为固定窗口，
-最多 65536 条请求，并受配置容量约束。Put 仍受配置容量及 65536 上限约束。
+`2 * cores`。`request_capacity` 默认 65536。支持分窗的 Get 将其作为预热提示。AIV Gather/Scatter
+复用按 65536 条布局分配的工作区，在一次调用内处理完整有效前缀。Put 仍受配置容量及 65536 上限约束。
 图/输出绑定仍须预先准备足够的请求容量。Gather 可额外指定 `cpu_threads`。
 Gather 可设置 `gather_ddr_bytes`，Scatter 可设置 `scatter_hbm_bytes`；均为字节预算，包含
 对应工作区的元数据和控制区，自动选择预算内最大的 4096 倍数窗口。默认 0 保留现有

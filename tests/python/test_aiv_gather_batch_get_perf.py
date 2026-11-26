@@ -9,7 +9,7 @@ from __future__ import annotations
 
 # ---- Edit benchmark settings here. ------------------------------------------
 TOKEN_BYTES = 656
-REQUEST_COUNT = 8192             # Try 1024, 8192, 8193, 65536; all requests are active.
+REQUEST_COUNT = 8192            # All requests are active.
 WARMUP = 20                     # Excluded from performance results.
 ITERATIONS = 100                # Profile OFF samples; 0 skips E2E for profile debugging.
 PROFILE_SAMPLES = 10            # Profile ON: diagnostic stage samples, separately.
@@ -122,7 +122,8 @@ def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
     return durations
 
 
-def validate_config(cores: int) -> None:
+def validate_config(cores: int, request_count: int = REQUEST_COUNT, warmup: int = WARMUP,
+                    iterations: int = ITERATIONS, profile_samples: int = PROFILE_SAMPLES) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
     cooperative = configured_cooperative_chunks()
     prepare = configured_prepare_ahead()
@@ -136,7 +137,7 @@ def validate_config(cores: int) -> None:
     if (os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") not in ("0", "1"):
         raise ValueError("KVAF_GATHER_TRUSTED_INPUTS must be 0 or 1")
     positive = {
-        "TOKEN_BYTES": TOKEN_BYTES, "REQUEST_COUNT": REQUEST_COUNT,
+        "TOKEN_BYTES": TOKEN_BYTES, "REQUEST_COUNT": request_count,
         "TABLE_CAPACITY": TABLE_CAPACITY,
         "TOKENS_PER_BLOCK": TOKENS_PER_BLOCK,
         "POPULATE_CHUNK_ENTRIES": POPULATE_CHUNK_ENTRIES,
@@ -144,14 +145,14 @@ def validate_config(cores: int) -> None:
     for name, value in positive.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
-    for name, value in {"WARMUP": WARMUP, "ITERATIONS": ITERATIONS,
-                        "PROFILE_SAMPLES": PROFILE_SAMPLES}.items():
+    for name, value in {"WARMUP": warmup, "ITERATIONS": iterations,
+                        "PROFILE_SAMPLES": profile_samples}.items():
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
-    if ITERATIONS == 0 and PROFILE_SAMPLES == 0:
+    if iterations == 0 and profile_samples == 0:
         raise ValueError("ITERATIONS and PROFILE_SAMPLES cannot both be zero")
-    if TOKEN_BYTES > 65535 or REQUEST_COUNT > 65536:
-        raise ValueError("TOKEN_BYTES must be <= 65535 and REQUEST_COUNT <= 65536")
+    if TOKEN_BYTES > 65535 or request_count > 0x7ffffffd:
+        raise ValueError("TOKEN_BYTES must be <= 65535 and request-count must leave two guard rows")
     if TABLE_CAPACITY > (1 << 31) - 1:
         raise ValueError("TABLE_CAPACITY exceeds the DSA int32 directory range")
     if (TOKENS_PER_BLOCK - 1) * TOKEN_BYTES > (1 << 31) - 1:
@@ -289,8 +290,8 @@ def summarize_profiles(
     )
 
 
-def print_profiles(samples: list[dict[str, object]], cores: int) -> None:
-    host, lanes = summarize_profiles(samples, cores, REQUEST_COUNT)
+def print_profiles(samples: list[dict[str, object]], cores: int, request_count: int) -> None:
+    host, lanes = summarize_profiles(samples, cores, request_count)
     print(
         f"GATHER_PROFILE_CONFIG profile=on cpu_profile=external samples={len(samples)} "
         f"first_sequence={samples[0]['sequence']} last_sequence={samples[-1]['sequence']} "
@@ -322,7 +323,8 @@ def latency_summary(samples_us: Sequence[float], payload_bytes: int) -> dict[str
 
 
 def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
-                 graph: bool, profile_samples: int) -> dict[str, object]:
+                 graph: bool, profile_samples: int, request_count: int = REQUEST_COUNT,
+                 warmup: int = WARMUP, iterations: int = ITERATIONS) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     local = now.astimezone(timezone(timedelta(hours=8)))
     revision, dirty = "", "unknown"
@@ -341,11 +343,11 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
         "run_directory": (local.strftime("%Y%m%d_%H%M%S") +
-                          f"-cores{cores}-token-bytes{TOKEN_BYTES}-request-count{REQUEST_COUNT}"),
+                          f"-cores{cores}-token-bytes{TOKEN_BYTES}-request-count{request_count}"),
         "git_revision": revision, "git_dirty": dirty,
         "mode": "gather_read", "device_id": device_id, "cores": cores,
-        "token_bytes": TOKEN_BYTES, "request_count": REQUEST_COUNT,
-        "payload_bytes": REQUEST_COUNT * TOKEN_BYTES, "table_capacity": TABLE_CAPACITY,
+        "token_bytes": TOKEN_BYTES, "request_count": request_count,
+        "payload_bytes": request_count * TOKEN_BYTES, "table_capacity": TABLE_CAPACITY,
         "tokens_per_block": TOKENS_PER_BLOCK, "sgl": GATHER_SGL_SIZE, "seed": SEED,
         "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "coalesce_sges": int(os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES", "0") or "0"),
@@ -354,7 +356,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
         "configured_cooperative_chunks": configured_cooperative_chunks(),
         "configured_first_chunk_divisor": configured_first_chunk_divisor(),
         "trusted_gather_inputs": int(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1"),
-        "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": profile_samples,
+        "warmup": warmup, "iterations": iterations, "profile_samples": profile_samples,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
         "cpu_profile": "external", "kernel_path": kernel, "put_kernel_path": put_kernel,
@@ -488,10 +490,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acl-graph", action="store_true",
                         help="capture one Gather READ and time device completion after each replay")
+    parser.add_argument("--request-count", type=int, default=REQUEST_COUNT)
+    parser.add_argument("--warmup", type=int, default=WARMUP)
+    parser.add_argument("--iterations", type=int, default=ITERATIONS)
     args = parser.parse_args(argv)
-    if args.acl_graph and not ITERATIONS:
-        parser.error("--acl-graph requires ITERATIONS > 0")
-    profile_samples = 0 if args.acl_graph else PROFILE_SAMPLES
+    # Stage profiles cover the final lane window only. Keep aggregate
+    # bandwidth based on complete calls in the large-request benchmark.
+    single_window = args.request_count <= 65536
+    profile_samples = PROFILE_SAMPLES if single_window and not args.acl_graph else 0
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
@@ -505,7 +511,7 @@ def main(argv=None) -> int:
         return 2
     try:
         cores = int(os.environ.get("KVAF_NPU_CORE_COUNT", "1"))
-        validate_config(cores)
+        validate_config(cores, args.request_count, args.warmup, args.iterations, profile_samples)
         kernel, put_kernel = kernel_paths("gather_read")
         endpoint = os.environ.get("KVAF_CPU_SERVICE_ADDR")
         if not endpoint:
@@ -522,7 +528,7 @@ def main(argv=None) -> int:
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware benchmark was requested but NPU Runtime is unavailable")
     coalesce = os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1"
-    check_schedule = coalesce or configured_first_chunk_divisor()
+    check_schedule = single_window and (coalesce or configured_first_chunk_divisor())
     if (profile_samples or check_schedule) and not all(
         hasattr(kvaf.NpuRuntime, method) for method in (
         "start_gather_batch_get_profile", "gather_batch_get_profile", "stop_gather_batch_get_profile",
@@ -533,7 +539,7 @@ def main(argv=None) -> int:
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     block_bytes = TOKEN_BYTES * TOKENS_PER_BLOCK
-    payload_bytes = REQUEST_COUNT * TOKEN_BYTES
+    payload_bytes = args.request_count * TOKEN_BYTES
     put = kvaf.PutExecutionConfig("urma", "aiv")
     get = kvaf.GetExecutionConfig("urma", "aiv", "gather")
     runtime = kvaf.NpuRuntime(
@@ -544,7 +550,8 @@ def main(argv=None) -> int:
             cores=cores, kernel_path=kernel, gather_sgl_size=GATHER_SGL_SIZE,
             trusted_get_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1"))],
     )
-    metadata = csv_metadata(cores, device_id, kernel, put_kernel, args.acl_graph, profile_samples)
+    metadata = csv_metadata(cores, device_id, kernel, put_kernel, args.acl_graph, profile_samples,
+                            args.request_count, args.warmup, args.iterations)
     layout = metadata["output_layout"]
     samples_us, snapshots, profile_calls_us = [], [], []
     graph = stream = None
@@ -554,13 +561,13 @@ def main(argv=None) -> int:
         print(
             f"GATHER_PERF_CONFIG mode=gather_read execution={metadata['execution']} "
             f"cores={cores} token_bytes={TOKEN_BYTES} "
-            f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
+            f"requests={args.request_count} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"populate_chunk_entries={POPULATE_CHUNK_ENTRIES} "
             f"coalesce_sges={metadata['coalesce_sges']} "
             f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
             f"configured_first_chunk_divisor={metadata['configured_first_chunk_divisor']} "
-            f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={profile_samples} "
+            f"warmup={args.warmup} iterations={args.iterations} profile_samples={profile_samples} "
             f"plan=fixed_random timing={metadata['timing_contract']}",
             flush=True,
         )
@@ -602,16 +609,16 @@ def main(argv=None) -> int:
         print(f"GATHER_PERF_PHASE_DONE phase=prepare_access_table "
               f"elapsed_ms={(time.perf_counter() - phase_start) * 1000:.3f}", flush=True)
         generator = torch.Generator().manual_seed(SEED)
-        indices_cpu = torch.randint(TABLE_CAPACITY, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
-        slots_cpu = torch.randint(TOKENS_PER_BLOCK, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
+        indices_cpu = torch.randint(TABLE_CAPACITY, (args.request_count,), generator=generator, dtype=torch.int32)
+        slots_cpu = torch.randint(TOKENS_PER_BLOCK, (args.request_count,), generator=generator, dtype=torch.int32)
         rows_cpu = torch.tensor(make_output_rows(
-            REQUEST_COUNT, cores, GATHER_SGL_SIZE, layout,
+            args.request_count, cores, GATHER_SGL_SIZE, layout,
             lambda count: torch.randperm(count, generator=generator).tolist()), dtype=torch.int32)
         indices = indices_cpu.to(device)
         offsets = (slots_cpu * TOKEN_BYTES).to(device)
         rows = rows_cpu.to(device)
-        miss_count = torch.tensor([REQUEST_COUNT], dtype=torch.int32, device=device)
-        output = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8, device=device)
+        miss_count = torch.tensor([args.request_count], dtype=torch.int32, device=device)
+        output = torch.full((args.request_count + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8, device=device)
         torch.npu.synchronize()
 
         def batch_get(*, checked: bool = False) -> None:
@@ -631,10 +638,10 @@ def main(argv=None) -> int:
             if coalesce:
                 check_coalesced_profile(preflight_profile)
             check_progress_profile(preflight_profile)
-        expected = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8)
+        expected = torch.full((args.request_count + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8)
         source_ids = indices_cpu.to(torch.int64) * TOKENS_PER_BLOCK + slots_cpu
-        for start in range(0, REQUEST_COUNT, 128):
-            end = min(start + 128, REQUEST_COUNT)
+        for start in range(0, args.request_count, 128):
+            end = min(start + 128, args.request_count)
             expected[rows_cpu[start:end].long()] = token_pattern(torch, source_ids[start:end], TOKEN_BYTES)
         if not torch.equal(output.cpu(), expected):
             raise AssertionError("gather correctness preflight payload/guard mismatch")
@@ -644,7 +651,7 @@ def main(argv=None) -> int:
         if args.acl_graph:
             stream = torch.npu.current_stream()
             execution = kvaf.GetExecutionConfig("urma", "aiv", "gather")
-            graph_lease = runtime.begin_get_graph(execution, output, REQUEST_COUNT, stream)
+            graph_lease = runtime.begin_get_graph(execution, output, args.request_count, stream)
             graph = kvaf.AclGraph()
             graph.capture_begin(stream)
             runtime.batch_get(view, indices, offsets, miss_count, rows, output, stream=stream,
@@ -658,21 +665,33 @@ def main(argv=None) -> int:
             def check_replay():
                 runtime.check_batch_get_status(stream, execution=execution, graph_lease=graph_lease)
 
-            # Prove replay really overwrites payload, with guard rows preserved.
-            for replay in range(2):
+            # Cross the window boundary in both directions with the same graph
+            # and buffers. Restore the full count before performance sampling.
+            counts = (args.request_count,) * 2 if single_window else (
+                args.request_count, 0, 65536, args.request_count)
+            for active in counts:
+                miss_count.fill_(active)
                 output.fill_(0xAD)
                 torch.npu.synchronize()
                 measure()
                 check_replay()
-                if not torch.equal(output.cpu(), expected):
-                    raise AssertionError(f"Gather graph replay {replay + 1} payload/guard mismatch")
+                actual = output.cpu()
+                if active == args.request_count:
+                    correct = torch.equal(actual, expected)
+                else:
+                    active_rows = rows_cpu[:active].long()
+                    correct = torch.equal(actual[active_rows], expected[active_rows])
+                    actual[active_rows] = 0xAD
+                    correct = correct and bool((actual == 0xAD).all())
+                if not correct:
+                    raise AssertionError(f"Gather graph replay with {active} requests has a payload/guard mismatch")
         print("GATHER_PERF_CORRECTNESS_PASS", flush=True)
 
-        for _ in range(WARMUP):
+        for _ in range(args.warmup):
             measure()
             if check_replay:
                 check_replay()
-        for _ in range(ITERATIONS):
+        for _ in range(args.iterations):
             begin = time.perf_counter_ns()
             measure()
             samples_us.append((time.perf_counter_ns() - begin) / 1000)
@@ -682,7 +701,7 @@ def main(argv=None) -> int:
             result = latency_summary(samples_us, payload_bytes)
             print(
                 f"GATHER_PERF_RESULT execution={metadata['execution']} timing={metadata['timing_contract']} "
-                f"profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
+                f"profile=off cpu_profile=external samples={args.iterations} warmup_excluded={args.warmup} "
                 f"mean_us={result['mean_us']:.3f} p50_us={result['p50_us']:.3f} "
                 f"p95_us={result['p95_us']:.3f} p99_us={result['p99_us']:.3f} "
                 f"useful_GiBps={result['useful_GiBps']:.3f} bandwidth_basis=p50_us",
@@ -701,7 +720,7 @@ def main(argv=None) -> int:
                 snapshots.append(dict(runtime.gather_batch_get_profile()))
                 profile_calls_us.append(elapsed)
             runtime.stop_gather_batch_get_profile()
-            print_profiles(snapshots, cores)
+            print_profiles(snapshots, cores, args.request_count)
         return 0
     finally:
         # CSV I/O is outside both timed groups. Preserve successful baseline or

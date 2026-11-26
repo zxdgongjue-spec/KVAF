@@ -133,14 +133,18 @@ def arguments(argv=None):
         args.miss_count = workload_tokens * args.active_percent // 100
     if args.request_length is None:
         args.request_length = workload_tokens
-    if not 1 <= args.miss_count <= args.request_length <= 65536:
-        parser.error("require 1 <= miss-count <= request-length <= 65536")
+    if not 1 <= args.miss_count <= args.request_length <= 0x7fffffff:
+        parser.error("require 1 <= miss-count <= request-length <= INT32_MAX")
+    if args.miss_count > 65536 and args.profile_iterations:
+        parser.error("use --profile-iterations 0 for multi-window end-to-end measurements")
     if args.workload != "sampled-tokens" and args.miss_count > workload_tokens:
         parser.error("miss-count exceeds this workload; use sampled-tokens for repeated requests")
     pattern_step = {"dense": 1, "strided": 2}.get(args.output_pattern)
     if pattern_step and args.output_row_step and pattern_step != args.output_row_step:
         parser.error("output-pattern and output-row-step disagree")
     args.output_row_step = args.output_row_step or pattern_step or 1
+    if args.request_length * args.output_row_step > 0x7fffffff:
+        parser.error("output rows exceed the int32 index range")
     args.output_pattern = "dense" if args.output_row_step == 1 else "strided"
     if args.token_bytes * args.tokens_per_block > 0xffffffff:
         parser.error("block byte count exceeds uint32")
@@ -247,7 +251,7 @@ def main(argv=None):
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
     kernel, put_kernel = kernel_paths("cpu_push_scatter")
-    check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
+    check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV2")
     from utils.backend import detect_torch_backend
     from utils.dsa_keys import build_dsa_keys
     from utils.npu_eids import parse_npu_eids

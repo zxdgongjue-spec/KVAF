@@ -36,8 +36,8 @@ Put 配置和资源分别由 `default_put`、`put_resources` 决定。
 
 | 新增路径 | Eager、容量与注册 | 图与恢复 |
 |---|---|---|
-| AIV Gather | 单 EID、1–8 核、单窗口最多 65536 条请求，输出按 transport 注册，无显式 output lease | 同一实例一个图节点租约，图内禁用 kernel profiling 和探针。失败图需销毁并 discard，关闭 transport 后可通过 Dispatcher 重建 |
-| AIV Scatter | 单 EID、1–8 核、单窗口最多 65536 条请求，payload 写入 owner 的 HBM staging，无显式 output lease | 同一实例的一张图可使用多个节点租约，共用状态 slab 和设备序号。结束失败图须先停止回放、销毁并 discard，再由 Dispatcher 关闭和重建 |
+| AIV Gather | 单 EID、1–8 核，每 lane 在一次 launch 内独立分窗，输出按 transport 注册，无显式 output lease | 同一实例一个图节点租约，图内禁用 kernel profiling 和探针。失败图需销毁并 discard，关闭 transport 后可通过 Dispatcher 重建 |
+| AIV Scatter | 单 EID、1–8 核，每 65536 条分窗，SGL Push 和 Gather→Push 均复用 owner 的 HBM staging，无显式 output lease | 同一实例的一张图可使用多个节点租约，共用状态 slab 和设备序号。结束失败图须先停止回放、销毁并 discard，再由 Dispatcher 关闭和重建 |
 
 两条路径在图存续期间拒绝该配置的普通 Get。跨 stream 并发回放、不同图共用上述实例、
 以及新路径的真机数据正确性和性能均需单独验收。独立 CPU Pull/HBM Pull 保持各自入口。

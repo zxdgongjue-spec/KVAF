@@ -68,6 +68,7 @@ foreach(mode scatter gather)
             "${algorithm_dir}/include/${mode}_batch_get_abi.h"
             "${shared_dir}/include/sequential_batch_get_abi.h"
             "${shared_dir}/kernel/batch_get_kernel_common.h"
+            "${KVAF_AIV_COMMON_INCLUDE_DIR}/get_window.h"
             "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
             ${mode_dependencies}
     VERBATIM)

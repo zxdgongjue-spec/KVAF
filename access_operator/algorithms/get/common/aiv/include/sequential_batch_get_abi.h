@@ -1,12 +1,12 @@
 #pragma once
 
 #include "batch_get_abi.h"
+#include "get_window.h"
 
 // Shared eager status contract. Each mode owns its launch argument ABI.
 enum {
   KVAF_SEQ_SCATTER = 1,
   KVAF_SEQ_GATHER = 2,
-  KVAF_SEQ_MAX_REQUESTS = 65536,
   KVAF_SEQ_MAX_WORKERS = 8,
   KVAF_SEQ_MAX_SGES = 6,
 };

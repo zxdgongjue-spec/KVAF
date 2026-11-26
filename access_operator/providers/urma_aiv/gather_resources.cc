@@ -116,8 +116,10 @@ Status GatherBatchGet::Resources::CaptureProfile() {
     else if (p.ack_done_cycle > p.kernel_finish_cycle) reason = "timestamp_ack_finish";
     else if (p.notify_done_cycle > p.read_done_cycle) reason = "timestamp_notify_read";
     else if (p.read_done_cycle > p.kernel_finish_cycle) reason = "timestamp_read_finish";
-    else if (p.requests != statuses[i].requests) reason = "requests";
-    else if (p.data_wrs != statuses[i].data_wrs) reason = "data_wrs";
+    else if (!p.window_count || p.requests > statuses[i].requests ||
+             (p.window_count <= 1 && p.requests != statuses[i].requests)) reason = "requests";
+    else if (p.data_wrs > statuses[i].data_wrs ||
+             (p.window_count <= 1 && p.data_wrs != statuses[i].data_wrs)) reason = "data_wrs";
     else if (p.pipeline_chunk_bytes != chunk_bytes) reason = "pipeline_chunk_bytes";
     else if (p.prepare_ahead != (p.requests ? args.prepare_ahead : 0)) reason = "prepare_ahead";
     else if (p.cooperative_chunks != (p.requests ? args.cooperative_chunks : 0)) reason = "cooperative_chunks";
@@ -186,6 +188,7 @@ Status GatherBatchGet::Resources::CaptureProfile() {
     out.cooperative_chunks = p.cooperative_chunks;
     out.prepare_ahead_wrs = p.prepare_ahead_wrs;
     out.prepare_ahead_cycles = p.prepare_ahead_cycles;
+    out.window_count = p.window_count;
     eager->latest_profile.cores.push_back(out);
   }
   return Status::OK();
@@ -208,7 +211,7 @@ Status GatherBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
   if (s.initialized || s.failed || s.workspace || s.status_device || s.status_host)
     return Status::InvalidState("sequential transport already initialized; shutdown before retry");
   if (!s.config.peer_link || !s.config.npu_core_count || s.config.npu_core_count > KVAF_SEQ_MAX_WORKERS ||
-      !s.config.batch_get_token_bytes || uint64_t(s.config.batch_get_token_bytes) * KVAF_SEQ_MAX_REQUESTS > UINT32_MAX ||
+      !s.config.batch_get_token_bytes || uint64_t(s.config.batch_get_token_bytes) * kDefaultGetWindow > UINT32_MAX ||
       !s.config.aiv_gather_sgl_size || s.config.aiv_gather_sgl_size > KVAF_SEQ_MAX_SGES ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
@@ -318,7 +321,7 @@ Status GatherBatchGet::PrepareGetGraph(const GetGraphOptions& options) {
       s.profiling || s.args.probe || s.sequence == UINT32_MAX)
     return Status::InvalidState("Gather requires one graph lease on an idle provider without profiling or probes");
   if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
-      !options.request_capacity || options.request_capacity > KVAF_SEQ_MAX_REQUESTS)
+      !options.request_capacity)
     return Status::InvalidArgument("invalid Gather graph stream, output or capacity");
   const auto stream = static_cast<aclrtStream>(options.stream);
   bool capturing = false;

@@ -10,10 +10,11 @@ inline Status Error(const char* what) {
   return Status::Internal(std::string("AIV sequential BatchGet: ") + what);
 }
 inline uint64_t Ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
-inline void FillInput(const BatchGetRequest& r, uint32_t cores, uint64_t token_bytes,
-                      KvafExecuteBatchGetKernelArgs* a) {
+inline Status FillInput(const BatchGetRequest& r, uint32_t cores, uint64_t token_bytes,
+                        KvafExecuteBatchGetKernelArgs* a) {
   const auto& table = r.device_access_table;
   const auto count = r.indices.bytes / 4;
+  if (count > UINT32_MAX) return Status::InvalidArgument("BatchGet request length exceeds uint32");
   const auto entries = table.addresses.bytes / 8;
   *a = {};
   a->address_table = Ptr(table.addresses.data); a->valid_table = Ptr(table.valid.data);
@@ -24,6 +25,7 @@ inline void FillInput(const BatchGetRequest& r, uint32_t cores, uint64_t token_b
   a->token_bytes = token_bytes; a->tokens_per_block = r.tokens_per_block;
   a->block_count = cores; a->jettys_per_core = 2;
   // Intentionally never copy the direct-read inflight budget into this ABI.
+  return Status::OK();
 }
 inline Status Input(const BatchGetExecRequest& exec, InputOptions options,
                     KvafExecuteBatchGetKernelArgs* a) {
@@ -40,13 +42,12 @@ inline Status Input(const BatchGetExecRequest& exec, InputOptions options,
       r.indices.device != DeviceKind::kNpu || r.offsets.device != DeviceKind::kNpu ||
       r.output_indices.device != DeviceKind::kNpu || r.miss_count.device != DeviceKind::kNpu ||
       r.output.device != DeviceKind::kNpu || table.addresses.device != DeviceKind::kNpu ||
-      table.valid.device != DeviceKind::kNpu || count > KVAF_SEQ_MAX_REQUESTS || entries > UINT32_MAX ||
+      table.valid.device != DeviceKind::kNpu || count > UINT32_MAX || entries > UINT32_MAX ||
       !r.output_block_bytes || r.output_block_bytes != options.token_bytes ||
       !r.tokens_per_block || r.tokens_per_block > UINT32_MAX ||
       r.output.bytes % r.output_block_bytes || r.output.bytes / r.output_block_bytes > UINT32_MAX ||
       Ptr(r.output.data) > UINT64_MAX - r.output.bytes)
     return Status::InvalidArgument("invalid sequential BatchGet Tensor layout/capacity");
-  FillInput(r, options.cores, options.token_bytes, a);
-  return Status::OK();
+  return FillInput(r, options.cores, options.token_bytes, a);
 }
 }

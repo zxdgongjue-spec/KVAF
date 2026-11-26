@@ -246,6 +246,7 @@ struct GatherBatchGetCoreProfile {
   std::uint64_t ready_queries{}, ready_wait_cycles{}, pipeline_chunk_bytes{};
   std::uint64_t read_vf_calls{};
   std::uint64_t prepare_ahead{}, cooperative_chunks{}, prepare_ahead_wrs{}, prepare_ahead_cycles{};
+  std::uint64_t window_count{1};
 };
 
 struct GatherBatchGetProfile {

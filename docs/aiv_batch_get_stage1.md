@@ -77,7 +77,7 @@ Scatter 和 Gather 分别位于 `access_operator/algorithms/get/scatter/urma_aiv
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
 | 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，256 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV12` |
+| Symbol | `KvafScatterBatchGetAivKernelV2` | `KvafGatherBatchGetAivKernelV13` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 两个 owner 分别位于 `access_operator/providers/urma_aiv/scatter_resources.cc` 和
@@ -98,7 +98,7 @@ WRITE 请求头和地址清单，K 端同样从本地 mailbox 读取通知。
 
 Scatter 必须保留函数级 AIV 类型声明，方式见
 [CANN 独立 AIV 下发示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/comm_op_dev_guide/aiv_comm_op_dev/op_dispatch.md)。
-`.ascend.meta.KvafScatterBatchGetAivKernelV1` 中应包含
+`.ascend.meta.KvafScatterBatchGetAivKernelV2` 中应包含
 `tag=1, length=4, value=3 (K_TYPE_AIV)`，对应小端字节 `01000400 03000000`。
 仅有 section 名不能证明核类型存在。检查实际产物：
 
@@ -133,7 +133,8 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 
 - 支持 1～8 核和单 EID。普通 Scatter 入口使用 eager 执行；图捕获使用下面的
   通用 Get graph lease。
-- 请求容量 1～65536，固定 token 长度 1～65535 B；`miss_count=0` 是合法空批次。
+- 单次调用的有效条数由设备上的 int32 `miss_count` 和输入张量容量决定，支持空批次。
+  固定 token 长度 1～65535 B，输入容量字段为 uint32。
 - 仅搬运有效前缀，允许重复源和不连续输出行；输出行必须唯一，offset 不能越过源 block。
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
 - 同一 Runtime 复用 workspace，下一次 Get/Put 先 drain 上一批；
@@ -142,8 +143,64 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
   异步逐批检查可通过 `KVAF_AIV_GATHER_CHECK_STATUS=1` 启用。执行失败后拒绝继续提交；无法确认 DMA
   停止时保留注册资源，允许重试关闭。错误输出不能作为有效结果消费。
 - done 轮询有次数上限，loader 的 kernel 超时为 180 秒；轮询次数不是毫秒。
-- Scatter HBM workspace 按最大 65536 请求配置，包括 `65536 * token_bytes` staging、
-  512 KiB 地址清单和控制区。大 token 回归使用较小请求容量以缩小测试输出，workspace 仍按上限分配。
+- Scatter HBM workspace 按每窗 65536 条配置，包括 `65536 * token_bytes` staging、
+  512 KiB 地址清单和控制区。最终输出按调用方容量分配。
+
+## 大请求分窗
+
+三条 AIV 链路都在一次 kernel launch 内按设备 `miss_count` 处理完整有效前缀。
+Gather READ 按全请求划定每个 lane 的范围，再以每 lane 的 DDR staging 容量分窗。
+每个 lane 等本窗 READ CQE 和 CPU ACK 后复用自己的工作区。合并 SGE 时，中间窗按 SGL 分组对齐。
+两种 CPU Push Scatter 均按 65536 条切分全局窗，所有 AIV 核确认本窗 Done 和本地 Scatter 写回
+后才复用 HBM staging。窗口的输出行沿用原始 `output_indices`。
+
+状态序号标记整次 launch，传输序号随窗口推进并跨 eager 调用与图回放保持递增。
+Scatter 和 Gather 的窗口序号达到实现的 32 位范围后，需要重建执行资源。
+窗口推进使用既有的 CPU mailbox 和 Gather 协议，部署时需一起更新 N 端 Host/Python 和 AIV kernel。
+如显式把 `ExecutionResources.request_capacity` 配到 65536 以上，同时更新 K 端服务的容量校验。
+容量受张量尺寸、输出索引、可用内存和设备执行超时约束。分窗会重复控制通知及尾部完成确认。
+阶段 profile 的 `window_count` 和计数描述该核的分窗情况及末窗数据。跨窗性能测试以整次
+调用的端到端数据为准，Scatter 使用 `--no-kernel-profile`，Gather 性能脚本会自动跳过阶段采样。
+
+建议用 656 B、16,384 个源块、每块 128 个 token，先测 8192 条回归，再测
+65535 / 65536 / 65537 和 131072 / 131073。两种 Scatter 分别设
+`KVAF_SCATTER_CPU_GATHER=0/1`，固定 4 核和 4 条 payload Jetty。Gather READ 从 2 核、SGL=5 起测。
+图模式先用单节点完成大请求回归，之后用 8 节点 Scatter 图测平摊后的端到端开销。
+单节点大请求图的 preflight 会在同一张图上变更有效条数并检查 payload 及未写输出。
+
+N 端先设置 `KVAF_CPU_SERVICE_ADDR`，以下命令以 131073 条跨窗请求为例。
+
+```bash
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+export KVAF_RUN_NPU_TESTS=1
+export DEVICE_ID=0
+export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+
+export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_gather_batch_get_kernels.o"
+KVAF_NPU_CORE_COUNT=2 KVAF_AIV_GATHER_COALESCE_SGES=0 \
+KVAF_AIV_GATHER_CHUNK_BYTES=131072 KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=32 \
+KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=4 KVAF_AIV_GATHER_PREPARE_AHEAD=1 \
+python tests/python/test_aiv_gather_batch_get_perf.py \
+  --request-count 131073 --warmup 5 --iterations 20 --acl-graph
+
+export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o"
+for cpu_gather in 0 1; do
+  KVAF_SCATTER_CPU_GATHER="$cpu_gather" \
+  bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+    --single --token-bytes 656 --request-length 131104 --miss-count 131073 \
+    --aiv-cores 4 --jettys-per-core 1 --table-capacity 16384 --tokens-per-block 128 \
+    --source-access-pattern random --output-access-pattern random \
+    --pipeline 1 --jetty-cursors 1 --overlap-head-cq 1 \
+    --warmup 5 --iterations 20 --completion-scope stream \
+    --acl-graph --graph-calls 1 --no-kernel-profile --no-host-profile \
+    --json "results/scatter-cpu-gather-${cpu_gather}-131073.json" \
+    --csv "results/scatter-cpu-gather-${cpu_gather}-131073.csv"
+done
+```
+
+测 eager 时省略图参数。用历史小请求配置复测 8192 条时，Scatter 可将
+`--request-length` 恢复为 32768，Gather→Push 可另测 `--graph-calls 8`。
+比较端到端 P50/P99 和有效带宽时使用一致的 GiB/s 或 GB/s 单位。
 
 ## Scatter ACL 图模式
 
@@ -261,7 +318,7 @@ PASS: mode=cpu_push_scatter cores=1 token_bytes=656 counts=[0, 1, 7, 19, 8193, 8
 | --- | --- | --- | --- |
 | 1/3/8 | 656 | 8193 | 多核、非均匀分工、大小批次及复用 |
 | 8 | 1/13/32/4096/16384/16385/65535 | 19 | 尾部、16 KiB 分块边界及最大 token |
-| 8 | 32 | 65536 | 最大请求容量 |
+| 8 | 32 | 65536 | Scatter 全窗和 Gather lane 容量边界 |
 
 Gather 使用 `test_aiv_gather_batch_get.py` 和对应 gather `.o`。兼容入口
 `test_aiv_sequential_batch_get.py` 根据 `KVAF_AIV_BATCH_GET_MODES` 为各模式启动

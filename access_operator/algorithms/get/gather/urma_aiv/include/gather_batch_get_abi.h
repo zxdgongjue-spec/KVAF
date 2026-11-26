@@ -19,6 +19,8 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
   uint64_t read_vf_calls;
   // Preparation is allowed before remote readiness, execution is not.
   uint64_t prepare_ahead, cooperative_chunks, prepare_ahead_wrs, prepare_ahead_cycles;
+  // Stage timestamps and counters describe the last window of this lane.
+  uint64_t window_count;
 };
 static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 256);
 

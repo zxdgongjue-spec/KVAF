@@ -896,6 +896,8 @@ class NpuPythonRuntime final {
       item["scatter_start_cycle"] = profile.scatter_start_cycle;
       item["scatter_finish_cycle"] = profile.scatter_finish_cycle;
       item["scatter_chunks"] = profile.scatter_chunks;
+      item["window_count"] = profile.window_count;
+      item["wire_sequence"] = profile.wire_sequence;
       if (!core && host_profile_enabled_ && host_profile_ready_) {
         py::dict host;
         const auto& timing = host_profile_;
@@ -1044,6 +1046,7 @@ class NpuPythonRuntime final {
       item["cooperative_chunks"] = p.cooperative_chunks;
       item["prepare_ahead_wrs"] = p.prepare_ahead_wrs;
       item["prepare_ahead_cycles"] = p.prepare_ahead_cycles;
+      item["window_count"] = p.window_count;
       cores.append(std::move(item));
     }
     py::dict result;

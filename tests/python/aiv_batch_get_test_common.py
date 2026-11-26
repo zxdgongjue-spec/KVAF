@@ -34,7 +34,7 @@ def report_gather_kernel(path: str, module) -> None:
     native = getattr(module, "_native", None)
     print(f"GATHER_KERNEL_FILE path={path} bytes={len(data)} "
           f"name_markers={','.join('V' + str(v) for v in versions) or 'unknown'} "
-          "expected_symbol=KvafGatherBatchGetAivKernelV12", flush=True)
+          "expected_symbol=KvafGatherBatchGetAivKernelV13", flush=True)
     print(f"GATHER_PYTHON_IMPORT executable={sys.executable} "
           f"package={getattr(module, '__file__', 'unknown')} "
           f"native={getattr(native, '__file__', 'unknown')}", flush=True)
@@ -56,12 +56,12 @@ def run(mode: str) -> int:
     if mode == "cpu_push_scatter":
         from aiv_kernel_metadata import check_aiv_kernel_metadata
         try:
-            check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
+            check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV2")
         except (OSError, ValueError) as error:
             raise RuntimeError(
                 f"scatter AIV metadata check failed: {error}; binary={kernel}. "
                 "Rebuild the scatter kernel with its K_TYPE_AIV declaration.") from error
-        print(f"[KVAF_TEST] AIV_METADATA_OK kernel=KvafScatterBatchGetAivKernelV1 "
+        print(f"[KVAF_TEST] AIV_METADATA_OK kernel=KvafScatterBatchGetAivKernelV2 "
               f"type=K_TYPE_AIV(3) binary={kernel}", flush=True)
     gather_probe = os.environ.get("KVAF_AIV_GATHER_PROBE", "") if mode == "gather_read" else ""
     if gather_probe and gather_probe not in ("ack", "wqe", "sq", "first_read"):

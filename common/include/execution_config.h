@@ -30,7 +30,7 @@ inline bool IsAicpuScatterGet(GetExecutionConfig config) {
 }
 inline bool IsWindowedGet(GetExecutionConfig config) {
   return IsAivDirectGet(config) ||
-      (config.transport == Transport::Urma && config.executor == Executor::Aicpu &&
+      (config.transport == Transport::Urma &&
        (config.algorithm == GetAlgorithm::Gather || config.algorithm == GetAlgorithm::Scatter));
 }
 inline bool operator==(PutExecutionConfig a, PutExecutionConfig b) {

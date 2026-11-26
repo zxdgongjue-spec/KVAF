@@ -42,7 +42,7 @@ Python binding 与 kernel。连接方式和环境变量见 [AIV 路径说明](ai
 |---|---|---|
 | Eager | 校验零、部分和全量有效前缀，比较 checked/trusted，覆盖 SGL 1、5、6 | 校验零、部分和全量有效前缀，分别覆盖 SGL WRITE 与 CPU 聚合 push |
 | 图 | 使用 `test_aiv_gather_batch_get_perf.py --acl-graph` 验证单节点重复回放 | 使用 Scatter 性能入口的 `--acl-graph --graph-calls 8` 验证同图多节点顺序和输出 |
-| 容量与绑定 | 校验上限 65536 条和超限拒绝，显式 output lease 返回不支持 | 校验上限 65536 条和超限拒绝，显式 output lease 返回不支持 |
+| 容量与绑定 | 校验 65535/65536/65537 和多窗尾块，单节点图切换有效前缀，显式 output lease 返回不支持 | 两种 push 均校验 65535/65536/65537 和多窗尾块，单节点图切换有效前缀，显式 output lease 返回不支持 |
 | 生命周期 | 验证首次使用或预热才建链，单图存续时拒绝同配置 eager，失败图 discard 后可重建 | 验证首次使用或预热才建链，收齐同图节点租约后重建，关闭失败保留旧 owner |
 
 原四种 Get 的统一回归仍需执行，新增路径与其他 Put 的交叉组合按实际部署覆盖。

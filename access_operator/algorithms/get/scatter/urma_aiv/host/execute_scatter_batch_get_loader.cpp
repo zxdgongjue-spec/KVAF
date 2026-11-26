@@ -10,7 +10,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafScatterBatchGetAivKernelV1";
+constexpr char kKernelName[] = "KvafScatterBatchGetAivKernelV2";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 // This binary now contains a SIMT VF. Its manually addressed UB scratch must
 // be reserved at launch, including when a runtime switch selects the UB path.

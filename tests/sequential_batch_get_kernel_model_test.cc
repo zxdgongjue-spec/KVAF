@@ -72,9 +72,9 @@ KvafScatterBatchGetArgs ScatterLaunchArgs(const ModelArgs& a) {
 }
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
-    KvafScatterBatchGetAivKernelV1(ScatterLaunchArgs(a));
+    KvafScatterBatchGetAivKernelV2(ScatterLaunchArgs(a));
   } else {
-    KvafGatherBatchGetAivKernelV12({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV13({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
@@ -1083,7 +1083,7 @@ int main() {
     } catch (const std::invalid_argument&) {
     }
   }
-  const auto& metadata = KvafGatherBatchGetAivKernelV12_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV13_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
   // Stage 1: WQEs precede the final ACK, but no payload READ does. Stage 2's
   // prefix gate must also submit a short ready slice of a 128-WR UB bank.
@@ -1221,7 +1221,7 @@ int main() {
     // Three publication WRs plus one SQ clean per control query. Ready fields
     // share one scratch-line invalidate, rather than one per field.
     assert(f.queues[1]->sq_cache_lines == 3 + f.ready_reads[0] + f.ack_reads[0]);
-    assert(f.scratch_cache_lines[0] == 1 + f.ready_reads[0] + f.ack_reads[0]);
+    assert(f.scratch_cache_lines[0] == 2 + f.ready_reads[0] + f.ack_reads[0]);
   }
   {
     Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
@@ -1404,7 +1404,7 @@ int main() {
         assert(actual_writes == descriptor_writes);
         assert(q.cq_completed - old_cqs[core] == 1 + f.ack_reads[core]);
         // One clean for both source words; ACK READs still invalidate after CQ.
-        assert(f.scratch_cache_lines[core] - old_flushes[core] == 1 + f.ack_reads[core]);
+        assert(f.scratch_cache_lines[core] - old_flushes[core] == 2 + f.ack_reads[core]);
       }
     }
   }

@@ -81,7 +81,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
-    parser.add_argument("--kernel", default="KvafScatterBatchGetAivKernelV1")
+    parser.add_argument("--kernel", default="KvafScatterBatchGetAivKernelV2")
     args = parser.parse_args()
     try:
         check_aiv_kernel_metadata(args.binary, args.kernel)

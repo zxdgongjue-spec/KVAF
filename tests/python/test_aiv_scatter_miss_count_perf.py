@@ -159,8 +159,10 @@ def validate_scatter(args):
         return f"aiv-cores times jettys-per-core must be at most {SCATTER_MAX_JETTYS}"
     if len(args.npu_eids) > 1:
         return "scatter supports one local NPU EID"
-    if not 1 <= args.miss_count <= args.request_length <= 65536:
-        return "scatter performance requires 1 <= miss-count <= request-length <= 65536"
+    if not 1 <= args.miss_count <= args.request_length <= 0x7fffffff:
+        return "scatter performance requires 1 <= miss-count <= request-length <= INT32_MAX"
+    if args.miss_count > 65536 and args.kernel_profile:
+        return "use --no-kernel-profile for multi-window end-to-end measurements"
     if not 1 <= args.token_bytes <= 65535 or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
         return "scatter token_bytes must be <=65535 and block bytes must fit uint32"
     if args.case_timeout <= 0:
@@ -335,7 +337,7 @@ def run_case(args):
     from utils.backend import detect_torch_backend
     kernel = args.build / "bin/kvaf_scatter_batch_get_kernels.o"
     put_kernel = args.build / "bin/kvaf_execute_batch_put_kernels.o"
-    check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
+    check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV2")
     if not put_kernel.is_file():
         raise ValueError(f"missing BatchPut kernel: {put_kernel}")
     sys.path.insert(0, str(args.build / "python"))
@@ -448,13 +450,17 @@ def run_case(args):
             view = runtime.access_table_view(table, device="npu", capacity=args.table_capacity)
             torch.npu.synchronize()
 
-        def verify(inputs, guard=False):
-            rows = inputs[2][:args.miss_count].to(torch.int64)
-            slots = (inputs[1][:args.miss_count] // args.token_bytes).to(torch.int64)
+        def verify(inputs, guard=False, active_count=args.miss_count):
+            if not active_count:
+                if guard and torch.count_nonzero(output).item():
+                    raise AssertionError("empty scatter wrote output rows")
+                return
+            rows = inputs[2][:active_count].to(torch.int64)
+            slots = (inputs[1][:active_count] // args.token_bytes).to(torch.int64)
             actual = output.index_select(0, rows)
             if not torch.equal(actual, pattern.index_select(0, slots)):
                 raise AssertionError("aligned scatter payload mismatch")
-            if guard and args.miss_count < args.request_length and \
+            if guard and active_count < args.request_length and \
                     torch.count_nonzero(output).item() != torch.count_nonzero(actual).item():
                 raise AssertionError("aligned scatter wrote outside active output rows")
 
@@ -466,7 +472,8 @@ def run_case(args):
             return generate_request_plan(torch, args, device, request_ids, view.addresses,
                                          contiguous_source_token_ids)
 
-        preflight_slots = contiguous_source_token_ids % args.tokens_per_block
+        # Distinguish rows at the same position in consecutive staging windows.
+        preflight_slots = (contiguous_source_token_ids + request_ids // 65536) % args.tokens_per_block
         fixed_inputs = ((contiguous_source_token_ids // args.tokens_per_block).to(torch.int32),
                         (preflight_slots * args.token_bytes).to(torch.int32),
                         request_ids.to(torch.int32))
@@ -532,6 +539,15 @@ def run_case(args):
             wait()
         complete_outside_measurement(runtime, graph_mode and args.kernel_profile, check_replay)
         verify(input_plans[-1], guard=calls == 1 or args.output_access_pattern == "contiguous")
+        if graph_mode and calls == 1 and args.miss_count > 65536:
+            for active in (0, 65536, args.miss_count):
+                output.zero_()
+                count.fill_(active)
+                torch.npu.synchronize()
+                submit()
+                wait()
+                check_replay()
+                verify(input_plans[0], guard=True, active_count=active)
         check = "per_node_preflight_and_last_payload" if calls > 1 else "active_prefix_and_guard"
         print(f"SCATTER_ALIGNED_CORRECTNESS_PASS {check}=1", flush=True)
         log_phase("preflight", "end")

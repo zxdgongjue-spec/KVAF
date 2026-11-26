@@ -16,8 +16,8 @@ namespace {
 std::vector<std::unique_ptr<std::string>> binaries;
 void Check(bool ok) { if (!ok) std::abort(); }
 constexpr char kDirect[] = "KvafExecuteBatchGetAivKernelV2";
-constexpr char kScatter[] = "KvafScatterBatchGetAivKernelV1";
-constexpr char kGather[] = "KvafGatherBatchGetAivKernelV12";
+constexpr char kScatter[] = "KvafScatterBatchGetAivKernelV2";
+constexpr char kGather[] = "KvafGatherBatchGetAivKernelV13";
 std::vector<std::string> launched;
 uint32_t failure_stage{};
 }

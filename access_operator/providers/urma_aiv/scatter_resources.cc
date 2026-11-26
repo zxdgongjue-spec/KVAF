@@ -197,7 +197,7 @@ Status ScatterBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
   if (s.initialized || s.failed || s.workspace || s.status_device || s.status_host)
     return Status::InvalidState("sequential transport already initialized; shutdown before retry");
   if (!s.config.peer_link || !s.config.npu_core_count || s.config.npu_core_count > KVAF_SEQ_MAX_WORKERS ||
-      !s.config.batch_get_token_bytes || uint64_t(s.config.batch_get_token_bytes) * KVAF_SEQ_MAX_REQUESTS > UINT32_MAX ||
+      !s.config.batch_get_token_bytes || uint64_t(s.config.batch_get_token_bytes) * kDefaultGetWindow > UINT32_MAX ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
   const char* pipeline_option = std::getenv("KVAF_SCATTER_PIPELINE");
@@ -438,9 +438,11 @@ Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfi
                                  s.ProfileBytes(), ACL_MEMCPY_DEVICE_TO_HOST);
   if (copied != ACL_SUCCESS) { s.failed = true; return s.AclFailure("copy_profile", copied); }
   uint64_t requests = 0;
+  const auto& first = profiles->front();
   for (uint32_t core = 0; core < profiles->size(); ++core) {
     const auto& p = (*profiles)[core];
     if (p.magic != kScatterProfileMagic || p.sequence != s.sequence ||
+        !p.window_count || p.window_count != first.window_count || p.wire_sequence != first.wire_sequence ||
         !p.start_cycle || p.inputs_ready_cycle < p.start_cycle ||
         p.done_cycle < p.inputs_ready_cycle || p.finish_cycle < p.done_cycle ||
         p.pipeline != ScatterOptionEnabled(s.args.reserved, kScatterPipeline) ||
@@ -453,7 +455,7 @@ Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfi
       return Error("invalid scatter profile; rebuild Host and AIV kernel together");
     requests += p.requests;
   }
-  if (requests && profiles->front().cpu_magic != cpu_push::ProfileToken(s.sequence))
+  if (requests && (!first.wire_sequence || first.cpu_magic != cpu_push::ProfileToken(first.wire_sequence)))
     return Error("CPU push profile report missing; rebuild and restart the CPU service");
   return Status::OK();
 }

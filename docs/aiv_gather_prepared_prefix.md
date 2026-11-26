@@ -14,7 +14,8 @@ Python/Host 异步下发
 ```
 
 HBM workspace 只存清单和每 lane 64 B scratch；UB 存清单/WQE，不存 payload。
-每核独占一条控制 Jetty、一条数据 Jetty 及持久化 SQ/CQ 状态，最多 8 核、65536 请求。
+每核独占一条控制 Jetty、一条数据 Jetty 及持久化 SQ/CQ 状态，最多 8 核。
+每 lane 按 65536 条总容量均分工作区，并在一次 launch 内复用该工作区处理超出容量的请求。
 
 | 阶段 | 保留的优化及约束 |
 | --- | --- |
@@ -166,7 +167,7 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 
 ## ABI 与兼容性
 
-- kernel `KvafGatherBatchGetAivKernelV12`，args 256 B。图回放仍由 AIV 推进请求序号，loader 拒绝旧内核。
+- kernel `KvafGatherBatchGetAivKernelV13`，args 256 B。图回放仍由 AIV 推进请求序号，loader 拒绝旧内核。
 - profile PRF5、256 B；CSV schema 10。profile 直接写每核独占的 GM 记录。
 - GDR2：整批/普通 byte-prefix；GDR4：均分协作块；均为 48 B header + 16 B span 数组。
 - GDR5：CPU 继续接受固定 1/32 首块 + 4 尾块的旧格式。
