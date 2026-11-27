@@ -1,4 +1,6 @@
 #include "execution_protocol.h"
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <limits>
@@ -221,6 +223,13 @@ bool Exchange(const std::string& address, const Request& request, Response* resp
     if (error) *error = s;
     return false;
   };
+  timeval timeout{300, 0};
+  if (const char* value = std::getenv("KVAF_EXECUTION_TIMEOUT_SECONDS")) {
+    const char* end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, timeout.tv_sec);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || timeout.tv_sec <= 0)
+      return fail("KVAF_EXECUTION_TIMEOUT_SECONDS must be a positive integer in seconds");
+  }
   auto body = Encode(request);
   if (body.size() > kMaxPacket - sizeof(peer::MessageHeader))
     return fail("execution request too large");
@@ -238,7 +247,6 @@ bool Exchange(const std::string& address, const Request& request, Response* resp
   for (auto* a = list; a; a = a->ai_next) {
     fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
     if (fd < 0) continue;
-    timeval timeout{30, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;

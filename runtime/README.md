@@ -181,6 +181,17 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 已知设备名时可设置 `peer_ub_device="udmac0d1e2"`，固定 CPU 侧候选设备。
 Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写入。
 
+Execution 控制连接的接收和发送超时默认各为 300 秒，可在发起请求的 NPU 进程环境中
+通过 `KVAF_EXECUTION_TIMEOUT_SECONDS` 配置，单位为秒，例如：
+
+```bash
+export KVAF_EXECUTION_TIMEOUT_SECONDS=600
+```
+
+未设置时使用默认值；设置值必须为正整数，空值、0、负数、非整数或超出系统秒数类型范围的值
+会在发送请求前返回配置错误。该配置作用于 `SO_RCVTIMEO` 和 `SO_SNDTIMEO`，
+不改变数据面 CQ 或 CPU Pull 等待的超时。
+
 `link_to` 必须在 `initialize_ddr(ddr_bytes, slot_size)` 或带 DDR 参数的 `initialize` 前调用；
 无参数 `initialize()` 只初始化基础设备，可用于无 DDR 的 NPU Pull。
 显式调用 `initialize_ddr()` 前须先完成无参数 `initialize()`；带 DDR 参数的兼容入口会自动完成基础初始化。
