@@ -95,13 +95,13 @@ def add_backend_arguments(parser, *, sweep=False):
     if sweep:
         count_options["nargs"] = "+"
     group.add_argument("--aiv-cores", **count_options,
-                       help="AIV cores per device (1..48; defaults: local URMA 2, remote URMA 4, ubmem 16)")
+                       help="AIV cores per device (1..48; defaults: local URMA 3, remote URMA 4, ubmem 16)")
     group.add_argument("--aicpu-workers", **count_options,
                        help="AICPU workers per device; gather_read/cpu_push_scatter only (1..8, default: 6)")
     # Preserve old commands while keeping distinct hardware concepts in help.
     group.add_argument("--workers", dest="compat_workers", **count_options, help=argparse.SUPPRESS)
     group.add_argument("--jettys-per-core", type=int, default=None,
-                       help="Jettys per AIV core; aiv only (1..64; defaults: local 2, remote 1)")
+                       help="Jettys per AIV core; aiv only (1..64; default: 1)")
     group.add_argument("--max-inflight-total", type=int, default=None,
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 uses SQ/CQ capacity)")
     group.add_argument("--gather-ddr-bytes", type=int,

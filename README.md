@@ -330,8 +330,8 @@ npu_pull_options=None)` 的两个 token 布局参数可同时省略，用于独�
 算法选择通过 `default_put/default_get` 和单次调用的 `execution` 完成。
 `put_resources/get_resources` 是 `(config, ExecutionResources(...))` 列表，提供该实现的
 核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认核数/worker 数为 URMA AIV
-Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
-URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。两种 Get 场景每卡均为 4 个 Jetty，`max_inflight_total=2048`。未使用算法不会要求预算或 kernel 有效。
+Put 2、Get 本机 3 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
+URMA AIV Get 默认每核 1 个 Jetty，本机每卡共 3 个，远端 A+K 每卡共 4 个，`max_inflight_total=2048`。URMA AIV Put 默认每核 2 个 Jetty。未使用算法不会要求预算或 kernel 有效。
 
 | 资源项 | AIV URMA / UBmem | AICPU Gather/Scatter / Put |
 | --- | --- | --- |

@@ -168,7 +168,7 @@ struct AccessOperatorConfig {
   // not establish a shared Direct-HCCP ABI.
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
-  // Zero selects the link defaults: local Get 2 x 2, remote Get 4 x 1, Put 2 x 2.
+  // Zero selects the link defaults: local Get 3 x 1, remote Get 4 x 1, Put 2 x 2.
   std::uint32_t npu_core_count{0};
   std::uint32_t jettys_per_core{0};
   // Per-launch total READ budget; 0 selects automatic SQ/CQ capacity windows.

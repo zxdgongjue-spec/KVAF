@@ -44,7 +44,7 @@ mkdir -p "$perf_root"
 for misses in 2048 4096 8192; do
   for backend in aiv ubmem gather_read cpu_push_scatter; do
     case "$backend" in
-      aiv) resources=(--aiv-cores 2 --jettys-per-core 2) ;;
+      aiv) resources=() ;;  # 按 CPU service 所在位置使用本机或远端默认值
       ubmem) resources=(--aiv-cores 16) ;;
       *) resources=(--aicpu-workers 5) ;;
     esac

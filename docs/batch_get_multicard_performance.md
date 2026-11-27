@@ -37,7 +37,7 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
 
 | backend | 并行度参数 | 通信参数 |
 |---|---|---|
-| `aiv` | 本机 2 核，远端 A+K 4 核 | 本机每核 2 个 Jetty，远端每核 1 个，`--max-inflight-total 2048` |
+| `aiv` | 本机 3 核，远端 A+K 4 核 | 每核 1 个 Jetty，`--max-inflight-total 2048` |
 | `ubmem` | `--aiv-cores 16` | 不使用 Jetty / READ 在途预算 |
 | `gather_read` | `--aicpu-workers 5` | 使用算法自身的通信布局 |
 | `cpu_push_scatter` | `--aicpu-workers 5` | 使用算法自身的通信布局 |

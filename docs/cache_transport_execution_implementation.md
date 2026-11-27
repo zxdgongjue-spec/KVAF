@@ -345,7 +345,7 @@ miss_count 为 NPU int32[1]；offsets 使用字节，只有 `[0, miss_count)` �
 输出每行大小须符合 token_bytes。使用 Runtime 生成的 DeviceAccessTable 时保留 Host
 表生命周期；直接传 addresses/valid Tensor 时，调用方承担该地址表的有效性。
 
-`cores=0` 使用下表对应算法的默认核数/worker 数。URMA AIV 的 `jettys=0` 表示按方向取默认值，Get 本机每核 2 个、远端 A+K 每核 1 个，Put 每核 2 个。
+`cores=0` 使用下表对应算法的默认核数/worker 数。URMA AIV 的 `jettys=0` 表示按方向取默认值，Get 每核 1 个 Jetty，Put 每核 2 个。
 `max_inflight_total=None` 使用默认 2048，显式 0 按各 SQ/CQ 的容量自动分组并等待回收。AIV/UBmem 的
 `kernel_path=""` 使用构建时记录的默认绝对路径：Get 为
 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为
@@ -367,7 +367,7 @@ URMA AIV，in-flight 用于 URMA AIV Get，CPU 线程预算用于 AICPU Gather�
 | URMA AIV Put | 2 | 2 | 不适用 | 构建目录 Put `.o` |
 | UBMEM AIV Put | 16 | 不适用 | 不适用 | 构建目录 Put `.o` |
 | URMA AICPU Put | 1 | 内部管理 | 不适用 | CANN 安装包 |
-| URMA AIV Direct Get（本机） | 2 | 2 | 2048 | 构建目录 Get `.o` |
+| URMA AIV Direct Get（本机） | 3 | 1 | 2048 | 构建目录 Get `.o` |
 | URMA AIV Direct Get（远端 A+K） | 4 | 1 | 2048 | 构建目录 Get `.o` |
 | UBMEM AIV Direct Get | 16 | 不适用 | 不适用 | 构建目录 Get `.o` |
 | AICPU Gather Get | 6 | 内部管理 | 不适用 | CANN 安装包 |

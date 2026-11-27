@@ -208,8 +208,8 @@ export KVAF_EXECUTION_TIMEOUT_SECONDS=600
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 可同时省略，用于独立 Pull；
 普通缓存 Get 在 provider 首次准备时要求有效布局。显式布局必须同时为正数，
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
-为 URMA AIV Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
-URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
+为 URMA AIV Put 2、Get 本机 3 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
+URMA AIV Get 默认每核 1 个 Jetty，Put 每核默认 2 个。Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
 AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
@@ -418,7 +418,7 @@ tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
 ```
 
 测试默认 `batch=16`、`token_bytes=656`、`tokens_per_block=128`，
-全表按 `batch × 1024 × 78` 个 83,968B entry 分配，每次 BatchGet 32,768 requests。URMA AIV Get 在本机默认每卡 2 核、每核 2 个 Jetty，在远端 A+K 默认每卡 4 核、每核 1 个 Jetty，
+全表按 `batch × 1024 × 78` 个 83,968B entry 分配，每次 BatchGet 32,768 requests。URMA AIV Get 默认本机每卡 3 核、远端 A+K 每卡 4 核，每核均为 1 个 Jetty，
 Put 默认每卡 2 核、每核 2 个 Jetty。测试执行 3 次 warmup 与
 100 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、

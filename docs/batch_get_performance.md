@@ -17,13 +17,13 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 | `--backend` | 执行路径 | 常用并行度参数 |
 |---|---|---:|
-| `aiv` | URMA AIV Direct | 本机 `--aiv-cores 2 --jettys-per-core 2`，远端 A+K `--aiv-cores 4 --jettys-per-core 1` |
+| `aiv` | URMA AIV Direct | 本机 `--aiv-cores 3 --jettys-per-core 1`，远端 A+K `--aiv-cores 4 --jettys-per-core 1` |
 | `ubmem` | UBMEM AIV Direct | `--aiv-cores 16` |
 | `gather_read` | URMA AICPU Gather | `--aicpu-workers 6` |
 | `cpu_push_scatter` | URMA AICPU Scatter | `--aicpu-workers 6` |
 
 四种后端共用请求生成、建表、预检、预热、输出校验、eager/graph 测量和结果格式。
-未显式设置并行度时，URMA AIV Direct 根据已连接的 CPU service 选默认值。本机每卡 2 核、每核 2 个 Jetty，远端 A+K 每卡 4 核、每核 1 个 Jetty，两种场景均为 4 个 Jetty。UBMEM 使用 16 核，Gather/Scatter 使用
+未显式设置并行度时，URMA AIV Direct 根据已连接的 CPU service 选默认值。本机每卡 3 核，远端 A+K 每卡 4 核。每核使用 1 个 Jetty，因此每卡分别使用 3 个和 4 个 Jetty。UBMEM 使用 16 核，Gather/Scatter 使用
 6 个 worker，与 Runtime 的算法默认值一致；命令行参数或环境变量可覆盖。
 `--aiv-cores` 表示 AIV 核数，`--aicpu-workers` 表示 AICPU worker 数（1..8）；
 旧 `--workers` 写法仍接受以兼容已有命令。

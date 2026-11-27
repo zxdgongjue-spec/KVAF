@@ -43,10 +43,11 @@ struct UrmaAivParallelism {
   std::uint32_t cores, jettys_per_core;
 };
 constexpr UrmaAivParallelism DefaultUrmaAivParallelism(bool get, bool peer_local) {
-  return get && !peer_local ? UrmaAivParallelism{4, 1} : UrmaAivParallelism{2, 2};
+  if (get) return {peer_local ? 3U : 4U, 1U};
+  return {2U, 2U};
 }
 struct ExecutionResources {
-  // Zero cores/Jettys select provider defaults: local URMA AIV Get 2 x 2,
+  // Zero cores/Jettys select provider defaults: local URMA AIV Get 3 x 1,
   // remote Get 4 x 1, Put 2 x 2. UBMEM AIV uses 16 cores, AICPU Put 1 / Get 6. An absent
   // in-flight budget uses 2048; explicit zero uses SQ/CQ capacity for URMA AIV Get.
   // Get derives total capacity from each invocation's buffers; request_capacity
