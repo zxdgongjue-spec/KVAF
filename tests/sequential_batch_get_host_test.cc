@@ -169,27 +169,41 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   }
   if (a->profile) {
     const auto args = *a;
-    const auto fault = profile_fault;
+    const auto injected_fault = profile_fault;
     work.push_back([=] {
       auto* profiles = reinterpret_cast<KvafGatherBatchGetCoreProfile*>(args.profile);
-      const auto* statuses = reinterpret_cast<const KvafSequentialStatus*>(args.request.core_status);
+      auto* statuses = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
+      const auto cores = args.request.block_count;
+      const uint64_t lane_capacity = (kvaf::kDefaultGetWindow + cores - 1) / cores;
+      // Profile fixtures use the kernel's SGL READ path.
+      assert(uint64_t(args.request.token_bytes) * args.sgl_size <= 65536);
+      const auto read_wrs = [&](uint64_t rows) { return (rows + args.sgl_size - 1) / args.sgl_size; };
       for (uint32_t i = 0; i < args.request.block_count; ++i) {
+        auto& status = statuses[i];
+        auto window_rows = lane_capacity;
+        if (args.coalesce_sges && status.requests > window_rows)
+          window_rows -= window_rows % args.sgl_size;
+        // Inject faults on the last lane, which owns work in both the
+        // one-row fixture and the fixture with a multi-window tail.
+        const auto fault = i + 1 == cores ? injected_fault : 0;
         auto& p = profiles[i];
         p = {};
+        p.window_count = status.requests ? (status.requests + window_rows - 1) / window_rows : 1;
+        p.requests = status.requests - (p.window_count - 1) * window_rows;
+        p.data_wrs = read_wrs(p.requests);
+        status.data_wrs = (p.window_count - 1) * read_wrs(window_rows) + p.data_wrs;
         if (fault == 1) continue; // Old/missing profile producer must fail closed.
         p.magic = KVAF_GATHER_PROFILE_MAGIC;
         p.sequence = args.sequence + (fault == 2);
-        p.result = fault == 5 ? KVAF_SEQ_CQ_ERROR : statuses[i].result;
+        p.result = fault == 5 ? KVAF_SEQ_CQ_ERROR : status.result;
         p.valid_mask = fault == 3 ? 1 : KVAF_GATHER_PROFILE_ALL_EVENTS;
         p.kernel_start_cycle = 100;
         p.input_done_cycle = 101;
-        p.descriptor_done_cycle = 102;
-        p.notify_done_cycle = 103;
-        p.ack_done_cycle = fault == 4 ? 99 : 104;
-        p.read_done_cycle = 105;
+        p.descriptor_done_cycle = p.requests ? 102 : p.input_done_cycle;
+        p.notify_done_cycle = p.requests ? 103 : p.input_done_cycle;
+        p.ack_done_cycle = p.requests ? 104 : p.input_done_cycle;
+        p.read_done_cycle = p.requests ? 105 : p.input_done_cycle;
         p.kernel_finish_cycle = 106;
-        p.requests = statuses[i].requests + (fault == 6);
-        p.data_wrs = statuses[i].data_wrs + (fault == 7);
         p.prepare_ahead = p.requests ? args.prepare_ahead : 0;
         p.cooperative_chunks = p.requests ? args.cooperative_chunks : 0;
         if (args.pipeline_chunk_bytes && p.requests) {
@@ -207,6 +221,9 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
           if (fault == 16) ++p.first_read_ready_bytes;
           if (fault == 17) p.first_read_submit_cycle = 106;
         }
+        if (fault == 4) p.ack_done_cycle = 99;
+        if (fault == 6) p.requests = status.requests + 1;
+        if (fault == 7) p.data_wrs = status.data_wrs + 1;
         if (fault == 8) p.input_done_cycle = 99;
         if (fault == 9) p.descriptor_done_cycle = 100;
         if (fault == 10) p.notify_done_cycle = 101;
@@ -221,6 +238,9 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
           p.read_done_cycle = 97320162709862ULL;
           p.kernel_finish_cycle = 97320162710121ULL;
         }
+        if (fault == 18) p.window_count = 0;
+        if (fault == 19) p.requests = status.requests - 1;
+        if (fault == 20) p.data_wrs = status.data_wrs - 1;
       }
     });
   }
@@ -638,6 +658,7 @@ int main() {
       uint64_t rows = 0;
       for (const auto& p : snapshot.cores) {
         assert(p.sequence == seq && p.kernel_finish_cycle - p.kernel_start_cycle == 6);
+        assert(p.window_count == 1 && p.data_wrs == p.requests);
         rows += p.requests;
       }
       assert(rows == 1);
@@ -651,15 +672,22 @@ int main() {
     assert(owner->SetBatchGetKernelProfiling(true).ok());
     count = 0;
     assert(owner->ExecuteBatchGet(exec).ok() && owner->CopyGatherBatchGetProfile(&snapshot).ok());
-    for (const auto& p : snapshot.cores) assert(p.requests == 0);
+    for (const auto& p : snapshot.cores) {
+      assert(p.window_count == 1 && p.requests == 0 && p.data_wrs == 0);
+      assert(p.input_done_cycle == p.descriptor_done_cycle && p.input_done_cycle == p.notify_done_cycle &&
+             p.input_done_cycle == p.ack_done_cycle && p.input_done_cycle == p.read_done_cycle);
+      assert(!p.pipeline_chunk_bytes && !p.first_read_ready_bytes && !p.ready_queries);
+    }
     count = 1;
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
   const char* profile_reasons[] = {"", "magic", "sequence", "valid_mask", "timestamp_notify_ack",
       "result", "requests", "data_wrs", "timestamp_start_input", "timestamp_input_descriptor",
-      "timestamp_descriptor_notify", "timestamp_ack_read", "timestamp_read_finish", "valid_mask"};
+      "timestamp_descriptor_notify", "timestamp_ack_read", "timestamp_read_finish", "valid_mask",
+      nullptr, nullptr, nullptr, nullptr, "requests", "requests", "data_wrs"};
   setenv("KVAF_AIV_GATHER_CHUNK_BYTES", "0", 1);
-  for (profile_fault = 1; profile_fault <= 13; ++profile_fault) {
+  for (profile_fault = 1; profile_fault < sizeof(profile_reasons) / sizeof(*profile_reasons); ++profile_fault) {
+    if (!profile_reasons[profile_fault]) continue; // Pipeline-only faults are checked below.
     auto owner = CreateSequentialBatchGet(algorithm, config);
     assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
     const auto failure = owner->ExecuteBatchGet(exec);
@@ -678,6 +706,47 @@ int main() {
     assert(!owner->CopyGatherBatchGetProfile(&snapshot).ok());
     assert(!owner->ExecuteBatchGet(exec).ok());
     assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  {
+    // A full window on each lane plus one extra row on the last lane.
+    const auto cores = config.npu_core_count;
+    const uint32_t lane_rows = (kDefaultGetWindow + cores - 1) / cores;
+    int32_t large_count = lane_rows * cores + 1;
+    std::vector<int32_t> indices(large_count);
+    std::vector<uint8_t> large_output(large_count * config.batch_get_token_bytes);
+    auto large_request = request;
+    large_request.indices = large_request.offsets = large_request.output_indices =
+        {indices.data(), indices.size() * sizeof(int32_t), npu};
+    large_request.miss_count = {&large_count, sizeof(large_count), npu};
+    large_request.output = {large_output.data(), large_output.size(), npu};
+    auto large_exec = exec;
+    large_exec.request = &large_request;
+    const auto full_window_wrs = (lane_rows + config.aiv_gather_sgl_size - 1) / config.aiv_gather_sgl_size;
+    for (const auto fault : {0U, 6U, 7U}) {
+      profile_fault = fault;
+      auto owner = CreateSequentialBatchGet(algorithm, config);
+      assert(owner->Initialize(region).ok() && owner->SetBatchGetKernelProfiling(true).ok());
+      const auto result = owner->ExecuteBatchGet(large_exec);
+      GatherBatchGetProfile snapshot;
+      if (!fault) {
+        assert(result.ok() && owner->CopyGatherBatchGetProfile(&snapshot).ok());
+        assert(snapshot.sequence == 1 && snapshot.cores.size() == cores);
+        for (uint32_t i = 0; i < cores; ++i) {
+          const bool has_tail = i + 1 == cores;
+          const auto& p = snapshot.cores[i];
+          assert(p.window_count == (has_tail ? 2U : 1U));
+          assert(p.requests == (has_tail ? 1U : lane_rows));
+          assert(p.data_wrs == (has_tail ? 1U : full_window_wrs));
+        }
+      } else {
+        assert(result.code() == StatusCode::kInternal);
+        assert(result.message().find("reason=" + std::string(profile_reasons[fault]) + " ") != std::string::npos);
+        assert(result.message().find("status_requests=" + std::to_string(lane_rows + 1) + " ") != std::string::npos);
+        assert(result.message().find("status_data_wrs=" + std::to_string(full_window_wrs + 1) + " ") != std::string::npos);
+        assert(!owner->CopyGatherBatchGetProfile(&snapshot).ok());
+      }
+      assert(owner->Shutdown().ok() && !allocations && !refs);
+    }
   }
   unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
   profile_fault = 0;

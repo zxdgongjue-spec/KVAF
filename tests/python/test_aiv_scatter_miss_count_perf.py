@@ -31,6 +31,7 @@ from test_aiv_scatter_perf import (SCATTER_MAX_JETTYS, resolve_scatter_options,
                                    scatter_payload_jettys, write_results)
 
 TOKEN_SIZES = (128, 256, 512, 656, 1024, 2048, 4096)
+SCATTER_WINDOW_ROWS = 65_536
 MISS_COUNTS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 CORE_COUNTS = (1, 2, 4, 8)
 STAGES = {
@@ -161,7 +162,7 @@ def validate_scatter(args):
         return "scatter supports one local NPU EID"
     if not 1 <= args.miss_count <= args.request_length <= 0x7fffffff:
         return "scatter performance requires 1 <= miss-count <= request-length <= INT32_MAX"
-    if args.miss_count > 65536 and args.kernel_profile:
+    if args.miss_count > SCATTER_WINDOW_ROWS and args.kernel_profile:
         return "use --no-kernel-profile for multi-window end-to-end measurements"
     if not 1 <= args.token_bytes <= 65535 or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
         return "scatter token_bytes must be <=65535 and block bytes must fit uint32"
@@ -329,6 +330,35 @@ def measure_call(runtime, args, iteration, submit, wait, check_replay=None, cloc
     return sample_metrics(sample)
 
 
+def describe_payload_mismatch(output, rows, slots, pattern):
+    # Copy the original tensors to Host on failure, so diagnostics can also
+    # distinguish a payload error from a large NPU index_select/equal error.
+    output, rows, slots, pattern = (tensor.cpu() for tensor in (output, rows, slots, pattern))
+    windows = []
+    for begin in range(0, rows.numel(), SCATTER_WINDOW_ROWS):
+        end = min(begin + SCATTER_WINDOW_ROWS, rows.numel())
+        actual = output.index_select(0, rows[begin:end])
+        expected = pattern.index_select(0, slots[begin:end])
+        bad = (actual != expected).any(dim=1).nonzero(as_tuple=True)[0]
+        window = dict(begin=begin, end=end, bad_rows=bad.numel())
+        if bad.numel():
+            first = int(bad[0])
+            request = begin + first
+            byte = int((actual[first] != expected[first]).nonzero(as_tuple=True)[0][0])
+            bad_payload = actual[bad]
+            window.update(first_bad_request=request, output_row=int(rows[request]),
+                          expected_slot=int(slots[request]), first_bad_byte=byte,
+                          expected_byte=int(expected[first, byte]), actual_byte=int(actual[first, byte]),
+                          zero_rows=int((bad_payload == 0).all(dim=1).sum()))
+            if begin:
+                previous_slots = slots[begin - SCATTER_WINDOW_ROWS:end - SCATTER_WINDOW_ROWS]
+                previous = pattern.index_select(0, previous_slots[bad])
+                window.update(previous_slot=int(previous_slots[first]),
+                              previous_window_matches=int((bad_payload == previous).all(dim=1).sum()))
+        windows.append(window)
+    return json.dumps(windows, separators=(",", ":"))
+
+
 def run_case(args):
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the NPU host")
@@ -450,19 +480,20 @@ def run_case(args):
             view = runtime.access_table_view(table, device="npu", capacity=args.table_capacity)
             torch.npu.synchronize()
 
-        def verify(inputs, guard=False, active_count=args.miss_count):
+        def verify(inputs, *, label, guard=False, active_count=args.miss_count):
             if not active_count:
                 if guard and torch.count_nonzero(output).item():
-                    raise AssertionError("empty scatter wrote output rows")
+                    raise AssertionError(f"empty scatter wrote output rows at {label}")
                 return
             rows = inputs[2][:active_count].to(torch.int64)
             slots = (inputs[1][:active_count] // args.token_bytes).to(torch.int64)
             actual = output.index_select(0, rows)
             if not torch.equal(actual, pattern.index_select(0, slots)):
-                raise AssertionError("aligned scatter payload mismatch")
+                details = describe_payload_mismatch(output, rows, slots, pattern)
+                raise AssertionError(f"aligned scatter payload mismatch at {label} host_windows={details}")
             if guard and active_count < args.request_length and \
                     torch.count_nonzero(output).item() != torch.count_nonzero(actual).item():
-                raise AssertionError("aligned scatter wrote outside active output rows")
+                raise AssertionError(f"aligned scatter wrote outside active output rows at {label}")
 
         log_phase("preflight", "begin")
         request_ids = torch.arange(args.request_length, dtype=torch.int64, device=device)
@@ -473,7 +504,7 @@ def run_case(args):
                                          contiguous_source_token_ids)
 
         # Distinguish rows at the same position in consecutive staging windows.
-        preflight_slots = (contiguous_source_token_ids + request_ids // 65536) % args.tokens_per_block
+        preflight_slots = (contiguous_source_token_ids + request_ids // SCATTER_WINDOW_ROWS) % args.tokens_per_block
         fixed_inputs = ((contiguous_source_token_ids // args.tokens_per_block).to(torch.int32),
                         (preflight_slots * args.token_bytes).to(torch.int32),
                         request_ids.to(torch.int32))
@@ -496,7 +527,7 @@ def run_case(args):
                 # Validate every node's request/output mapping before capture.
                 # The graph reuses the same output allocation in stream order.
                 torch.npu.synchronize()
-                for inputs in input_plans:
+                for node, inputs in enumerate(input_plans):
                     output.zero_()
                     torch.npu.synchronize()
                     eager = runtime.prepare_scatter_batch_get(
@@ -504,7 +535,7 @@ def run_case(args):
                     eager()
                     stream.synchronize()
                     complete_outside_measurement(runtime, args.kernel_profile)
-                    verify(inputs, guard=True)
+                    verify(inputs, label=f"eager_preflight_node_{node}", guard=True)
             if graph_mode:
                 execution = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
                 for _ in input_plans:
@@ -538,16 +569,17 @@ def run_case(args):
         if wait is not None:
             wait()
         complete_outside_measurement(runtime, graph_mode and args.kernel_profile, check_replay)
-        verify(input_plans[-1], guard=calls == 1 or args.output_access_pattern == "contiguous")
-        if graph_mode and calls == 1 and args.miss_count > 65536:
-            for active in (0, 65536, args.miss_count):
+        verify(input_plans[-1], label="graph_preflight" if graph_mode else "eager_preflight",
+               guard=calls == 1 or args.output_access_pattern == "contiguous")
+        if graph_mode and calls == 1 and args.miss_count > SCATTER_WINDOW_ROWS:
+            for active in (0, SCATTER_WINDOW_ROWS, args.miss_count):
                 output.zero_()
                 count.fill_(active)
                 torch.npu.synchronize()
                 submit()
                 wait()
                 check_replay()
-                verify(input_plans[0], guard=True, active_count=active)
+                verify(input_plans[0], label=f"graph_preflight_count_{active}", guard=True, active_count=active)
         check = "per_node_preflight_and_last_payload" if calls > 1 else "active_prefix_and_guard"
         print(f"SCATTER_ALIGNED_CORRECTNESS_PASS {check}=1", flush=True)
         log_phase("preflight", "end")
@@ -568,7 +600,7 @@ def run_case(args):
             report["samples"][phase].append(
                 measure_call(runtime, args, iteration, submit, wait, check_replay))
         log_phase("measure", "end")
-        verify(input_plans[-1], guard=args.output_access_pattern == "contiguous")
+        verify(input_plans[-1], label="last_sample", guard=args.output_access_pattern == "contiguous")
         samples = report["samples"][phase]
         report["summary"][phase] = {
             key: statistics_ns([r[key] for r in samples],
