@@ -91,6 +91,7 @@ class UrmaSession final : public execution::Session {
     if ((command == peer::Command::kEnableDirectGather ||
          command == peer::Command::kEnableGatherLanes ||
          command == peer::Command::kPrepareGatherWorkspace ||
+         command == peer::Command::kPrepareGatherRoute ||
          command == peer::Command::kPrepareGatherWindow) &&
         (profile_.put || profile_.algorithm != GetAlgorithm::Gather))
       return Status::InvalidArgument("session has no Gather profile");

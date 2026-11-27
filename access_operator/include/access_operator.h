@@ -219,6 +219,8 @@ struct BatchGetKernelProfile {
   std::uint64_t ubmem_address_cycles{0};
   std::uint64_t ubmem_submit_cycles{0};
   std::uint64_t ubmem_drain_cycles{0};
+  std::optional<GatherReadyObservation> gather_ready_progress{};
+  std::optional<GatherPullObservation> gather_pull_progress{};
 };
 
 // Compatibility adapter for the URMA AIV algorithms and resource provider.

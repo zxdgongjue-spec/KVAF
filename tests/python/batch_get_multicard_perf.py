@@ -257,7 +257,7 @@ def write_summary(directory, isolated, concurrent, config=None):
         "backend", "transport", "execution_mode", "aiv_cores", "aicpu_workers", "requests", "request_length", "miss_count", "token_bytes", "table_capacity", "tokens_per_block",
         "seconds", "graphs", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total", "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs",
-        "kernel_profile", "kernel_profile_clock_mhz",
+        "jettys_per_worker", "kernel_profile", "kernel_profile_clock_mhz",
     ) if key in config}
     if config.get("backend") == "gather_read":
         metadata.update(gather_read_wave_settings(argparse.Namespace(**config)))
@@ -294,6 +294,10 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("访问模式 / 随机种子", f"source={config.get('source_access_pattern', 'random')} output={config.get('output_access_pattern', 'contiguous')} sort={config.get('sort_input_indices', False)} seed={config['seed']}"),
             ("CPU service / 卡", "; ".join(f"{device} → {peer}" for device, peer in device_peers.items())),
         ]
+        if backend == "gather_read":
+            settings.append(("数据链 / worker", config.get("jettys_per_worker", 1)))
+            if not config.get("device_peer_ub_devices"):
+                settings.append(("CPU UB 设备", config.get("peer_ub_device") or "auto"))
         if backend == "aiv":
             settings += [(label, config[key]) for label, key in (
                 ("Jetty 数 / AIV 核", "jettys_per_core"),

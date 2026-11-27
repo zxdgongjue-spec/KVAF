@@ -18,7 +18,7 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
   if (transport == Transport::Ubmem) {
     resources.cores = 16U;
   } else if (executor == Executor::Aicpu) {
-    resources.cores = get ? 5U : 1U;
+    resources.cores = get ? 6U : 1U;
   } else {
     const auto defaults = DefaultUrmaAivParallelism(get, peer_local);
     resources.cores = defaults.cores;
@@ -37,6 +37,7 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
     resources.gather_ddr_bytes = configured->gather_ddr_bytes;
     resources.scatter_hbm_bytes = configured->scatter_hbm_bytes;
     resources.gather_read_wave_wrs = configured->gather_read_wave_wrs;
+    resources.gather_address_groups_per_post = configured->gather_address_groups_per_post;
     if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
   }
   return resources;

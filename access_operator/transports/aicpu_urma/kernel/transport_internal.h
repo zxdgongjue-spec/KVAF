@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -64,7 +65,14 @@ struct RequestBuffer {
   std::uint32_t wr_count = 0;
 };
 
+struct PeerRoute {
+  UmdkRemoteMemoryBinding remote;
+  std::uint64_t tp{}, peer_tp{};
+  std::uint32_t peer_psn{};
+};
+
 struct Queue {
+  PeerRoute* route{};
   RequestBuffer requests;
   // Stable storage for one-WR control transfers, including a failed in-flight WR.
   Sge single_local{}, single_remote{};
@@ -92,15 +100,13 @@ struct SessionState {
   urma_context_t* context = nullptr;
   urma_token_id_t* token = nullptr;
   urma_target_seg_t* local = nullptr;
-  UmdkRemoteMemoryBinding remote;
+  std::map<std::array<std::uint8_t, 16>, PeerRoute> routes;
   std::uint64_t session = 0;
-  std::uint64_t shared_tp = 0, shared_peer_tp = 0;
-  std::uint32_t shared_peer_psn = 0;
-  std::array<std::uint8_t, 16> peer_eid{};
+  std::uint32_t data_jettys = 1;
   std::uint64_t buffer = 0, buffer_bytes = 0;
   std::uint32_t worker_count = 1;
   UmdkQueueProfile queue_profile{UmdkQueueProfile::Gather};
-  std::array<Queue, kUmdkControlQueueIndex> data_queues;
+  std::vector<Queue> data_queues;
   std::array<Queue, kUmdkControlQueueIndex> control_queues;
   std::vector<RegisteredBuffer> buffers;
 };
@@ -135,14 +141,18 @@ bool UnregisterBuffer(const UmdkControlArgs&, UmdkControlStatus&);
 void Stage(UmdkControlStatus&, const char*);
 bool Fail(UmdkControlStatus&, const char*, int result = -1, const char* detail = "");
 bool PostBatch(Queue&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);
+// Caller owns the control queue until the signaled chain tail has been retired.
+bool PostOrderedWrites(Queue&, const UmdkTransfer*, std::uint32_t count, UmdkControlStatus&);
+// Caller holds the queue lock until the CQE for single_wr.user_ctx is consumed.
+bool PostOne(Queue&, bool write, const UmdkTransfer&, UmdkControlStatus&, bool fence = false);
 bool WaitCompletion(Queue&, std::uint64_t context, std::uint64_t start, std::uint32_t timeout_ms,
                     UmdkControlStatus&);
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes);
 bool TransferControl(bool write, const UmdkTransfer*, std::uint32_t count, UmdkControlStatus&,
-                     std::uint32_t worker_index = 0U);
+                     std::uint32_t worker_index = 0U, urma_order_type_t placement = URMA_RELAX_ORDER);
 // Internal synchronous transfer. Caller owns the session, holds its mutex
 // (shared or exclusive), and has installed SessionScope for the entire operation.
 // Session/context validation belongs at the execution entry, not each message.
 std::uint32_t TransferControlSync(bool write, const UmdkTransfer*, std::uint32_t count,
-                                  std::uint32_t worker_index);
+                                  std::uint32_t worker_index, urma_order_type_t placement = URMA_RELAX_ORDER);
 }  // namespace kvaf::aicpu_urma::detail

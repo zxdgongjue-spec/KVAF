@@ -49,7 +49,10 @@ Queue& DataQueue(std::uint32_t index) {
 
 Queue* FindQueue(std::uint32_t index) {
   auto& state = CurrentState();
-  if (index < UmdkDataQueueCount(state.queue_profile, state.worker_count)) return &DataQueue(index);
+  if (index < kUmdkControlQueueIndex || index >= 2 * kUmdkControlQueueIndex) {
+    const auto ordinal = index < kUmdkControlQueueIndex ? index : index - kUmdkControlQueueIndex;
+    return ordinal < state.data_queues.size() ? &DataQueue(ordinal) : nullptr;
+  }
   if (index >= kUmdkControlQueueIndex &&
       index < kUmdkControlQueueIndex + UmdkControlQueueCount(state.queue_profile, state.worker_count))
     return &state.control_queues[index - kUmdkControlQueueIndex];
@@ -166,8 +169,8 @@ bool ReleaseApiEnvironment(UmdkControlStatus& status) {
 bool Cleanup(UmdkControlStatus& status) {
   const auto profile = CurrentState().queue_profile;
   const auto workers = CurrentState().worker_count;
-  for (std::uint32_t index = 0; index < UmdkDataQueueCount(profile, workers); ++index)
-    if (!CleanupQueue(CurrentState().data_queues[index], status)) return false;
+  for (auto& queue : CurrentState().data_queues)
+    if (!CleanupQueue(queue, status)) return false;
   for (std::uint32_t index = 0; index < UmdkControlQueueCount(profile, workers); ++index)
     if (!CleanupQueue(CurrentState().control_queues[index], status)) return false;
 #define KVAF_RELEASE(member, function)                       \
@@ -177,8 +180,10 @@ bool Cleanup(UmdkControlStatus& status) {
     if (result != 0) return Fail(status, #function, result); \
     CurrentState().member = nullptr;                                  \
   }
-  const auto unimported = CurrentState().remote.Close();
-  if (unimported != 0) return Fail(status, "urma_unimport_seg", unimported);
+  for (auto& entry : CurrentState().routes) {
+    const auto result = entry.second.remote.Close();
+    if (result != 0) return Fail(status, "urma_unimport_seg", result);
+  }
   while (!CurrentState().buffers.empty()) {
     auto& buffer = CurrentState().buffers.back();
     if (buffer.segment != nullptr) {
@@ -376,11 +381,13 @@ bool CreateSessionQueues(const UmdkControlArgs& args, UmdkControlStatus& status)
   auto& state = CurrentState();
   state.worker_count = args.worker_count;
   state.queue_profile = args.queue_profile;
+  state.data_jettys = args.queue_profile == UmdkQueueProfile::GatherStriped ? args.data_jettys : 1;
+  state.data_queues.resize(UmdkDataQueueCount(state.queue_profile, state.worker_count) * state.data_jettys);
   // Gather preserves its existing order; Put only posts through control[0].
   if (!CreateQueue(args, status, state.control_queues[0])) return false;
-  for (std::uint32_t index = 0; index < UmdkDataQueueCount(state.queue_profile, state.worker_count); ++index) {
+  for (std::uint32_t index = 0; index < state.data_queues.size(); ++index) {
     if (!CreateQueue(args, status, state.data_queues[index])) return false;
-    if (index != 0 && !CreateQueue(args, status, state.control_queues[index])) return false;
+    if (index != 0 && index < state.worker_count && !CreateQueue(args, status, state.control_queues[index])) return false;
   }
   return true;
 }
@@ -390,14 +397,17 @@ bool DescribeWorker(const UmdkControlArgs& args, std::uint32_t index, UmdkContro
   if (selected == nullptr) return Fail(status, "invalid worker index");
   auto& worker = *selected;
   if (worker.jetty == nullptr) return Fail(status, "worker Jetty is unavailable");
-  if (worker.tp == 0 && CurrentState().shared_tp != 0) worker.tp = CurrentState().shared_tp;
-  if (worker.tp == 0) {
+  std::array<std::uint8_t, 16> eid{};
+  std::copy_n(args.route_eid, eid.size(), eid.begin());
+  auto& route = CurrentState().routes[eid];
+  if (worker.route && worker.route != &route) return Fail(status, "Jetty peer EID changed");
+  worker.route = &route;
+  if (!route.tp) {
     Stage(status, "urma_get_tp_list");
-    if (!kvaf::urma::QueryTp(CurrentState().api.get_tp_list, CurrentState().context, CurrentState().peer_eid.data(),
-                             &worker.tp))
+    if (!kvaf::urma::QueryTp(CurrentState().api.get_tp_list, CurrentState().context, eid.data(), &route.tp))
       return Fail(status, "urma_get_tp_list");
-    CurrentState().shared_tp = worker.tp;
   }
+  worker.tp = route.tp;
   status.tp = worker.tp;
   std::memcpy(status.eid, CurrentState().context->eid.raw, 16);
   status.key_bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
@@ -444,7 +454,6 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
 
   if (!LoadApi(args, status)) return false;
   if (!CreateContext(args, status)) return false;
-  std::copy_n(args.route_eid, 16, CurrentState().peer_eid.begin());
   if (!CreateSessionQueues(args, status)) return false;
   Stage(status, "urma_alloc_token_id");
   CurrentState().token = CurrentState().api.urma_alloc_token_id(CurrentState().context);
@@ -466,7 +475,7 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   CurrentState().buffer = args.local_buffer;
   CurrentState().buffer_bytes = args.buffer_bytes;
   if (!DescribeWorker(args, kUmdkControlQueueIndex, status)) return false;
-  if (args.queue_profile == UmdkQueueProfile::Gather && !DescribeWorker(args, 0, status)) return false;
+  if (args.queue_profile != UmdkQueueProfile::Put && !DescribeWorker(args, 0, status)) return false;
   return true;
 }
 
@@ -478,8 +487,10 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
     return Fail(status, "invalid connect CurrentState()");
   if (args.segment_bytes < sizeof(urma_seg_t) || args.key_bytes != 28 || args.peer_tp == 0)
     return Fail(status, "invalid peer descriptor");
-  if (CurrentState().shared_peer_tp != 0 &&
-      (args.peer_tp != CurrentState().shared_peer_tp || args.peer_psn != CurrentState().shared_peer_psn))
+  if (!worker.route) return Fail(status, "queue has no peer route");
+  auto& route = *worker.route;
+  if (route.peer_tp != 0 &&
+      (args.peer_tp != route.peer_tp || args.peer_psn != route.peer_psn))
     return Fail(status, "shared TP peer binding changed", -1,
                 "all Jettys must use the same peer TP and PSN");
   urma_seg_t segment{};
@@ -488,15 +499,15 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
       segment.len > UINT64_MAX - segment.ubva.va)
     return Fail(status, "remote range outside segment");
   Stage(status, "urma_import_seg");
-  if (CurrentState().remote.Import(CurrentState().context, CurrentState().api.urma_import_seg,
+  if (route.remote.Import(CurrentState().context, CurrentState().api.urma_import_seg,
           CurrentState().api.urma_unimport_seg, segment, args.token, args.remote_address,
           CurrentState().session) != 0) return Fail(status, "urma_import_seg");
   Stage(status, "urma_import_jetty_ex");
   worker.target = kvaf::urma::ImportJetty(CurrentState().api.import_jetty_ex, CurrentState().context, args.peer_key,
                                           args.token, worker.tp, args.peer_tp, 1U, args.peer_psn);
   if (worker.target == nullptr) return Fail(status, "urma_import_jetty_ex");
-  CurrentState().shared_peer_tp = args.peer_tp;
-  CurrentState().shared_peer_psn = args.peer_psn;
+  route.peer_tp = args.peer_tp;
+  route.peer_psn = args.peer_psn;
   return DescribeWorker(args, args.worker_index, status);
 }
 

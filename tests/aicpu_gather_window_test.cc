@@ -30,18 +30,29 @@ struct Fixture {
   std::vector<BatchGetWorkerProfile> profiles;
   std::vector<std::unique_ptr<peer::CpuGatherExecutor>> cpu;
   std::array<uint64_t, 8> last{}, calls{};
+  std::array<std::thread, 8> cpu_tasks;
+  std::atomic<bool> stop{};
   std::array<uint32_t, 8> pending_wrs{}, peak_wrs{}, cq_waits{};
+  std::array<uint32_t, 64> queue_wrs{};
+  std::array<uint64_t, 8> max_read_bytes{};
   GatherExecutionControl control{};
   UmdkBatchGetArgs args{};
   int32_t count{};
   uint64_t launches{}, fail_at{};
-  Fixture(uint32_t n, uint32_t w, uint32_t c, uint32_t bytes = 7)
+  Fixture(uint32_t n, uint32_t w, uint32_t c, uint32_t bytes = 7, uint32_t jettys = 1)
       : capacity(n), workers(w), window(c), token(bytes),
         local(GatherWorkspaceBytes(w, c) / 64), remote(GatherRemoteWorkspaceBytes(bytes, w, c) / 64),
         source(std::size_t(n) * bytes), output(source.size()), addresses(n), indices(n), offsets(n), rows(n),
         reports(w), profiles(w) {
     current = this;
     session->state.worker_count = w;
+    session->state.data_jettys = jettys;
+    for (std::size_t i = 0; i < session->state.data_queues.size(); ++i) {
+      auto& q = session->state.data_queues[i];
+      q.route = &session->state.route;
+      q.target = reinterpret_cast<void*>(i + 1);
+    }
+    for (auto& q : session->state.control_queues) q.route = &session->state.route;
     session->state.remote.segment.seg.ubva.va = reinterpret_cast<uint64_t>(remote.data());
     for (uint32_t i = 0; i < n; ++i) {
       addresses[i] = reinterpret_cast<uint64_t>(source.data() + std::size_t(i) * token);
@@ -56,6 +67,7 @@ struct Fixture {
     r.offsets = reinterpret_cast<uint64_t>(offsets.data()); r.output_indices = reinterpret_cast<uint64_t>(rows.data());
     r.miss_count = reinterpret_cast<uint64_t>(&count); r.request_capacity = n; r.token_bytes = token;
     auto& g = args.gather;
+    g.pull_groups = kGatherChunkedPullEnabled;
     g.context = {1, uint64_t(getpid())}; g.worker_count = workers; g.window_capacity = window;
     g.output = reinterpret_cast<uint64_t>(output.data()); g.output_extent = output.size();
     g.core_status = reinterpret_cast<uint64_t>(reports.data()); g.profile = reinterpret_cast<uint64_t>(profiles.data());
@@ -78,18 +90,21 @@ struct Fixture {
       return;
     }
     CHECK(cpu[worker]->PrepareDirect(remote.size() * 64, c->command, c->notify,
-                                     GatherLaneCapacity(workers, window)) != 0);
-    cpu[worker]->Copy();
-    c->ack = c->notify;
+                                     GatherLaneCapacity(workers, window), c, &stop) != 0);
+    const auto success = cpu[worker]->Copy();
+    peer::FinishGatherCopy(*c, c->notify, success, descriptor);
   }
   void Run(int32_t n, bool success = true, bool direct = false) {
     count = n; ++launches;
     pending_wrs.fill(0); peak_wrs.fill(0); cq_waits.fill(0);
+    queue_wrs.fill(0); max_read_bytes.fill(0);
     args.request.indices = direct ? 0 : reinterpret_cast<uint64_t>(indices.data());
     std::fill(output.begin(), output.end(), 0xa5);
     std::vector<std::thread> tasks;
     for (uint32_t w = 0; w < workers; ++w) tasks.emplace_back([&] { (void)ExecuteGatherRead(&args); });
     for (auto& t : tasks) t.join();
+    if (control.failed) stop.store(true);
+    for (auto& t : cpu_tasks) if (t.joinable()) t.join();
     if (!success) { CHECK(control.failed); return; }
     CHECK(control.failed == 0 && control.claimed == launches * workers);
     uint64_t completed = 0, spans = 0;
@@ -101,6 +116,7 @@ struct Fixture {
             peak_wrs[w] <= ResolveGatherReadWaveWrs(args.gather.read_wave_wrs, uint32_t(n)));
     }
     CHECK(completed == uint32_t(n) && spans == uint32_t(n));
+    for (const auto& q : session->state.data_queues) CHECK(q.completions.empty());
     for (uint32_t i = 0; i < capacity; ++i) for (uint32_t b = 0; b < token; ++b)
       CHECK(output[std::size_t(rows[i]) * token + b] ==
           (i < uint32_t(n) ? source[std::size_t(i) * token + b] : 0xa5));
@@ -110,6 +126,10 @@ namespace kvaf::aicpu_urma::detail {
 std::shared_ptr<ExecutionSession> FindSession(std::uint64_t id) { return id == 1 ? current->session : nullptr; }
 std::uint64_t NowNs() { return BatchGetProfileNowNs(); }
 Queue& DataQueue(std::uint32_t i) { return CurrentState().data_queues[i]; }
+Queue* FindQueue(std::uint32_t i) {
+  return i >= kUmdkControlQueueIndex ? &CurrentState().control_queues[i - kUmdkControlQueueIndex]
+                                    : &DataQueue(i);
+}
 bool Fail(UmdkControlStatus& status, const char* stage, int result, const char*) {
   status.result = result; std::snprintf(status.stage, sizeof(status.stage), "%s", stage); return false;
 }
@@ -119,17 +139,20 @@ urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes) {
       ? &segment : nullptr;
 }
 bool PostBatch(Queue& queue, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&) {
-  const auto worker = static_cast<std::size_t>(&queue - current->session->state.data_queues.data());
-  CHECK(worker < current->workers);
+  const auto ordinal = static_cast<std::size_t>(&queue - current->session->state.data_queues.data());
+  CHECK(ordinal < current->workers * current->session->state.data_jettys);
+  const auto worker = ordinal % current->workers;
   for (auto* wr = first;; wr = wr->next) {
+    ++current->queue_wrs[ordinal];
     const auto live = ++current->pending_wrs[worker];
     current->peak_wrs[worker] = std::max(current->peak_wrs[worker], live);
     CHECK(live <= ResolveGatherReadWaveWrs(current->args.gather.read_wave_wrs,
                                          uint32_t(current->count)));
     CHECK(wr && wr->rw.src.num_sge == 1 && wr->rw.dst.num_sge <= 6);
+    CHECK(wr->tjetty == queue.target);
     auto source = wr->rw.src.sge[0].addr;
     const auto bytes = wr->rw.src.sge[0].len;
-    CHECK(bytes <= 65536);
+    current->max_read_bytes[worker] = std::max<uint64_t>(current->max_read_bytes[worker], bytes);
     CHECK(peer::GatherRange(reinterpret_cast<uint64_t>(current->remote.data()), current->remote.size() * 64, source, bytes));
     uint64_t copied = 0;
     for (uint32_t i = 0; i < wr->rw.dst.num_sge; ++i) {
@@ -138,34 +161,73 @@ bool PostBatch(Queue& queue, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkCont
     }
     CHECK(copied == bytes); queue.completed = wr->user_ctx;
     // Every wave must end at a signaled, strongly ordered checkpoint.
-    if (wr->flag.bs.complete_enable) CHECK(wr == tail && wr->flag.bs.place_order == URMA_STRONG_ORDER);
+    if (wr->flag.bs.complete_enable) {
+      CHECK(wr == tail && wr->flag.bs.place_order == URMA_STRONG_ORDER);
+      queue.completions.push_back(wr->user_ctx);
+    }
     if (wr == tail) break;
   }
   return true;
 }
 bool WaitCompletion(Queue& q, std::uint64_t context, std::uint64_t, std::uint32_t, UmdkControlStatus&) {
+  for (auto& control : current->session->state.control_queues) if (&q == &control) {
+    CHECK(!q.completions.empty() && q.completions.front() == context);
+    q.completions.pop_front();
+    return true;
+  }
   CHECK(q.completed == context);
-  const auto worker = static_cast<std::size_t>(&q - current->session->state.data_queues.data());
-  CHECK(current->pending_wrs[worker] && q.requests.wrs[q.requests.wr_count - 1].flag.bs.complete_enable);
-  current->pending_wrs[worker] = 0;
+  CHECK(!q.completions.empty() && q.completions.front() == context);
+  q.completions.pop_front();
+  const auto ordinal = static_cast<std::size_t>(&q - current->session->state.data_queues.data());
+  const auto worker = ordinal % current->workers;
+  CHECK(current->queue_wrs[ordinal] && current->pending_wrs[worker] >= current->queue_wrs[ordinal]);
+  current->pending_wrs[worker] -= current->queue_wrs[ordinal];
+  current->queue_wrs[ordinal] = 0;
   ++current->cq_waits[worker];
   return true;
 }
-std::uint32_t TransferControlSync(bool write, const UmdkTransfer* transfers, std::uint32_t count, std::uint32_t worker) {
+std::uint32_t TransferControlSync(bool write, const UmdkTransfer* transfers, std::uint32_t count, std::uint32_t worker, urma_order_type_t) {
   bool notify = false;
   for (uint32_t i = 0; i < count; ++i) {
     const auto& t = transfers[i];
     CHECK(peer::GatherRange(reinterpret_cast<uint64_t>(current->remote.data()), current->remote.size() * 64, t.remote, t.bytes));
     if (write) {
-      std::memcpy(reinterpret_cast<void*>(t.remote), reinterpret_cast<void*>(t.local), t.bytes);
+      if (t.bytes == 8) __atomic_store_n(reinterpret_cast<uint64_t*>(t.remote),
+          *reinterpret_cast<const uint64_t*>(t.local), __ATOMIC_RELEASE);
+      else std::memcpy(reinterpret_cast<void*>(t.remote), reinterpret_cast<void*>(t.local), t.bytes);
       notify |= t.remote == current->args.gather.remote_notify + worker * sizeof(peer::GatherControl);
-    } else std::memcpy(reinterpret_cast<void*>(t.local), reinterpret_cast<void*>(t.remote), t.bytes);
+    } else if (t.bytes == 8) *reinterpret_cast<uint64_t*>(t.local) =
+        __atomic_load_n(reinterpret_cast<const uint64_t*>(t.remote), __ATOMIC_ACQUIRE);
+    else std::memcpy(reinterpret_cast<void*>(t.local), reinterpret_cast<void*>(t.remote), t.bytes);
   }
-  if (notify) current->Gather(worker);
+  if (notify) {
+    auto& task = current->cpu_tasks[worker];
+    if (task.joinable()) task.join();
+    task = std::thread([worker] { current->Gather(worker); });
+  }
   return 0;
 }
-bool TransferControl(bool write, const UmdkTransfer* t, std::uint32_t n, UmdkControlStatus&, std::uint32_t w) {
-  return TransferControlSync(write, t, n, w) == 0;
+bool TransferControl(bool write, const UmdkTransfer* t, std::uint32_t n, UmdkControlStatus&, std::uint32_t w, urma_order_type_t placement) {
+  return TransferControlSync(write, t, n, w, placement) == 0;
+}
+static std::uint32_t ControlWorker(Queue& q) {
+  return static_cast<std::uint32_t>(&q - CurrentState().control_queues.data());
+}
+bool PostOne(Queue& q, bool write, const UmdkTransfer& transfer, UmdkControlStatus&, bool) {
+  q.single_wr.user_ctx = ++q.sequence;
+  TransferControlSync(write, &transfer, 1, ControlWorker(q));
+  q.completed = q.single_wr.user_ctx;
+  q.completions.push_back(q.completed);
+  std::this_thread::yield();
+  return true;
+}
+bool PostOrderedWrites(Queue& q, const UmdkTransfer* transfers, std::uint32_t count, UmdkControlStatus&) {
+  q.requests.wrs.resize(count);
+  for (auto& wr : q.requests.wrs) wr.user_ctx = ++q.sequence;
+  TransferControlSync(true, transfers, count, ControlWorker(q));
+  q.completed = q.requests.wrs.back().user_ctx;
+  q.completions.push_back(q.completed);
+  return true;
 }
 }
 
@@ -178,6 +240,20 @@ int main() {
   { Fixture f(1000000, 5, 4096); f.Run(1000000); }
   { Fixture f(8193, 5, 4096, 656); f.Run(8193); }
   { Fixture f(8193, 5, 4096, 4096); f.Run(8193); }
+  // Cross the former 6*token <= 64 KiB gate, including a token larger than
+  // 64 KiB. Retain full-token SGEs, arbitrary output rows and Jetty tail CQEs.
+  for (uint32_t token : {10922U, 10923U, 16384U, 65536U, 131072U}) {
+    Fixture f(769, 1, 4096, token, 4);
+    for (uint32_t wave : {31U, 64U, 256U}) {
+      f.args.gather.read_wave_wrs = wave;
+      f.control.address_groups_per_post = wave == 64 ? UINT32_MAX : 3;
+      f.Run(769);
+      CHECK(f.max_read_bytes[0] == uint64_t{6} * token);
+      CHECK(f.profiles[0].read_wqes == 129);
+    }
+    f.Run(7, true, true);
+    f.Run(0);
+  }
   // Replay the same retained transport buffers with smaller/larger wave limits.
   // Also exercise limits below/non-multiples of the 32-WR post batch.
   { Fixture f(20001, 5, 65536, 656);

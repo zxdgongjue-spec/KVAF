@@ -42,6 +42,7 @@ class NpuBindingMetadata(unittest.TestCase):
         self.assertEqual(default.gather_ddr_bytes, 0)  # Resolve the legacy layout after token/workers are known.
         self.assertEqual(default.scatter_hbm_bytes, 0)
         self.assertIsNone(default.gather_read_wave_wrs)
+        self.assertIsNone(default.gather_address_groups_per_post)
         resource = binding.ExecutionResources(gather_ddr_bytes=64 << 20, scatter_hbm_bytes=128 << 20,
                                               request_capacity=1000000)
         self.assertEqual(resource.gather_ddr_bytes, 64 << 20)
@@ -57,6 +58,12 @@ class NpuBindingMetadata(unittest.TestCase):
         for invalid in (-1, 1 << 32):
             with self.assertRaises((TypeError, OverflowError)):
                 binding.ExecutionResources(gather_read_wave_wrs=invalid)
+        for groups in (1, 3, 12, (1 << 32) - 1):
+            resource = binding.ExecutionResources(gather_address_groups_per_post=groups)
+            self.assertEqual(resource.gather_address_groups_per_post, groups)
+        for invalid in (-1, 1 << 32):
+            with self.assertRaises((TypeError, OverflowError)):
+                binding.ExecutionResources(gather_address_groups_per_post=invalid)
 
     def test_retained_registration_owns_original_storage_after_tensor_rebind(self):
         class Storage:

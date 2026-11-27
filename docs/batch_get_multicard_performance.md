@@ -49,8 +49,8 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
 
 卡号与 `--devices` 中的设备 ID 对应，独跑和并发共用映射。未指定映射的卡沿用轮询。
 测轮询基线时，删去两个 `--device-core-fe-map` 参数，保留相同 FE 列表和负载，并更换输出目录。
-在 `concurrent/device_0.log` 和 `concurrent/device_1.log` 中先用 `DIRECT_GET_FE` 核对下标和设备名，
-再看 `DIRECT_AIV_ENTITY_TEMPLATE_READY`。按 `entity_index` 排序，两张卡的 `eid_path`
+在 `concurrent/device_0.log` 和 `concurrent/device_1.log` 中用 `GET_FE_SELECTION` 确认
+`algorithm=direct` 和 `active=3`。再将 `DIRECT_AIV_ENTITY_TEMPLATE_READY` 按 `entity_index` 排序，两张卡的 `eid_path`
 应分别为 `0,0,0,0,1,1` 和 `2,2,2,2,1,1`，轮询基线均为 `0,1,2,0,1,2`。
 
 ## 每张卡使用不同的核数、Jetty 数或 CPU FE
@@ -188,7 +188,7 @@ BASH
 控制器只负责设备进程、起跑屏障、测量窗口、扫描和报告。
 
 单卡入口支持动态输入校验；多卡入口固定各节点的请求，校验在测量窗口外。
-单卡默认 Torch Graph；与多卡对照时可在单卡命令上指定 `--graph-api acl`。
+单卡和多卡均默认使用 ACL Graph；单卡可通过 `--graph-api torch` 显式切换。
 持续吞吐包含回放、等待及循环控制成本，与单卡 `scope=kernel` 的带宽口径不同。
 
 ## 查看帮助和结果

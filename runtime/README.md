@@ -74,45 +74,9 @@ cd /path/to/kvaf
 CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
-URMA DDR 区域支持 `default`、`thp` 和 `hugetlb-<size>`，默认使用 `thp`。
-`<size>` 使用 `k/m/g/t/p/e` 二进制单位，换算成字节后必须是 2 的幂。
-例如 `hugetlb-64k`、`hugetlb-2m`、`hugetlb-16m`、`hugetlb-32m`、`hugetlb-512m`、
-`hugetlb-1g` 和 `hugetlb-16g`。在 CPU 侧宿主机查看内核支持的实际页大小，例如
-`hugepages-32768kB` 对应 `hugetlb-32m`。
-
-```bash
-ls /sys/kernel/mm/hugepages
-ls /sys/devices/system/node/node3/hugepages
-```
-
-```bash
-# 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
-# 是否全部合并仍由 Linux THP 决定。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999
-
-# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode default
-
-# 显式使用 2 MiB、32 MiB 或 1 GiB HugeTLB 页，按宿主机页池选择。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-32m
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
-```
-
-显式 HugeTLB 模式需要在目标 NUMA 节点预留对应大小的页。实际映射按页大小向上取整，
-客户端可用容量和 URMA 注册长度仍为请求长度。内核不支持所选页大小或页池不足时，DDR 申请会返回错误。
-`DDR_ALLOCATED` 日志记录 `page_mode` 和 `backing_bytes`。`urma+ubmem` 混合模式的共享 DDR 由 UBmem 分配器提供。
-
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的
-CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。默认 THP 模式还应通过
-`/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
-合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
+CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。
 
 服务启动时记录 CPU 亲和性。普通 URMA 缓存操作使用匹配的 `--cpunodebind N --membind N` 时，通过 Linux CPU topology 确定节点所属的 CPU Chip，只枚举该 Chip 上所有 FE 的非零 EID。
 未绑定时枚举所有 UB 设备。候选按设备名和 EID index 排序。服务端 `--ub-device NAME` 选该设备首项，
@@ -122,6 +86,82 @@ CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范�
 无法确定归属或属于其他 Chip 的设备记为 `NUMA_DEVICE_SKIPPED`。
 CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
+
+### URMA DDR 大页配置
+
+`--memory-page-mode` 是 `kvaf_cpu_service` 的启动参数，控制 URMA 分配的 CPU DDR。
+`urma+ubmem` 模式下的共享缓存 DDR 由 UBmem 分配器提供。
+
+| CPU 服务参数 | 分配方式 |
+| --- | --- |
+| 省略参数或 `--memory-page-mode thp` | 默认模式。按 2 MiB 对齐，用 `MADV_HUGEPAGE` 请求透明大页，并在注册前主动触页。实际合并量可查看 `/proc/<pid>/smaps` 中的 `AnonHugePages`。 |
+| `--memory-page-mode default` | 按 4 KiB 对齐申请普通内存。内核仍可按系统策略使用 THP。 |
+| `--memory-page-mode hugetlb-<size>` | 从所选大小的 Linux HugeTLB 页池分配。页大小须受宿主机内核支持。 |
+
+以下以 **NUMA 1 上的 1 GiB HugeTLB** 为例。所有 shell 命令都在 CPU 服务所在的 Linux 宿主机执行。
+
+#### 1. 确认 NUMA 节点和页大小
+
+根据 CPU 侧 UB device 的拓扑选择节点。已知设备的 PCI BDF 时，可查看
+`/sys/bus/pci/devices/<BDF>/numa_node`。用 `numactl --hardware` 查看节点和内存，
+将示例中的 `node1` 改成实际节点对应的目录，再查看该节点支持的页池。
+
+```bash
+numactl --hardware
+ls /sys/devices/system/node/node1/hugepages
+```
+
+下表列出当前回归测试覆盖的全部页大小。按目标节点实际存在的页池选择参数。
+`<size>` 使用小写二进制单位 `k/m/g/t/p/e`，换算成字节后须是 2 的幂。
+
+| 页大小 | 页池目录 | `--memory-page-mode` 的值 |
+| --- | --- | --- |
+| 64 KiB | `hugepages-64kB` | `hugetlb-64k` |
+| 2 MiB | `hugepages-2048kB` | `hugetlb-2m` |
+| 16 MiB | `hugepages-16384kB` | `hugetlb-16m` |
+| 32 MiB | `hugepages-32768kB` | `hugetlb-32m` |
+| 512 MiB | `hugepages-524288kB` | `hugetlb-512m` |
+| 1 GiB | `hugepages-1048576kB` | `hugetlb-1g` |
+| 16 GiB | `hugepages-16777216kB` | `hugetlb-16g` |
+
+#### 2. 计算并预留大页
+
+每块 DDR 所需的页数向上取整，再把页数加起来。例如，328 MiB 的 DDR 需要 1 个 1 GiB 大页。
+使用 AICPU Gather 时，还要为它的 DDR 工作区预留大页。[工作区配置](../docs/aicpu_get_windows.md#配置)
+
+以下命令以 root 身份执行。向 `nr_hugepages` 写入 `2`，表示将 NUMA 1 的 1 GiB 页池目标总数
+设为 2 页，共 2 GiB。写入值低于现有页数时会缩减页池。
+
+```bash
+echo 2 > /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+cat /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+cat /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/free_hugepages
+```
+
+回读 `nr_hugepages` 应为 `2`。如果写入成功但回读小于 `2`，说明未能预留到目标页数，通常是
+节点上的连续物理内存不足。可在 Linux 启动时预留后再次检查。`free_hugepages` 是当前空闲页数，
+应至少达到本次 DDR 申请所需的页数。
+[Linux HugeTLB 页池说明](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html)
+
+#### 3. 启动 CPU 服务并核对分配
+
+在仓库根目录启动服务，将 CPU 和内存绑定到预留大页的同一节点，并传入对应的页模式。
+
+```bash
+numactl --cpunodebind=1 --membind=1 \
+  ./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
+```
+
+使用其他节点时，同时修改页池目录和 `numactl` 的节点编号。使用其他页大小时，同时修改页池目录、
+所需页数和启动参数中的页模式。
+NPU 客户端照常通过 `initialize(ddr_bytes, slot_size)` 或 `initialize_ddr(ddr_bytes, slot_size)`
+指定缓存容量。客户端申请 DDR 时，CPU 服务才会从页池取页。检查 CPU 服务的 `DDR_ALLOCATED`
+日志确认 `page_mode=hugetlb-1g`，上述示例的映射长度为 `backing_bytes=1073741824`（1 GiB）。
+客户端可用容量和传给 URMA 的注册长度仍以申请值为准。UDMA/IOMMU 的页表粒度取决于驱动和硬件。
+页池不足或内核不支持所选页大小时，显式 HugeTLB 分配会失败。
+
+### NPU 连接方式
 
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 
@@ -157,33 +197,37 @@ Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 可同时省略，用于独立 Pull；
 普通缓存 Get 在 provider 首次准备时要求有效布局。显式布局必须同时为正数，
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
-为 URMA AIV Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+为 URMA AIV Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
 URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
 AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
 
-CPU Pull 每个 DDR region 绑定一个 CPU 端点。本机首次 `offload_region(source_physical_device_id=...)` 用指定源物理卡的 `pair_info.local_eid` 匹配候选，省略时采用 Runtime 所在卡。未命中或远端自动选择时取表中首项。单个 `peer_ub_device` 或服务端设备配置优先。逗号分隔的设备列表仅供远端 Direct BatchGet 使用。
+CPU Pull 每个 DDR region 绑定一个 CPU 端点。本机首次 `offload_region(source_physical_device_id=...)` 用指定源物理卡的 `pair_info.local_eid` 匹配候选，省略时采用 Runtime 所在卡。未命中或远端自动选择时取表中首项。单个 `peer_ub_device` 或服务端设备配置优先。逗号分隔的设备列表用于远端 AIV Direct 和 AICPU Gather BatchGet。
 
 ### 远端 A+K 的多 FE BatchGet
 
-远端 URMA AIV Direct Get 默认从 CPU service 公布的候选中，按顺序选择两个不同 UB device 的
-`eid_index=0`。在 NPU 进程设置 `KVAF_DEFAULT_PEER_FE_COUNT=1` 即可默认走单 FE，也可设置
-其他正整数。自动模式按可用设备数和总 Jetty 数收缩。服务端固定设备或 index 时尊重其选择。
+AIV Direct 和 AICPU Gather 共用 CPU FE 选择。远端默认选两个不同 UB device 的 `eid_index=0`；
+`KVAF_DEFAULT_PEER_FE_COUNT` 可设置自动选择数量，实际数量受可用设备和通信 worker 数约束。
+服务端固定设备或 index 时尊重其选择。
 
-通过 Python 的 `peer_ub_device="devC,devA,devB"` 或测试入口的
-`--peer-ub-device devC,devA,devB` 可显式指定有序 FE 列表，覆盖环境变量。各设备必须有
-index 0，总 Jetty 数必须覆盖整个列表。单设备参数仍取该设备的首个候选，兼容非零 index。
-显式列表首项供 Put 和 AICPU 使用。本机链路和显式多个 NPU EID 的配置分别使用一个 CPU FE，
-同时指定多个 CPU FE 会返回错误。
+通过 `peer_ub_device="devC,devA,devB"` 或 `--peer-ub-device devC,devA,devB` 指定有序 FE 列表，
+覆盖自动数量。多设备列表要求各设备有 index 0；单设备取其首个候选。
+显式 FE 数不得超过 AIV 的总 Jetty worker 数或 Gather 的 worker 数。
+本机链路和多个 NPU EID 的配置使用一个 CPU FE，同时指定多个 CPU FE 会报错。
+Put 和 AICPU Scatter 使用列表首项。
 
-每个 FE 注册同一块 DDR。默认各 Jetty 按 `(core * jettys_per_core + slot) % active_fes` 选路。
+各 FE 注册同一块 DDR。AIV 默认按 `(core * jettys_per_core + slot) % active_fes` 为每个 Jetty 分配 FE。
 可在创建 Runtime 时传入 `get_core_fe_map=[0,0,1]`，让每个核的全部 Jetty 绑定对应 CPU FE。
 条目数须与实际 AIV 核数一致，下标从 0 开始，按本次选中的 CPU FE 顺序解释。
-一次 Get 只提交一个 kernel。小 batch 可能只用到部分 Jetty。初始化后首次使用或 warmup
-时查看 `DIRECT_GET_FE_SELECTION` 和 `DIRECT_GET_FE` 核对数量、设备和 EID，再按
-`DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty。部署时同步更新 NPU host 库
-和 Direct Get kernel。多 FE 复用当前 CPU service 的 execution session 协议。
+一次 AIV Get 只提交一个 kernel，小 batch 可能只用到部分 Jetty。
+
+Gather 建链时按 `worker_id % FE数` 分配 FE，同一 worker 的控制链和数据链绑定同一个 FE。
+各 FE 共用一份 staging 和一组 CPU gather 线程。
+
+首次使用或 warmup 时通过 `GET_FE_SELECTION` 核对 FE 数量。AIV 可通过
+`DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty，Gather 可通过 `GATHER_ROUTE` 核对各 worker。
+部署时同步更新 NPU host 库和 Direct Get kernel。多 FE 复用当前 CPU service 的 execution session 协议。
 
 ### 固定 UB device 后测量
 

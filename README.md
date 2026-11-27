@@ -264,7 +264,13 @@ NPU raw Pull 默认使用本次构建目录下的 `.o`，可通过 `NpuPullOptio
 其他后端不使用这两个 `--gather-*` 参数。服务启动后打印 `LISTEN`。
 按实际路由可增加 `--ub-device NAME --eid-index N`。
 CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
-远端 A+K 的 URMA AIV Direct BatchGet 默认使用两个 CPU FE。NPU 端可用
+
+URMA DDR 默认使用透明大页（THP）。如果要使用显式 HugeTLB，先在 CPU 服务所在的 Linux
+宿主机为目标 NUMA 节点预留大页，再在上述启动命令末尾加上与页池匹配的
+`--memory-page-mode`，例如 `--memory-page-mode hugetlb-1g`。页数计算、预留命令和
+完整启动示例见 [URMA DDR 大页配置](runtime/README.md#urma-ddr-大页配置)。
+
+远端 A+K 的 AIV Direct 和 AICPU Gather BatchGet 共用 FE 选择，默认使用两个 CPU FE。NPU 端可用
 `KVAF_DEFAULT_PEER_FE_COUNT=1` 改为单 FE，或用 `--peer-ub-device devA,devB,devC` 指定设备顺序。
 初始化与首次使用的边界见 [Runtime](runtime/README.md)；两端需使用匹配产物。
 
@@ -324,7 +330,7 @@ npu_pull_options=None)` 的两个 token 布局参数可同时省略，用于独�
 算法选择通过 `default_put/default_get` 和单次调用的 `execution` 完成。
 `put_resources/get_resources` 是 `(config, ExecutionResources(...))` 列表，提供该实现的
 核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认核数/worker 数为 URMA AIV
-Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 6。
 URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。两种 Get 场景每卡均为 4 个 Jetty，`max_inflight_total=2048`。未使用算法不会要求预算或 kernel 有效。
 
 | 资源项 | AIV URMA / UBmem | AICPU Gather/Scatter / Put |

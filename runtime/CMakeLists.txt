@@ -84,9 +84,13 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOA
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_remote_offload)
   endif()
   if(KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL)
-    find_package(Boost REQUIRED)
+    # PropertyTree JSON parsing only needs headers, not a Boost library or Config package.
+    find_path(KVAF_BOOST_INCLUDE_DIR boost/property_tree/json_parser.hpp
+      HINTS ${Boost_INCLUDE_DIR} ${Boost_INCLUDE_DIRS} ${Boost_ROOT} ${BOOST_ROOT}
+            ENV BOOST_ROOT ENV BOOST_INCLUDEDIR
+      PATH_SUFFIXES include REQUIRED)
     target_sources(kvaf_offload_control PRIVATE src/hbm_read_route.cc)
-    target_link_libraries(kvaf_offload_control PRIVATE Boost::boost)
+    target_include_directories(kvaf_offload_control SYSTEM PRIVATE "${KVAF_BOOST_INCLUDE_DIR}")
     add_library(kvaf_hbm_read_source STATIC src/hbm_read_source.cc)
     target_include_directories(kvaf_hbm_read_source PUBLIC include PRIVATE src "${ASCEND_CANN_PACKAGE_PATH}/include")
     target_link_directories(kvaf_hbm_read_source PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")

@@ -4,6 +4,8 @@
 #include "peer_execution_resources.h"
 
 #include <arpa/inet.h>
+#include <poll.h>
+#include <atomic>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cstdio>
@@ -148,8 +150,11 @@ void CpuSelection() {
   Check(listener >= 0 && bind(listener, reinterpret_cast<sockaddr*>(&addr), size) == 0 &&
         listen(listener, 4) == 0 && getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &size) == 0,
         "start loopback CPU service");
+  std::atomic<bool> stop_server{false};
   std::thread server([&] {
-    for (;;) {
+    while (!stop_server.load()) {
+      pollfd pending{listener, POLLIN, 0};
+      if (poll(&pending, 1, 100) <= 0) continue;
       int fd = accept(listener, nullptr, nullptr);
       if (fd < 0) break;
       peer::MessageHeader h{};
@@ -213,21 +218,21 @@ void CpuSelection() {
   unsetenv("KVAF_DEFAULT_PEER_FE_COUNT");
   choose("", Eid(2), 0);
   std::vector<peer::PeerCandidateInfo> active;
-  Check(selected.ForDirectGet(4, &active).ok() && active.size() == 2 &&
+  Check(selected.ForWorkers(4, &active).ok() && active.size() == 2 &&
         active[0].candidate_id == 0 && active[1].candidate_id == 2, "two distinct FE index-zero rows by default");
-  Check(selected.ForDirectGet(1, &active).ok() && active.size() == 1, "automatic Jetty cap");
+  Check(selected.ForWorkers(1, &active).ok() && active.size() == 1, "automatic Jetty cap");
   setenv("KVAF_DEFAULT_PEER_FE_COUNT", "8", 1);
   choose("", {}, 0);
-  Check(selected.direct_get.size() == 3 && selected.direct_get.back().device_name == "devD",
+  Check(selected.read_fes.size() == 3 && selected.read_fes.back().device_name == "devD",
         "automatic selection skips devices without index zero and caps at availability");
   setenv("KVAF_DEFAULT_PEER_FE_COUNT", "1", 1);
   choose("", {}, 0);
-  Check(selected.direct_get.size() == 1, "configurable single FE default");
+  Check(selected.read_fes.size() == 1, "configurable single FE default");
   choose("devD, devA ,devB", {}, 4);
-  Check(selected.ForDirectGet(3, &active).ok() && active.size() == 3 &&
+  Check(selected.ForWorkers(3, &active).ok() && active.size() == 3 &&
         active[1].candidate_id == 0 && active[2].candidate_id == 2, "explicit three FEs override count");
   CheckSessions(link.address(), active);
-  Check(!selected.ForDirectGet(2, &active).ok(), "explicit list exceeds worker count");
+  Check(!selected.ForWorkers(2, &active).ok(), "explicit list exceeds worker count");
   for (const auto* csv : {"devA,", ",devA", "devA,  ,devB", "devB,devB", "devC,devD"})
     Check(!link.SelectCpuFes(table, csv, {}, false, &selected).ok(), "invalid explicit FE list");
   choose("devC", {}, 3);
@@ -235,12 +240,13 @@ void CpuSelection() {
   setenv("KVAF_DEFAULT_PEER_FE_COUNT", "0", 1);
   Check(!link.SelectCpuFes(table, "", {}, false, &selected).ok(), "invalid automatic count");
   choose("devA,devB", {}, 0);  // Explicit selection ignores the environment.
-  Check(link.SelectCpuFes(table, "", {}, true, &selected).ok() && selected.direct_get.size() == 1,
+  Check(link.SelectCpuFes(table, "", {}, true, &selected).ok() && selected.read_fes.size() == 1,
         "multiple local EIDs use one CPU FE");
   Check(!link.SelectCpuFes(table, "devA,devB", {}, true, &selected).ok(), "ambiguous many-to-many list");
   table.device_fixed = true;
   choose("", {}, 0);
-  Check(selected.direct_get.size() == 1, "respect service pin on remote links");
+  Check(selected.read_fes.size() == 1, "respect service pin on remote links");
+  stop_server.store(true);
   shutdown(listener, SHUT_RDWR);
   server.join();
   close(listener);

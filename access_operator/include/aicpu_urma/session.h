@@ -1,4 +1,5 @@
 #pragma once
+#include "gather_workspace.h"
 
 #include <array>
 #include <map>
@@ -21,6 +22,9 @@ struct UmdkSessionConfig {
   std::shared_ptr<peer::PeerLink> peer_link;
   std::array<std::uint8_t, 16> local_eid{};
   UmdkQueueProfile queue_profile{UmdkQueueProfile::Gather};
+  std::uint32_t data_jettys{1};
+  std::vector<std::uint32_t> candidates;
+  GatherChunkConfig chunks{};
 };
 
 class UmdkSession;

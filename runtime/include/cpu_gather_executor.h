@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cpu_gather.h"
+#include "gather_pull_plan.h"
 
 namespace kvaf::peer {
 
@@ -32,6 +33,9 @@ inline void GatherSpinPause() {
   std::this_thread::yield();
 #endif
 }
+
+// Sole completion publisher, called after Copy() has joined this request's helpers.
+void FinishGatherCopy(GatherControl& control, std::uint64_t sequence, bool success, GatherDescriptorHeader* header);
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
@@ -62,9 +66,10 @@ class CpuGatherExecutor {
   CpuGatherExecutor& operator=(const CpuGatherExecutor&) = delete;
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
-                            std::uint64_t sequence, std::size_t max_spans);
+                            std::uint64_t sequence, std::size_t max_spans,
+                            const GatherControl* control = nullptr, const std::atomic<bool>* stop = nullptr);
 
-  void Copy();
+  bool Copy();
 
  private:
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
@@ -96,10 +101,19 @@ class CpuGatherExecutor {
     return ((address + 63U) & ~std::uintptr_t{63U}) - reinterpret_cast<std::uintptr_t>(staging_);
   }
 
-  std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
+  std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end);
+  std::uint64_t CopyPublishedRange(std::uint64_t offset, std::uint64_t end) const;
+  bool WaitPublishedAddresses(std::uint64_t end);
 
   std::uint64_t ProcessSource(std::size_t worker);
 
+  bool GroupStopped() const;
+  bool CopyStripe(std::size_t worker, std::uint64_t begin, std::uint64_t end, std::uint64_t& copied);
+  std::uint64_t CopyGroups(std::size_t worker);
+  std::uint64_t CopySizedChunks(std::size_t worker);
+  std::uint64_t ChunkBoundary(std::size_t index) const {
+    return index ? std::min(total_bytes_, first_chunk_bytes_ + (index - 1) * pipeline_chunk_bytes_) : 0;
+  }
   void RunHelper(std::size_t worker);
 
   std::uint8_t* memory_;
@@ -123,6 +137,14 @@ class CpuGatherExecutor {
   std::size_t active_threads_{1U};
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
+  const std::uint64_t* suffix_sequence_{nullptr};
+  const std::atomic<bool>* request_stop_{nullptr};
+  GatherPullPlan group_plan_{};
+  bool pull_groups_{};
+  bool chunked_addresses_{};
+  std::uint64_t sequence_{}, head_bytes_{};
+  std::atomic<bool> suffix_failed_{false};
+  std::uint64_t first_chunk_bytes_{};
   std::uint32_t pipeline_chunk_bytes_{0U};
   std::vector<std::uint32_t> chunk_done_;
   std::atomic<std::size_t> next_chunk_{0U};

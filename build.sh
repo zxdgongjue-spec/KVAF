@@ -207,7 +207,7 @@ build_npu() {
       echo "[KVAF_BUILD] installing pybind11 for $python_bin"
       "$python_bin" -m pip install --user pybind11
     fi
-    cmake_options+=("-DPython_EXECUTABLE=$python_bin" "-DPython3_EXECUTABLE=$python_bin"
+    cmake_options+=("-DPython_EXECUTABLE=$python_bin"
       "-Dpybind11_DIR=$("$python_bin" -m pybind11 --cmakedir)")
   fi
   if [[ "$build_aicpu" == ON ]]; then
