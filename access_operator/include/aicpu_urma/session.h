@@ -23,7 +23,7 @@ class UmdkSession {
   explicit UmdkSession(UmdkSessionConfig config) : config_(std::move(config)) {}
   Status Load();
   Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,
-                bool prepared_only = false);
+                const char* buffer_role, bool prepared_only = false);
   Status Shutdown();
   // A failed launch/completion blocks reuse until Shutdown succeeds.
   Status Drain();
@@ -37,6 +37,7 @@ class UmdkSession {
  private:
   Status Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream stream = nullptr,
              Launch launch = nullptr);
+  Status RunHbmRegistration(UmdkControlOp op, UmdkControlStatus& status, const char* buffer_role);
   Status CompletePending(UmdkControlStatus& status);
   UmdkSessionConfig config_;
   UmdkControlArgs args_{};

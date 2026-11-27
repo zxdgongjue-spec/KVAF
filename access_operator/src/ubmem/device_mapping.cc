@@ -9,7 +9,7 @@ Status Acl(const char* operation, aclError code) {
   if (code == ACL_SUCCESS) return Status::OK();
   // Capture the failing task's details before cleanup ACL calls replace them.
   const char* detail = aclGetRecentErrMsg();
-  if (detail && *detail) std::fprintf(stderr, "[KVAF_UBMEM] %s detail: %s\n", operation, detail);
+  if (detail && *detail) std::fprintf(stderr, "==============[KVAF_UBMEM]=========== %s detail: %s\n", operation, detail);
   return HalError(operation, code);
 }
 

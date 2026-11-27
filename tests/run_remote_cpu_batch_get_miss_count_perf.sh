@@ -147,7 +147,7 @@ if [[ "$adaptive_requested" == true ]]; then
     echo "BATCH_GET_UB_DEVICE_FILTER_CHECK_FAILED status=$filter_check_status" >&2
     exit "$filter_check_status"
   fi
-  if awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" &&
+  if awk '$1 ~ /^=*\[KVAF_AIV\]=*$/ && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" &&
            $0 ~ /reason=k_side_device_filter/ { found = 1 }
            END { exit !found }' "$selection_log"; then
     adaptive_selection_skipped=true
@@ -285,7 +285,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         fi
 
         active_record="$(
-          awk '$1 == "[KVAF_AIV]" && ($2 == "UB_DEVICE_SELECTED" || $2 == "UB_DEVICE_REUSED") { result = $0 }
+          awk '$1 ~ /^=*\[KVAF_AIV\]=*$/ && ($2 == "UB_DEVICE_SELECTED" || $2 == "UB_DEVICE_REUSED") { result = $0 }
                END { print result }' "$log_file"
         )"
         shape_ub_device="$selected_ub_device"

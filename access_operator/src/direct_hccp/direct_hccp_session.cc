@@ -116,7 +116,7 @@ bool LoadSessionApi(DirectHccpSession *session) {
     session->ra_deinit = nullptr;
   }
   if (session->ra_library == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_SESSION_API_FAILED reason=ra_symbols\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_API_FAILED reason=ra_symbols\n");
     return false;
   }
 
@@ -138,12 +138,12 @@ bool LoadSessionApi(DirectHccpSession *session) {
     }
   }
   if (session->rt_open_net_service == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_SESSION_API_FAILED reason=runtime_service\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_API_FAILED reason=runtime_service\n");
     CloseLibraries(session);
     return false;
   }
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_SESSION_API_READY ra_library=%s "
+               "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_API_READY ra_library=%s "
                "device_ra_policy=ra_init_ret_328002_reuse\n",
                session->ra_library_name.c_str());
   return true;
@@ -161,7 +161,7 @@ int CallRaInitWithRetry(DirectHccpSession *session, uint32_t mode, const char *r
     ret = session->ra_init(&config);
     if (ret == 0) {
       VerboseLog(
-          "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_READY role=%s physical=%u mode=%u hdc_type=%u\n",
+          "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_READY role=%s physical=%u mode=%u hdc_type=%u\n",
           role, session->key.physical_device_id, mode, session->key.hdc_type);
       return 0;
     }
@@ -179,7 +179,7 @@ bool CallRaInit(DirectHccpSession *session, uint32_t mode, const char *role) {
     return true;
   }
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_INIT_FAILED role=%s physical=%u mode=%u ret=%d timeout_ms=%u\n",
+               "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_INIT_FAILED role=%s physical=%u mode=%u ret=%d timeout_ms=%u\n",
                role, session->key.physical_device_id, mode, ret, kTimeoutMs);
   return false;
 }
@@ -198,7 +198,7 @@ bool EnsureDeviceRa(DirectHccpSession *session) {
   if (ret == 0) {
     session->device_ra_owned = true;
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_OWNED "
+                 "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_OWNED "
                  "role=device_aiv physical=%u hdc_type=%u\n",
                  session->key.physical_device_id, session->key.hdc_type);
     return true;
@@ -206,14 +206,14 @@ bool EnsureDeviceRa(DirectHccpSession *session) {
   if (ret == kRepeatRaInit) {
     session->device_ra_owned = false;
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED "
+                 "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_REUSED "
                  "role=device_aiv physical=%u hdc_type=%u "
                  "source=ra_init_ret_328002\n",
                  session->key.physical_device_id, session->key.hdc_type);
     return true;
   }
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_INIT_FAILED "
+               "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_INIT_FAILED "
                "role=device_aiv physical=%u mode=%u ret=%d timeout_ms=%u\n",
                session->key.physical_device_id, kOfflineHdc, ret, kTimeoutMs);
   return false;
@@ -233,7 +233,7 @@ void CallRaDeinitBestEffort(DirectHccpSession *session, uint32_t mode, const cha
     ret = session->ra_deinit(&config);
     if (ret == 0) {
       VerboseLog(
-          "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_RELEASED role=%s physical=%u mode=%u\n",
+          "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_RELEASED role=%s physical=%u mode=%u\n",
           role, session->key.physical_device_id, mode);
       return;
     }
@@ -243,7 +243,7 @@ void CallRaDeinitBestEffort(DirectHccpSession *session, uint32_t mode, const cha
     std::this_thread::sleep_for(std::chrono::milliseconds(kRetryMs));
   } while (std::chrono::steady_clock::now() < deadline);
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_DEINIT_WARNING role=%s physical=%u mode=%u ret=%d\n",
+               "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RA_DEINIT_WARNING role=%s physical=%u mode=%u ret=%d\n",
                role, session->key.physical_device_id, mode, ret);
 }
 
@@ -263,13 +263,13 @@ bool Bootstrap(DirectHccpSession *session) {
   const int service_ret = session->rt_open_net_service(&service);
   if (service_ret != 0) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_FAILED physical=%u ret=%d hdc_type=%u\n",
+                 "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_SERVICE_FAILED physical=%u ret=%d hdc_type=%u\n",
                  session->key.physical_device_id, service_ret, session->key.hdc_type);
     CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
     session->peer_ra_owned = false;
     return false;
   }
-  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
+  VerboseLog("==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
              session->key.physical_device_id, session->key.hdc_type);
 
   if (!EnsureDeviceRa(session)) {
@@ -307,7 +307,7 @@ bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
   if (existing != g_sessions.end()) {
     ++existing->second->reference_count;
     *session = existing->second.get();
-    VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_REUSED physical=%u hdc_type=%u refs=%u\n",
+    VerboseLog("==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_REUSED physical=%u hdc_type=%u refs=%u\n",
                physical_device_id, hdc_type, existing->second->reference_count);
     return true;
   }
@@ -321,7 +321,7 @@ bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
   created->reference_count = 1U;
   *session = created.get();
   g_sessions.emplace(key, std::move(created));
-  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_READY physical=%u hdc_type=%u refs=1\n",
+  VerboseLog("==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_READY physical=%u hdc_type=%u refs=1\n",
              physical_device_id, hdc_type);
   return true;
 }
@@ -333,12 +333,12 @@ void ReleaseDirectHccpSession(DirectHccpSession *session) {
   std::lock_guard<std::mutex> lock(g_sessions_mutex);
   const auto found = g_sessions.find(session->key);
   if (found == g_sessions.end() || found->second.get() != session || session->reference_count == 0U) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_SESSION_RELEASE_INVALID\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RELEASE_INVALID\n");
     return;
   }
   --session->reference_count;
   if (session->reference_count != 0U) {
-    VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_RELEASE physical=%u hdc_type=%u refs=%u\n",
+    VerboseLog("==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_RELEASE physical=%u hdc_type=%u refs=%u\n",
                session->key.physical_device_id, session->key.hdc_type, session->reference_count);
     return;
   }
@@ -347,7 +347,7 @@ void ReleaseDirectHccpSession(DirectHccpSession *session) {
   // unload code still reachable during later cleanup or process exit.  Keep
   // the successfully bootstrapped session in the process map at refs=0; a
   // later Runtime on this NPU reuses it and the OS reclaims it at process exit.
-  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_IDLE physical=%u hdc_type=%u refs=0 lifetime=process\n",
+  VerboseLog("==============[KVAF_AIV]=========== DIRECT_HCCP_SESSION_IDLE physical=%u hdc_type=%u refs=0 lifetime=process\n",
              session->key.physical_device_id, session->key.hdc_type);
 }
 

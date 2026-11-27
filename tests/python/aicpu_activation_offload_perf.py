@@ -155,7 +155,7 @@ def run(args):
 
         def measure(phase, layer, group, call, *params, **kwargs):
             if args.trace:
-                print(f"ACTIVATION_OFFLOAD_PHASE step={label} shape={shape_index} "
+                print(f"==============[KVAF_AICPU]=========== ACTIVATION_OFFLOAD_PHASE step={label} shape={shape_index} "
                       f"layer={layer} group={group} phase={phase}", flush=True)
             start = now()
             result = call(*params, **kwargs)

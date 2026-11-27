@@ -74,11 +74,11 @@ void ServeSession(int fd, const RoceOptions& options, const Limits& limits, Usag
         session->bytes = bytes;
       } else {
         const int error = errno;
-        std::fprintf(stderr, "[KVAF_ROCE] DDR mmap failed bytes=%llu errno=%d (%s)\n",
+        std::fprintf(stderr, "==============[KVAF_ROCE]=========== DDR mmap failed bytes=%llu errno=%d (%s)\n",
                      static_cast<unsigned long long>(bytes), error, std::strerror(error));
       }
     } else if (status.ok()) {
-      std::fprintf(stderr, "[KVAF_ROCE] DDR request exceeds device MR limit bytes=%llu limit=%llu\n",
+      std::fprintf(stderr, "==============[KVAF_ROCE]=========== DDR request exceeds device MR limit bytes=%llu limit=%llu\n",
                    static_cast<unsigned long long>(bytes),
                    static_cast<unsigned long long>(session->connection.max_mr_size()));
     }
@@ -88,7 +88,7 @@ void ServeSession(int fd, const RoceOptions& options, const Limits& limits, Usag
                                   IBV_ACCESS_REMOTE_WRITE);
       if (session->mr == nullptr) {
         const int error = errno;
-        std::fprintf(stderr, "[KVAF_ROCE] DDR ibv_reg_mr failed bytes=%llu errno=%d (%s)\n",
+        std::fprintf(stderr, "==============[KVAF_ROCE]=========== DDR ibv_reg_mr failed bytes=%llu errno=%d (%s)\n",
                      static_cast<unsigned long long>(bytes), error, std::strerror(error));
       }
       if (session->mr != nullptr &&
@@ -98,7 +98,7 @@ void ServeSession(int fd, const RoceOptions& options, const Limits& limits, Usag
         status = session->connection.Connect(peer);
         if (status.ok() && roce::SendEndpoint(fd, true, session->connection.local()) &&
             roce::SetControlTimeout(fd, false)) {
-          std::fprintf(stderr, "[KVAF_ROCE] REGION_READY bytes=%llu qpn=%u\n",
+          std::fprintf(stderr, "==============[KVAF_ROCE]=========== REGION_READY bytes=%llu qpn=%u\n",
                        static_cast<unsigned long long>(bytes),
                        session->connection.local().qpn);
           release_requested = roce::ReceiveRelease(fd, false);
@@ -106,10 +106,10 @@ void ServeSession(int fd, const RoceOptions& options, const Limits& limits, Usag
       }
     }
     if (!status.ok()) {
-      std::fprintf(stderr, "[KVAF_ROCE] %s\n", status.message().c_str());
+      std::fprintf(stderr, "==============[KVAF_ROCE]=========== %s\n", status.message().c_str());
     }
   } else {
-    std::fprintf(stderr, "[KVAF_ROCE] rejected region request bytes=%llu slot_size=%llu\n",
+    std::fprintf(stderr, "==============[KVAF_ROCE]=========== rejected region request bytes=%llu slot_size=%llu\n",
                  static_cast<unsigned long long>(bytes),
                  static_cast<unsigned long long>(slot_size));
   }
@@ -119,7 +119,7 @@ void ServeSession(int fd, const RoceOptions& options, const Limits& limits, Usag
     if (release_requested) (void)roce::SendRelease(fd, true);
   } else {
     // Keep the registered backing and its provider resources on teardown failure.
-    std::fprintf(stderr, "[KVAF_ROCE] cannot release session safely, retaining resources\n");
+    std::fprintf(stderr, "==============[KVAF_ROCE]=========== cannot release session safely, retaining resources\n");
     (void)session.release();
   }
   close(fd);
@@ -184,10 +184,10 @@ int main(int argc, char** argv) {
       }).detach();
     } catch (const std::system_error& error) {
       usage->sessions.fetch_sub(1, std::memory_order_relaxed);
-      std::fprintf(stderr, "[KVAF_ROCE] cannot start session: %s\n", error.what());
+      std::fprintf(stderr, "==============[KVAF_ROCE]=========== cannot start session: %s\n", error.what());
       close(fd);
     }
   });
-  std::fprintf(stderr, "[KVAF_ROCE] %s\n", status.message().c_str());
+  std::fprintf(stderr, "==============[KVAF_ROCE]=========== %s\n", status.message().c_str());
   return 1;
 }

@@ -27,7 +27,7 @@ for WRITE and once for READ (restart the server processes between runs).
 USAGE
 }
 
-die() { printf '[multi-roce-bw] ERROR: %s\n' "$*" >&2; exit 2; }
+die() { printf '==============[multi-roce-bw]=========== ERROR: %s\n' "$*" >&2; exit 2; }
 
 demo=""
 mapping=""
@@ -115,15 +115,15 @@ mkdir -p "$log_dir" || die "cannot create log directory: $log_dir"
 
 operation_upper="${operation^^}"
 declare -a pids=() log_files=() exit_codes=()
-printf '[multi-roce-bw] operation=%s clients=%d bytes_per_wr=%s depth_per_qp=%s qp_count_per_client=%s warmup=%s iterations=%s\n' \
+printf '==============[multi-roce-bw]=========== operation=%s clients=%d bytes_per_wr=%s depth_per_qp=%s qp_count_per_client=%s warmup=%s iterations=%s\n' \
   "$operation_upper" "$count" "$bytes" "$depth" "$qp_count" "$warmup" "$iterations"
-printf '[multi-roce-bw] per-client HBM/DDR region: %s bytes; aggregate region request: %s bytes\n' \
+printf '==============[multi-roce-bw]=========== per-client HBM/DDR region: %s bytes; aggregate region request: %s bytes\n' \
   "$((bytes * depth * qp_count))" "$((bytes * depth * qp_count * count))"
 
 for ((i=0; i<count; ++i)); do
   log_file="$log_dir/${labels[i]}.log"
   log_files+=("$log_file")
-  printf '[multi-roce-bw] START label=%s acl_device=%s rdma_device=%s gid=%s server=%s log=%s\n' \
+  printf '==============[multi-roce-bw]=========== START label=%s acl_device=%s rdma_device=%s gid=%s server=%s log=%s\n' \
     "${labels[i]}" "${device_ids[i]}" "${rdma_devices[i]}" "${gids[i]}" "${servers[i]}" "$log_file"
   "$demo" "${device_ids[i]}" "${servers[i]}" \
     --rdma-device "${rdma_devices[i]}" --rdma-port "$rdma_port" --gid-index "${gids[i]}" \
@@ -137,12 +137,12 @@ failed=0
 for ((i=0; i<count; ++i)); do
   if wait "${pids[i]}"; then
     exit_codes+=(0)
-    printf '[multi-roce-bw] DONE label=%s status=0\n' "${labels[i]}"
+    printf '==============[multi-roce-bw]=========== DONE label=%s status=0\n' "${labels[i]}"
   else
     rc=$?
     exit_codes+=("$rc")
     failed=1
-    printf '[multi-roce-bw] DONE label=%s status=%s (see %s)\n' "${labels[i]}" "$rc" "${log_files[i]}" >&2
+    printf '==============[multi-roce-bw]=========== DONE label=%s status=%s (see %s)\n' "${labels[i]}" "$rc" "${log_files[i]}" >&2
   fi
 done
 
@@ -177,7 +177,7 @@ for ((i=0; i<count; ++i)); do
     else
       exit_codes[i]="no_perf_result"
       failed=1
-      printf '[multi-roce-bw] ERROR label=%s exited successfully but has no unique %s PERF_RESULT\n' \
+      printf '==============[multi-roce-bw]=========== ERROR label=%s exited successfully but has no unique %s PERF_RESULT\n' \
         "${labels[i]}" "$operation_upper" >&2
     fi
   fi
@@ -186,13 +186,13 @@ for ((i=0; i<count; ++i)); do
     "${exit_codes[i]}" "$gbps" "$gibps" "$gbits" "${log_files[i]}" >> "$summary"
 done
 
-printf '\n[multi-roce-bw] SUMMARY operation=%s successful_links=' "$operation_upper"
+printf '\n==============[multi-roce-bw]=========== SUMMARY operation=%s successful_links=' "$operation_upper"
 successes=0
 for status in "${exit_codes[@]}"; do [[ "$status" == 0 ]] && ((successes+=1)); done
 printf '%d/%d aggregate_GBps=%s aggregate_GiBps=%s aggregate_Gbps=%s\n' \
   "$successes" "$count" "$sum_gbps" "$sum_gibps" "$sum_gbits"
-printf '[multi-roce-bw] per-link summary: %s\n' "$summary"
+printf '==============[multi-roce-bw]=========== per-link summary: %s\n' "$summary"
 if ((failed)); then
-  printf '[multi-roce-bw] INCOMPLETE: inspect failed client logs; aggregate includes only clients with valid results.\n' >&2
+  printf '==============[multi-roce-bw]=========== INCOMPLETE: inspect failed client logs; aggregate includes only clients with valid results.\n' >&2
   exit 1
 fi

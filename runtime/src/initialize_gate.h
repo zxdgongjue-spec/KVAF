@@ -201,7 +201,7 @@ class InitializeGate final {
   void Log(const char* event, double waited, double held) const noexcept {
     const int saved_errno = errno;
     flockfile(stderr);
-    std::fprintf(stderr, "[KVAF_INIT_GATE] event=%s pid=%ld device=%u endpoint=",
+    std::fprintf(stderr, "==============[KVAF_INIT_GATE]=========== event=%s pid=%ld device=%u endpoint=",
                  event, static_cast<long>(getpid()), static_cast<unsigned int>(device_id_));
     WriteQuoted(endpoint_);
     std::fputs(" path=", stderr);

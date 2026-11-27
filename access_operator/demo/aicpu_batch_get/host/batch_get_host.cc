@@ -41,9 +41,10 @@ struct BatchGetTransport::Impl {
   bool initialized{false}, cpu_enabled{false};
   Status PrepareGather(MutableBufferView output, bool capturing, GatherReadArgs& args) {
     const auto workers = session.config().workers;
-    auto ready = session.Ensure(region.base, workspace, GatherWorkspaceBytes(workers), capturing);
+    auto ready = session.Ensure(region.base, workspace, GatherWorkspaceBytes(workers),
+                                "get_workspace", capturing);
     if (!ready.ok()) return ready;
-    ready = session.Ensure(region.base, output.data, output.bytes, capturing);
+    ready = session.Ensure(region.base, output.data, output.bytes, "get_output", capturing);
     if (!ready.ok()) return ready;
     const auto staging = (region.base + region.length + 63U) & ~std::uint64_t{63U};
     const auto descriptors = staging + workers * lane_staging_bytes;

@@ -1,7 +1,9 @@
 #include "direct_hccp/direct_hccp_remote_transport.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <string>
@@ -29,7 +31,7 @@ template <typename Function>
 bool LoadSymbol(void* library, const char* name, Function* function) {
   *function = reinterpret_cast<Function>(dlsym(library, name));
   if (*function != nullptr) return true;
-  std::fprintf(stderr, "[KVAF_AIV] direct libhccp ABI missing symbol %s: %s\n", name, dlerror());
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== direct libhccp ABI missing symbol %s: %s\n", name, dlerror());
   return false;
 }
 
@@ -52,7 +54,7 @@ std::uint32_t MakePeerCtpPsn(const DirectHccpApi& api,
     }
   }
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_CTP_PSN_READY role=%s psn=0x%x source=ra_secure_or_fallback\n",
+               "==============[KVAF_AIV]=========== DIRECT_CTP_PSN_READY role=%s psn=0x%x source=ra_secure_or_fallback\n",
                role, psn);
   return psn;
 }
@@ -73,7 +75,7 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
   int ret = api.get_tp_info_async(context, &cfg, &info, &count, &async_request);
   if (ret != 0 || async_request == nullptr) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_CTP_ASYNC_SUBMIT_FAILED role=%s ret=%d count=%u request=%p\n",
+                 "==============[KVAF_AIV]=========== DIRECT_CTP_ASYNC_SUBMIT_FAILED role=%s ret=%d count=%u request=%p\n",
                  role, ret, count, async_request);
     return false;
   }
@@ -84,7 +86,7 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
     ret = api.get_async_req_result(async_request, &request_result);
     if (ret == kHccpAsyncAgain) {
       if (std::chrono::steady_clock::now() >= deadline) {
-        std::fprintf(stderr, "[KVAF_AIV] DIRECT_CTP_ASYNC_TIMEOUT role=%s timeout_ms=%u\n",
+        std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_CTP_ASYNC_TIMEOUT role=%s timeout_ms=%u\n",
                      role, kCtpQueryTimeoutMs);
         return false;
       }
@@ -96,7 +98,7 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
     async_request = nullptr;
     if (ret != 0 || request_result != 0) {
       std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_CTP_ASYNC_COMPLETE_FAILED role=%s api_ret=%d request_ret=%d\n",
+                   "==============[KVAF_AIV]=========== DIRECT_CTP_ASYNC_COMPLETE_FAILED role=%s api_ret=%d request_ret=%d\n",
                    role, ret, request_result);
       return false;
     }
@@ -104,13 +106,13 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
   }
   if (count == 0U || info.tp_handle == 0U) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_CTP_GET_FAILED role=%s mode=hdc_async count=%u tp=0x%llx\n",
+                 "==============[KVAF_AIV]=========== DIRECT_CTP_GET_FAILED role=%s mode=hdc_async count=%u tp=0x%llx\n",
                  role, count, static_cast<unsigned long long>(info.tp_handle));
     return false;
   }
   *tp_handle = info.tp_handle;
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_CTP_READY role=%s mode=hdc_async tp_handle=0x%llx\n",
+               "==============[KVAF_AIV]=========== DIRECT_CTP_READY role=%s mode=hdc_async tp_handle=0x%llx\n",
                role, static_cast<unsigned long long>(*tp_handle));
   return true;
 }
@@ -124,6 +126,28 @@ bool GetPeerTp(const DirectHccpApi& api, void* context,
   return GetPeerCtp(api, context, local_eid, peer_eid, role, tp);
 }
 
+int RegisterLocalHbm(const DirectHccpApi& api, void* context, MrRegInfo* info,
+                     void** handle, const char* role) {
+  const char* timing = std::getenv("KVAF_URMA_MR_TIMING");
+  if (timing == nullptr || std::strcmp(timing, "1") != 0)
+    return api.lmem_register(context, info, handle);
+
+  const auto start = std::chrono::steady_clock::now();
+  const int result = api.lmem_register(context, info, handle);
+  const int error = errno;
+  const auto register_us = std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - start).count();
+  std::fprintf(stderr,
+      "==============[KVAF_URMA_MR]=========== backend=aiv phase=register role=%s bytes=%llu "
+      "failed=%d lmem_register_us=%.1f\n",
+      role, static_cast<unsigned long long>(info->in.mem.size),
+      result != 0 || *handle == nullptr || info->out.key.size == 0U ||
+          info->out.key.size > kMemKeyBytes,
+      register_us);
+  errno = error;
+  return result;
+}
+
 bool LoadDirectHccp(DirectHccpApi* api) {
   if (api == nullptr) return false;
   for (const char* candidate : {"libra.so", "libra.so.0", "libhccp.so", "libhccp.so.0"}) {
@@ -131,7 +155,7 @@ bool LoadDirectHccp(DirectHccpApi* api) {
     if (api->library != nullptr) break;
   }
   if (api->library == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] dlopen direct RA ABI (libra.so) failed: %s\n", dlerror());
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== dlopen direct RA ABI (libra.so) failed: %s\n", dlerror());
     return false;
   }
   const bool loaded =
@@ -158,7 +182,7 @@ bool LoadDirectHccp(DirectHccpApi* api) {
     *api = {};
     return false;
   }
-  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TRANSPORT_API_READY backend=RaCtx_no_HCOMM\n");
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TRANSPORT_API_READY backend=RaCtx_no_HCOMM\n");
   return true;
 }
 
@@ -205,9 +229,9 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
     }
     return resources.device_context;
   };
-  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=begin\n");
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=begin\n");
   if (api.qp_unimport != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
       void* context = context_for_worker(worker);
@@ -218,7 +242,7 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
     }
   }
   if (api.qp_destroy != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
@@ -228,7 +252,7 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
     }
   }
   if (api.cq_destroy != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
       void* context = context_for_worker(worker);
@@ -240,7 +264,7 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
   }
   if (resources.paths != nullptr) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_eid_paths count=%u\n",
+                 "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=release_eid_paths count=%u\n",
                  resources.path_count);
     for (std::uint32_t reverse = resources.path_count; reverse > 0U; --reverse) {
       DeviceAivPathResources& path = resources.paths[reverse - 1U];
@@ -265,28 +289,28 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
     if (api.rmem_unimport != nullptr && resources.device_context != nullptr &&
         resources.device_peer_memory_import != nullptr) {
       std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_peer_memory\n");
+                   "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=unimport_peer_memory\n");
       (void)api.rmem_unimport(resources.device_context,
                               resources.device_peer_memory_import);
     }
     if (api.token_free != nullptr && resources.device_context != nullptr &&
         resources.device_transport_token_handle != nullptr) {
       std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
+                   "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
       (void)api.token_free(resources.device_context,
                            resources.device_transport_token_handle);
     }
     if (api.ctx_deinit != nullptr && resources.device_context != nullptr) {
       std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
+                   "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
       (void)api.ctx_deinit(resources.device_context);
     }
   }
   if (resources.session != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_session\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=release_session\n");
     ReleaseDirectHccpSession(resources.session);
   }
-  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=close_dynamic_libraries\n");
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_TEARDOWN phase=close_dynamic_libraries\n");
   CloseDirectHccp(&api);
 }
 
@@ -299,16 +323,16 @@ bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
   if (!link_status.ok() || region.length == 0U || region.token_id == 0U || region.token_value == 0U ||
       region.segment_key_bytes == 0U || region.segment_key_bytes > kMemKeyBytes) {
     const char* reason = link_status.ok() ? "invalid peer region descriptor" : link_status.message().c_str();
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_REGION_LOOKUP_FAILED base=0x%llx reason=%s\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_REGION_LOOKUP_FAILED base=0x%llx reason=%s\n",
                  static_cast<unsigned long long>(peer_base), reason);
     return false;
   }
   const std::uint32_t wqe_token_id = region.token_id >> 8U;
   if (wqe_token_id == 0U) {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_REGION_TOKEN_INVALID raw_token_id=0x%x\n", region.token_id);
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_REGION_TOKEN_INVALID raw_token_id=0x%x\n", region.token_id);
     return false;
   }
-  std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_DDR_TOKEN raw_token_id=0x%x wqe_token_id=0x%x\n",
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_DDR_TOKEN raw_token_id=0x%x wqe_token_id=0x%x\n",
                region.token_id, wqe_token_id);
   *memory = {};
   memory->registered_address = region.base;
@@ -347,16 +371,16 @@ bool ImportPeerJetty(const DirectHccpApi& api, void* context, const std::uint8_t
   import_info->in.ub.exp_import_cfg.rx_psn = peer_psn;
   import_info->in.ub.tp_type = CtpProtocolType();
   std::fprintf(stderr,
-               "[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=%s local_tp=0x%llx peer_tp=0x%llx tx_psn=0x%x rx_psn=0x%x\n",
+               "==============[KVAF_AIV]=========== PEER_LINK_JETTY_IMPORT_ATTEMPT role=%s local_tp=0x%llx peer_tp=0x%llx tx_psn=0x%x rx_psn=0x%x\n",
                role, static_cast<unsigned long long>(local_tp), static_cast<unsigned long long>(peer_tp),
                local_psn, peer_psn);
   const int ret = api.qp_import(context, import_info, target_jetty);
   if (ret != 0 || *target_jetty == nullptr || import_info->out.ub.tpn == 0U) {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_JETTY_IMPORT_FAILED role=%s ret=%d target=%p tpn=%u\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_JETTY_IMPORT_FAILED role=%s ret=%d target=%p tpn=%u\n",
                  role, ret, *target_jetty, import_info->out.ub.tpn);
     return false;
   }
-  std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=%s tpn=%u\n", role,
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_JETTY_IMPORT_READY role=%s tpn=%u\n", role,
                import_info->out.ub.tpn);
   return true;
 }
@@ -375,7 +399,7 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
                                  kAivWqebbsPerWqe * kAivWqeBytes;
   if (sq_bytes > UINT32_MAX) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_AIV_DEV_USED_QUEUE_INVALID role=%s sq_depth=%u requested_sq_bytes=%llu\n",
+                 "==============[KVAF_AIV]=========== DIRECT_AIV_DEV_USED_QUEUE_INVALID role=%s sq_depth=%u requested_sq_bytes=%llu\n",
                  role, sq_depth, static_cast<unsigned long long>(sq_bytes));
     return false;
   }
@@ -407,7 +431,7 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
   if (ret != 0 || *jetty_handle == nullptr || jetty_info->key.size == 0U ||
       jetty_info->key.size > kQpKeyBytes) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_JETTY_CREATE_FAILED role=%s mode=%u sq_depth=%u sqebb_num=%u "
+                 "==============[KVAF_AIV]=========== DIRECT_JETTY_CREATE_FAILED role=%s mode=%u sq_depth=%u sqebb_num=%u "
                  "cstm_flag=%u requested_sq_bytes=%u ret=%d handle=%p key_bytes=%u\n",
                  role, attr.ub.mode, sq_depth, attr.ub.ext_mode.sqebb_num,
                  attr.ub.ext_mode.cstm_flag, attr.ub.ext_mode.sq.buffer_size,
@@ -417,7 +441,7 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
   if (jetty_info->ub.sq_buffer_va == 0U || jetty_info->ub.db_addr == 0U ||
       jetty_info->ub.wqebb_size != kAivWqeBytes) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_USER_CTL_QUEUE_CONTRACT_INVALID role=%s sq_va=0x%llx db_va=0x%llx "
+                 "==============[KVAF_AIV]=========== DIRECT_USER_CTL_QUEUE_CONTRACT_INVALID role=%s sq_va=0x%llx db_va=0x%llx "
                  "returned_wqebb_bytes=%llu expected_wqebb_bytes=%u\n",
                  role, static_cast<unsigned long long>(jetty_info->ub.sq_buffer_va),
                  static_cast<unsigned long long>(jetty_info->ub.db_addr),
@@ -426,14 +450,14 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
     return false;
   }
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_JETTY_READY role=%s mode=%u cstm_flag=%u jetty_id=%u sq_va=0x%llx "
+               "==============[KVAF_AIV]=========== DIRECT_JETTY_READY role=%s mode=%u cstm_flag=%u jetty_id=%u sq_va=0x%llx "
                "db_va=0x%llx returned_wqebb_bytes=%llu\n",
                role, attr.ub.mode, attr.ub.ext_mode.cstm_flag, jetty_info->ub.id,
                static_cast<unsigned long long>(jetty_info->ub.sq_buffer_va),
                static_cast<unsigned long long>(jetty_info->ub.db_addr),
                static_cast<unsigned long long>(jetty_info->ub.wqebb_size));
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_USER_CTL_QUEUE_CONTRACT role=%s profile=aiv_dev_used "
+               "==============[KVAF_AIV]=========== DIRECT_USER_CTL_QUEUE_CONTRACT role=%s profile=aiv_dev_used "
                "sq_depth_entries=%u sqebb_num=%u requested_sq_buffer_bytes=%u "
                "returned_sq_va=0x%llx returned_wqebb_bytes=%llu db_addr_is_post_offset=1 sq_cstm=0\n",
                role, sq_depth, attr.ub.ext_mode.sqebb_num, attr.ub.ext_mode.sq.buffer_size,
@@ -465,7 +489,7 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
   std::uint64_t peer_tp_handle = 0U;
   std::uint32_t peer_psn = 0U;
   std::fprintf(stderr,
-               "[KVAF_AIV] PEER_LINK_CHANNEL_REQUEST role=%s local_qp_key_bytes=%u\n",
+               "==============[KVAF_AIV]=========== PEER_LINK_CHANNEL_REQUEST role=%s local_qp_key_bytes=%u\n",
                request.role, request.local_jetty_info->key.size);
   const Status status = request.link->CreateChannel(
       request.peer_base, request.local_jetty_info->key.value,
@@ -473,7 +497,7 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
       request.peer_memory->token_value, local_tp_handle, local_psn, &peer_qp_key,
       &peer_qp_key_bytes, &peer_tp_handle, &peer_psn);
   if (!status.ok()) {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_CHANNEL_FAILED role=%s reason=%s\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_CHANNEL_FAILED role=%s reason=%s\n",
                  request.role, status.message().c_str());
     return false;
   }
@@ -483,7 +507,7 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
                        request.role, &channel->local_import_info,
                        &channel->local_target_jetty)) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] PEER_LINK_CHANNEL_FAILED role=%s reason=import_peer_jetty\n",
+                 "==============[KVAF_AIV]=========== PEER_LINK_CHANNEL_FAILED role=%s reason=import_peer_jetty\n",
                  request.role);
     return false;
   }

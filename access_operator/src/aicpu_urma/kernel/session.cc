@@ -222,7 +222,7 @@ static bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status
         status.result = status.error_number = 0;
         status.detail[0] = '\0';
         std::memcpy(status.eid, state.context->eid.raw, 16);
-        std::fprintf(stderr, "[KVAF_AICPU] UMDK_EID_SELECTED source=host device=%s eid_index=%u eid=",
+        std::fprintf(stderr, "==============[KVAF_AICPU]=========== UMDK_EID_SELECTED source=host device=%s eid_index=%u eid=",
                      device->name, eid.eid_index);
         for (auto byte : status.eid) std::fprintf(stderr, "%02x", byte);
         std::fprintf(stderr, "\n");
@@ -235,6 +235,38 @@ static bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status
   for (unsigned i = 0; i < 16; ++i) std::snprintf(expected + i * 2, 3, "%02x", args.local_eid[i]);
   errno = ENODEV;
   return Fail(status, "Host EID not exposed by UMDK", -1, expected);
+}
+
+static bool RegisterLocalBuffer(const UmdkControlArgs& args, UmdkControlStatus& status,
+                                urma_token_id_t*& token, urma_target_seg_t*& segment) {
+  const bool timing = args.hbm_timing == kUmdkHbmTimingMagic;
+  if (timing) status.hbm_timing_magic = kUmdkHbmTimingMagic;
+  Stage(status, "urma_alloc_token_id");
+  auto start = timing ? NowNs() : 0U;
+  token = state.api.urma_alloc_token_id(state.context);
+  if (timing) {
+    const int error = errno;
+    status.token_alloc_ns = NowNs() - start;
+    errno = error;
+  }
+  if (token == nullptr) return Fail(status, "urma_alloc_token_id");
+
+  urma_seg_cfg_t cfg{};
+  cfg.va = args.local_buffer & ~std::uint64_t{4095};
+  cfg.len = args.buffer_bytes + args.local_buffer - cfg.va;
+  cfg.token_id = token;
+  cfg.token_value.token = args.token;
+  cfg.flag.value = MemRegFlags(true);
+  Stage(status, "urma_register_seg (local HBM)");
+  start = timing ? NowNs() : 0U;
+  segment = state.api.urma_register_seg(state.context, &cfg);
+  if (timing) {
+    const int error = errno;
+    status.segment_register_ns = NowNs() - start;
+    errno = error;
+  }
+  if (segment == nullptr) return Fail(status, "urma_register_seg (local HBM)");
+  return true;
 }
 
 bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
@@ -260,23 +292,7 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
     if (!CreateQueue(args, status, state.data_queues[index])) return false;
     if (index != 0 && !CreateQueue(args, status, state.control_queues[index])) return false;
   }
-  Stage(status, "urma_alloc_token_id");
-  state.token = state.api.urma_alloc_token_id(state.context);
-  if (state.token == nullptr) return Fail(status, "urma_alloc_token_id");
-  urma_seg_cfg_t cfg{};
-  cfg.va = args.local_buffer & ~std::uint64_t{4095};
-  cfg.len = args.buffer_bytes + args.local_buffer - cfg.va;
-  cfg.token_id = state.token;
-  cfg.token_value.token = args.token;
-  cfg.flag.value = MemRegFlags(true);
-
-  Stage(status, "urma_register_seg (local HBM)");
-  state.local = state.api.urma_register_seg(state.context, &cfg);
-  if (state.local == nullptr) {
-    Fail(status, "urma_register_seg (local HBM)");
-
-    return false;
-  }
+  if (!RegisterLocalBuffer(args, status, state.token, state.local)) return false;
   state.buffer = args.local_buffer;
   state.buffer_bytes = args.buffer_bytes;
   if (!DescribeWorker(args, kUmdkControlQueueIndex, status)) return false;
@@ -336,20 +352,10 @@ bool RegisterBuffer(const UmdkControlArgs& args, UmdkControlStatus& status) {
       args.local_buffer > UINT64_MAX - args.buffer_bytes)
     return Fail(status, "invalid UMDK HBM registration");
   if (LocalSegment(args.local_buffer, args.buffer_bytes) != nullptr) return true;
-  Stage(status, "urma_alloc_token_id");
-  auto* token = state.api.urma_alloc_token_id(state.context);
-  if (token == nullptr) return Fail(status, "urma_alloc_token_id");
-  urma_seg_cfg_t cfg{};
-  cfg.va = args.local_buffer & ~std::uint64_t{4095};
-  cfg.len = args.buffer_bytes + args.local_buffer - cfg.va;
-  cfg.token_id = token;
-  cfg.token_value.token = args.token;
-  cfg.flag.value = MemRegFlags(true);
-  Stage(status, "urma_register_seg (local HBM)");
-  auto* segment = state.api.urma_register_seg(state.context, &cfg);
-  if (segment == nullptr) {
-    Fail(status, "urma_register_seg (local HBM)");
-    (void)state.api.urma_free_token_id(token);
+  urma_token_id_t* token = nullptr;
+  urma_target_seg_t* segment = nullptr;
+  if (!RegisterLocalBuffer(args, status, token, segment)) {
+    if (token != nullptr) (void)state.api.urma_free_token_id(token);
     return false;
   }
   state.buffers.push_back({args.local_buffer, args.buffer_bytes, token, segment});

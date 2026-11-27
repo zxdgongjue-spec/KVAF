@@ -87,7 +87,7 @@ extern "C" int32_t KvafExecuteBatchGetRangesLaunch(
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_ranges_function && aclrtBinaryGetFunction(g_binary,
           "KvafExecuteBatchGetRangesAivKernelV2", &g_ranges_function) != ACL_SUCCESS) {
-      std::fprintf(stderr, "[KVAF_AIV] missing range Get kernel; rebuild the NPU kernel object\n");
+      std::fprintf(stderr, "==============[KVAF_AIV]=========== missing range Get kernel; rebuild the NPU kernel object\n");
       return KVAF_BATCH_GET_RUNTIME_ERROR;
     }
   }

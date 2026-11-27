@@ -54,7 +54,7 @@ Status RuntimeService::ServeConnections(const std::function<void(int)>& handler)
     return Status::Internal("cannot listen on " + options_.address + ":" +
                             std::to_string(options_.port) + ": " + std::strerror(errno));
   }
-  std::fprintf(stderr, "[KVAF_CPU] LISTEN address=%s port=%u\n", options_.address.c_str(), options_.port);
+  std::fprintf(stderr, "==============[KVAF_CPU]=========== LISTEN address=%s port=%u\n", options_.address.c_str(), options_.port);
   while (true) {
     const int connection = accept(listener, nullptr, nullptr);
     if (connection < 0) {

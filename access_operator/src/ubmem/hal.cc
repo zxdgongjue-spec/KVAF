@@ -13,14 +13,14 @@ constexpr std::uint64_t kHostUva = 1ULL << 10;
 template <typename T>
 bool Symbol(void* library, const char* name, T* result) {
   *result = reinterpret_cast<T>(dlsym(library, name));
-  if (*result == nullptr) std::fprintf(stderr, "[KVAF_UBMEM] missing HAL symbol %s\n", name);
+  if (*result == nullptr) std::fprintf(stderr, "==============[KVAF_UBMEM]=========== missing HAL symbol %s\n", name);
   return *result != nullptr;
 }
 }  // namespace
 
 Status HalError(const char* operation, int result) {
   const std::string message = std::string(operation) + " failed, ret=" + std::to_string(result);
-  std::fprintf(stderr, "[KVAF_UBMEM] %s\n", message.c_str());
+  std::fprintf(stderr, "==============[KVAF_UBMEM]=========== %s\n", message.c_str());
   return Status::Internal(message);
 }
 
@@ -32,7 +32,7 @@ Status Hal::Load(const std::string& path) {
   library_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (library_ == nullptr) {
     const std::string message = "cannot load " + path + ": " + dlerror();
-    std::fprintf(stderr, "[KVAF_UBMEM] %s\n", message.c_str());
+    std::fprintf(stderr, "==============[KVAF_UBMEM]=========== %s\n", message.c_str());
     return Status::NotFound(message);
   }
   if (!Symbol(library_, "halMemCreate", &create) ||

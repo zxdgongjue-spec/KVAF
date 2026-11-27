@@ -25,7 +25,7 @@ int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, acl
   const aclError result = aclrtLaunchKernelWithHostArgs(function, blocks, stream, &config,
                                                         arguments, bytes, nullptr, 0U);
   if (result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AICPU_URMA] kernel launch failed acl=%d\n",
+    std::fprintf(stderr, "==============[KVAF_AICPU_URMA]=========== kernel launch failed acl=%d\n",
                  static_cast<int>(result));
     return -1;
   }
@@ -38,12 +38,12 @@ bool LoadUmdkKernel(const char* json_path) {
   std::lock_guard<std::mutex> lock(kernel_mutex);
   char resolved[PATH_MAX];
   if (realpath(json_path, resolved) == nullptr) {
-    std::fprintf(stderr, "[KVAF_AICPU_URMA] missing kernel JSON path=%s\n", json_path);
+    std::fprintf(stderr, "==============[KVAF_AICPU_URMA]=========== missing kernel JSON path=%s\n", json_path);
     return false;
   }
   if (binary != nullptr) {
     if (loaded_path == resolved) return true;
-    std::fprintf(stderr, "[KVAF_AICPU_URMA] kernel already loaded from %s; requested %s\n",
+    std::fprintf(stderr, "==============[KVAF_AICPU_URMA]=========== kernel already loaded from %s; requested %s\n",
                  loaded_path.c_str(), resolved);
     return false;
   }
@@ -55,7 +55,7 @@ bool LoadUmdkKernel(const char* json_path) {
   options.numOpt = 1;
   aclrtBinHandle loaded = nullptr;
   if (aclrtBinaryLoadFromFile(resolved, &options, &loaded) != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AICPU_URMA] failed to load AICPU kernel path=%s\n", resolved);
+    std::fprintf(stderr, "==============[KVAF_AICPU_URMA]=========== failed to load AICPU kernel path=%s\n", resolved);
     if (loaded) (void)aclrtBinaryUnLoad(loaded);
     return false;
   }

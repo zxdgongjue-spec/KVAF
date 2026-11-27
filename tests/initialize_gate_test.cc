@@ -128,7 +128,7 @@ void CrossProcessExclusion(const std::string& path) {
       std::_Exit(0);
     }
     const auto line = logs.Line();
-    CHECK(line.find("[KVAF_INIT_GATE] event=wait") == 0U);
+    CHECK(line.find("==============[KVAF_INIT_GATE]=========== event=wait") == 0U);
     CHECK(line.find("device=3") != std::string::npos);
     CHECK(!events.Ready());
   }

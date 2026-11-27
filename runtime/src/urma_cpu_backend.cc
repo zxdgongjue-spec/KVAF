@@ -133,24 +133,24 @@ class UrmaResources {
     selected_device_name_ = device_name;
     device_ = urma_get_device_by_name(const_cast<char*>(device_name.c_str()));
     if (device_ == nullptr || device_->type != URMA_TRANSPORT_UB) {
-      Log("[KVAF_CPU] unusable UB device=%s\n", device_name.c_str());
+      Log("==============[KVAF_CPU]=========== unusable UB device=%s\n", device_name.c_str());
       return false;
     }
     context_ = urma_create_context(device_, eid_index);
     if (context_ == nullptr) {
-      Log("[KVAF_CPU] urma_create_context failed device=%s eid_index=%u errno=%d\n",
+      Log("==============[KVAF_CPU]=========== urma_create_context failed device=%s eid_index=%u errno=%d\n",
           selected_device_name_.c_str(), eid_index, errno);
       return false;
     }
     get_tp_list_ = reinterpret_cast<urma::GetTpList>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<urma::ImportJettyEx>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
-      Log("[KVAF_CPU] liburma lacks required expanded CTP APIs get_tp_list=%p import_jetty_ex=%p\n",
+      Log("==============[KVAF_CPU]=========== liburma lacks required expanded CTP APIs get_tp_list=%p import_jetty_ex=%p\n",
           reinterpret_cast<void*>(get_tp_list_), reinterpret_cast<void*>(import_jetty_ex_));
       return false;
     }
     eid_index_ = eid_index;
-    Log("[KVAF_CPU] CANDIDATE_READY ub_device=%s eid_index=%u eid=", selected_device_name_.c_str(), eid_index);
+    Log("==============[KVAF_CPU]=========== CANDIDATE_READY ub_device=%s eid_index=%u eid=", selected_device_name_.c_str(), eid_index);
     for (uint8_t byte : context_->eid.raw) {
       std::fprintf(stderr, "%02x", byte);
     }
@@ -187,7 +187,7 @@ class UrmaResources {
     }
     auto* target = urma::ImportJetty(import_jetty_ex_, context_, key, token_value,
                                      local_tp, peer_tp, local_psn, peer_psn);
-    if (!target) Log("[KVAF_CPU] urma_import_jetty_ex failed errno=%d\n", errno);
+    if (!target) Log("==============[KVAF_CPU]=========== urma_import_jetty_ex failed errno=%d\n", errno);
     return target;
   }
 
@@ -215,7 +215,7 @@ class UrmaResourcePool {
                   uint32_t requested_eid_index) {
     const Status status = discovery_.Initialize(requested_device, eid_index_requested, requested_eid_index);
     if (!status.ok()) {
-      Log("[KVAF_CPU] candidate discovery failed: %s\n", status.message().c_str());
+      Log("==============[KVAF_CPU]=========== candidate discovery failed: %s\n", status.message().c_str());
       return false;
     }
     for (const auto& discovered : discovery_.candidates()) {
@@ -231,7 +231,7 @@ class UrmaResourcePool {
       if (index != 0U && candidate.device_name != previous_device) ++device_id;
       candidate.device_id = device_id;
       previous_device = candidate.device_name;
-      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u device_id=%u ub_device=%s "
+      Log("==============[KVAF_CPU]=========== CANDIDATE_DISCOVERED id=%u device_id=%u ub_device=%s "
           "eid_index=%u eid=", candidate.id, candidate.device_id,
           candidate.device_name.c_str(), candidate.eid_index);
       for (uint8_t byte : candidate.eid) {
@@ -270,7 +270,7 @@ class UrmaResourcePool {
 
   UrmaResources* Get(uint32_t candidate_id) {
     if (candidate_id >= candidates_.size()) {
-      Log("[KVAF_CPU] CANDIDATE_REJECTED id=%u reason=out_of_range count=%zu\n", candidate_id,
+      Log("==============[KVAF_CPU]=========== CANDIDATE_REJECTED id=%u reason=out_of_range count=%zu\n", candidate_id,
           candidates_.size());
       return nullptr;
     }
@@ -279,19 +279,19 @@ class UrmaResourcePool {
       return candidate.resources.get();
     }
     if (candidate.unavailable) {
-      Log("[KVAF_CPU] CANDIDATE_REJECTED id=%u reason=initialization_failed\n", candidate_id);
+      Log("==============[KVAF_CPU]=========== CANDIDATE_REJECTED id=%u reason=initialization_failed\n", candidate_id);
       return nullptr;
     }
     auto resources = std::make_unique<UrmaResources>();
     if (!resources->Initialize(candidate.device_name, candidate.eid_index)) {
       candidate.unavailable = true;
-      Log("[KVAF_CPU] CANDIDATE_UNAVAILABLE id=%u ub_device=%s eid_index=%u\n", candidate.id,
+      Log("==============[KVAF_CPU]=========== CANDIDATE_UNAVAILABLE id=%u ub_device=%s eid_index=%u\n", candidate.id,
           candidate.device_name.c_str(), candidate.eid_index);
       return nullptr;
     }
     if (std::memcmp(resources->context()->eid.raw, candidate.eid.data(), candidate.eid.size()) != 0) {
       candidate.unavailable = true;
-      Log("[KVAF_CPU] CANDIDATE_UNAVAILABLE id=%u reason=eid_changed ub_device=%s eid_index=%u\n",
+      Log("==============[KVAF_CPU]=========== CANDIDATE_UNAVAILABLE id=%u reason=eid_changed ub_device=%s eid_index=%u\n",
           candidate.id, candidate.device_name.c_str(), candidate.eid_index);
       return nullptr;
     }
@@ -358,7 +358,7 @@ class CpuGatherWorker {
         valid = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
         if (valid) executor_.Copy();
       } catch (const std::exception& error) {
-        Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
+        Log("==============[KVAF_CPU]=========== GatherRead failed: %s\n", error.what());
         valid = false;
       }
       if (!valid && address % 64U == 0U &&
@@ -465,7 +465,7 @@ class CpuService {
     region->token_value = NextToken();
     region->token_id = urma_alloc_token_id(resources->context());
     if (region->token_id == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
+      Log("==============[KVAF_CPU]=========== REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
@@ -488,7 +488,7 @@ class CpuService {
     config.flag = flag;
     region->segment = urma_register_seg(resources->context(), &config);
     if (region->segment == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
+      Log("==============[KVAF_CPU]=========== REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
           " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
           region->memory, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
       ReleaseRegion(region.get());
@@ -508,14 +508,14 @@ class CpuService {
     std::memcpy(response->peer_eid, region->segment->seg.ubva.eid.raw, kEidBytes);
     std::memcpy(response->segment_key, &region->segment->seg, kSegBytes);
     if (response->peer_base == 0U || response->token_id == 0U) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
+      Log("==============[KVAF_CPU]=========== REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
           " token_id=0x%x\n",
         response->peer_base, response->token_id);
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
     regions_.emplace(id, std::move(region));
-    Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
+    Log("==============[KVAF_CPU]=========== REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
         "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
         response->peer_base, response->token_id, flag.value, MemoryPageModeName());
@@ -530,7 +530,7 @@ class CpuService {
                     [](uint8_t byte) { return byte == 0U; }) ||
         request.peer_token_value == 0U || request.local_tp_handle == 0U || request.local_psn == 0U ||
         (request.reserved & ~peer::kChannelSharedTp) != 0U) {
-      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_key_bytes=%u/%u token=0x%x peer_tp=0x%llx "
+      Log("==============[KVAF_CPU]=========== CHANNEL_REJECTED key_bytes=%u expected_key_bytes=%u/%u token=0x%x peer_tp=0x%llx "
           "peer_psn=0x%x\n",
           request.local_qp_key_bytes, kJettyKeyBytes, kNpuJettyKeyBytes, request.peer_token_value,
           static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
@@ -541,7 +541,7 @@ class CpuService {
       return Result::kNotFound;
     }
     Region& region = *found->second;
-    Log("[KVAF_CPU] CHANNEL_REQUEST session=%" PRIu64 " key_bytes=%u token=0x%x npu_tp=0x%llx npu_psn=0x%x npu_eid=",
+    Log("==============[KVAF_CPU]=========== CHANNEL_REQUEST session=%" PRIu64 " key_bytes=%u token=0x%x npu_tp=0x%llx npu_psn=0x%x npu_eid=",
         region.id, request.local_qp_key_bytes, request.peer_token_value,
         static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
     for (uint8_t byte : request.local_eid) {
@@ -585,7 +585,7 @@ class CpuService {
     const bool tp_reused = shared != nullptr;
     region.channels.push_back(std::move(channel));
     const auto& connected = region.channels.back();
-    Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
+    Log("==============[KVAF_CPU]=========== CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
         "cpu_psn=0x%x cpu_cq_id=%u cpu_jfr_id=%u peer_tp=0x%llx tp_shared=%u tp_reused=%u\n",
         region.id, connected.local_jetty->jetty_id.id, connected.remote_jetty->id.id,
         static_cast<unsigned long long>(connected.tp.local), connected.tp.local_psn,
@@ -600,7 +600,7 @@ class CpuService {
       return Result::kNotFound;
     }
     if (StopCpuPushGet(id) != Result::kOk) return Result::kResourceError;
-    Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
+    Log("==============[KVAF_CPU]=========== REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
         found->second->channels.size());
     ReleaseRegion(found->second.get());
     regions_.erase(found);
@@ -621,7 +621,7 @@ class CpuService {
           region.memory, region.base, region.bytes, gather_threads_,
           min_bytes_per_thread_, gather_mode_);
     } catch (const std::exception& error) {
-      Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
+      Log("==============[KVAF_CPU]=========== GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
     }
     return Result::kOk;
@@ -645,7 +645,7 @@ class CpuService {
             gather_mode_, control_address + lane * sizeof(peer::GatherControl)));
       }
     } catch (const std::exception& error) {
-      Log("[KVAF_CPU] GATHER_LANE_SETUP_FAILED reason=%s\n", error.what());
+      Log("==============[KVAF_CPU]=========== GATHER_LANE_SETUP_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
     }
     region.gather_lanes = std::move(created);
@@ -660,7 +660,7 @@ class CpuService {
     if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
     if (!request.source_bytes || request.source_bytes > region.bytes)
       return Result::kInvalidRequest;
-    Log("[KVAF_CPU] CPU_PUSH_OPEN session=%llu workers=%u token_bytes=%u hbm_bytes=%llu\n",
+    Log("==============[KVAF_CPU]=========== CPU_PUSH_OPEN session=%llu workers=%u token_bytes=%u hbm_bytes=%llu\n",
         static_cast<unsigned long long>(request.session_id), request.workers, request.token_bytes,
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<cpu_push::Transport>();
@@ -668,7 +668,7 @@ class CpuService {
         request, region.resources->tp_query(), region.resources->jetty_import(),
         NextPsn(), response);
     if (!status.ok()) {
-      Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
+      Log("==============[KVAF_CPU]=========== CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
       const auto stopped = transport->Shutdown();
       if (!stopped.ok()) {
         // Retain the failed setup in the region so STOP can retry teardown.
@@ -691,7 +691,7 @@ class CpuService {
     if (!push) return Result::kOk;
     const auto status = push->Stop();
     if (!status.ok()) {
-      Log("[KVAF_CPU] CPU_PUSH_STOP_FAILED reason=%s\n", status.message().c_str());
+      Log("==============[KVAF_CPU]=========== CPU_PUSH_STOP_FAILED reason=%s\n", status.message().c_str());
       return Result::kResourceError;
     }
     push.reset();
@@ -727,7 +727,7 @@ class CpuService {
             : kBasePageBytes;
     const int allocation_status = posix_memalign(&region->memory, alignment, bytes);
     if (allocation_status != 0 || region->memory == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
+      Log("==============[KVAF_CPU]=========== REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
           " alignment=%zu status=%d memory=%p page_mode=%s\n",
           region->bytes, alignment, allocation_status, region->memory,
           MemoryPageModeName());
@@ -735,7 +735,7 @@ class CpuService {
     }
     if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
       if (madvise(region->memory, bytes, MADV_HUGEPAGE) != 0) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
+        Log("==============[KVAF_CPU]=========== REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
             " errno=%d\n",
             region->bytes, errno);
         free(region->memory);
@@ -777,7 +777,7 @@ class CpuService {
     jfc_config.depth = kHostJfcDepth;
     *jfc = urma_create_jfc(resources->context(), &jfc_config);
     if (*jfc == nullptr) {
-      Log("[KVAF_CPU] urma_create_jfc failed scope=channel depth=%u errno=%d\n",
+      Log("==============[KVAF_CPU]=========== urma_create_jfc failed scope=channel depth=%u errno=%d\n",
           kHostJfcDepth, errno);
       return false;
     }
@@ -799,7 +799,7 @@ class CpuService {
     jfr_config.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
     *jfr = urma_create_jfr(resources->context(), &jfr_config);
     if (*jfr == nullptr) {
-      Log("[KVAF_CPU] urma_create_jfr failed depth=%u token=0x%x errno=%d\n", kHostJfrDepth,
+      Log("==============[KVAF_CPU]=========== urma_create_jfr failed depth=%u token=0x%x errno=%d\n", kHostJfrDepth,
           token_value, errno);
       (void)urma_delete_jfc(*jfc);
       *jfc = nullptr;
@@ -812,7 +812,7 @@ class CpuService {
     config.shared.jfc = *jfc;
     *jetty = urma_create_jetty(resources->context(), &config);
     if (*jetty == nullptr) {
-      Log("[KVAF_CPU] urma_create_jetty failed jfs_depth=%u jfr_depth=%u token=0x%x errno=%d\n",
+      Log("==============[KVAF_CPU]=========== urma_create_jetty failed jfs_depth=%u jfr_depth=%u token=0x%x errno=%d\n",
           kHostJfsDepth, kHostJfrDepth, token_value, errno);
       (void)urma_delete_jfr(*jfr);
       *jfr = nullptr;
@@ -844,7 +844,7 @@ class CpuService {
     if (region->push) {
       if (!region->push->Stop().ok()) {
         // The process must keep source DDR registered until all DMA stops.
-        Log("[KVAF_CPU] CPU_PUSH_RELEASE_FAILED source region retained\n");
+        Log("==============[KVAF_CPU]=========== CPU_PUSH_RELEASE_FAILED source region retained\n");
         return;
       }
       region->push.reset();

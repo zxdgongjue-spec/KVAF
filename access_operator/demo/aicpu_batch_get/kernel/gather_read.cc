@@ -289,6 +289,7 @@ std::uint32_t ReadStaging(const ReadSpans& spans,
   UmdkControlStatus error{};
   if (!ReadBatches(worker, spans, args, status, first, last, error, profile)) {
     std::fprintf(stderr,
+                 "==============[KVAF_AICPU_URMA]=========== "
                  "GATHER_UMDK_READ_ERROR worker=%u stage=%s result=%d errno=%d cq_status=%d "
                  "cq_context=%llu\n",
                  worker_index, error.stage, error.result, error.error_number,

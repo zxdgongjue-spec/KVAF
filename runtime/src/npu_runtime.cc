@@ -345,7 +345,7 @@ void AddNpuLocalEidCandidate(
   }
   candidates->push_back(NpuLocalEidCandidate{eid, std::move(source)});
   std::fprintf(stderr,
-               "[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERED physical_device=%u source=%s eid=%s\n",
+               "==============[KVAF_AIV]=========== PEER_LINK_NPU_EID_DISCOVERED physical_device=%u source=%s eid=%s\n",
                physical_device_id, candidates->back().source.c_str(),
                EidToHex(candidates->back().eid).c_str());
 }
@@ -373,7 +373,7 @@ bool DiscoverNpuLocalEidCandidates(std::uint32_t logical_device_id,
                             "hccl_clos_pg_" + std::to_string(index), candidates);
   }
   if (clos_eids.empty()) {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERY_UNAVAILABLE path=%s reason=%s\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_NPU_EID_DISCOVERY_UNAVAILABLE path=%s reason=%s\n",
                  rootinfo.c_str(), clos_error.c_str());
   }
   std::array<std::uint8_t, peer::kEidBytes> pair_info_eid{};
@@ -382,7 +382,7 @@ bool DiscoverNpuLocalEidCandidates(std::uint32_t logical_device_id,
     AddNpuLocalEidCandidate(physical_device_id, pair_info_eid,
                             "asdrv_pair_info_device_eid", candidates);
   } else {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_NPU_EID_FALLBACK_UNAVAILABLE reason=%s\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== PEER_LINK_NPU_EID_FALLBACK_UNAVAILABLE reason=%s\n",
                  pair_info_error.c_str());
   }
   if (!candidates->empty()) return true;
@@ -592,11 +592,11 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
-  std::fprintf(stderr, "[KVAF] NPU_RUNTIME transport=%s aicpu_mode=%s device=%u cores=%u\n",
+  std::fprintf(stderr, "==============[KVAF]=========== NPU_RUNTIME transport=%s aicpu_mode=%s device=%u cores=%u\n",
       config.transport == Transport::kUbmem ? "ubmem" : "urma",
       aicpu ? config.aicpu_batch_get_mode.c_str() : "off", config.device_id, config.npu_core_count);
-  std::fprintf(stderr, "[KVAF] ALLOCATION_MODE mode=%s\n", AllocationModeName(config.allocation_mode));
-  if (aicpu) std::fprintf(stderr, "[KVAF] AICPU_PACKAGE root=%s json=%s\n",
+  std::fprintf(stderr, "==============[KVAF]=========== ALLOCATION_MODE mode=%s\n", AllocationModeName(config.allocation_mode));
+  if (aicpu) std::fprintf(stderr, "==============[KVAF]=========== AICPU_PACKAGE root=%s json=%s\n",
       impl_->kernel_package.cann_root.c_str(), impl_->kernel_package.json_path.c_str());
 }
 
@@ -724,7 +724,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                !device_filter_applied && has_n_side_allowlist;
   if (impl_->options.adaptive_ub_device && !tune_candidates) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
+                 "==============[KVAF_AIV]=========== UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
                  "reason=%s\n",
                  impl_->options.device_id,
                  device_filter_applied ? "k_side_device_filter"
@@ -850,7 +850,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
 #endif
         if (last.ok()) {
           std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
+                       "==============[KVAF_AIV]=========== UB_DEVICE_PROBE_RESULT device_id=%u "
                        "ub_device=%s miss_count=%u cycles=%.0f\n",
                        impl_->options.device_id,
                        peer_candidate_device_names[peer_candidate].c_str(),
@@ -861,14 +861,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok()) {
         if (tune_candidates) {
           std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u "
+                       "==============[KVAF_AIV]=========== UB_DEVICE_SELECTED device_id=%u "
                        "ub_device=%s cycles=%.0f\n",
                        impl_->options.device_id,
                        peer_candidate_device_names[peer_candidate].c_str(),
                        *cycles);
         } else if (fixed_peer_device) {
           std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u ub_device=%s\n",
+                       "==============[KVAF_AIV]=========== UB_DEVICE_REUSED device_id=%u ub_device=%s\n",
                        impl_->options.device_id,
                        impl_->options.peer_ub_device.c_str());
         }
@@ -966,7 +966,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
+                 "==============[KVAF_AIV]=========== UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
                  "pairs=%zu token_bytes=%u tokens_per_block=%u miss_count=%u "
                  "aiv_cores=%u jettys_per_core=%u warmup=%u samples=%u\n",
                  impl_->options.device_id, device_names[device].c_str(),

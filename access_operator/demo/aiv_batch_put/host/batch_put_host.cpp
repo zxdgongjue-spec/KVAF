@@ -97,7 +97,7 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
     wqe_remote_eid[index] = ra_host_eid[hccp::kEidBytes - 1U - index];
   }
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_AIV_WQE_EID_ENCODING format=reverse ra_host_eid=%s wqe_remote_eid=%s\n",
+      "==============[KVAF_AIV]=========== DIRECT_AIV_WQE_EID_ENCODING format=reverse ra_host_eid=%s wqe_remote_eid=%s\n",
       EidToHex(ra_host_eid).c_str(), EidToHex(wqe_remote_eid).c_str());
   return wqe_remote_eid;
 }
@@ -113,12 +113,12 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   std::memcpy(attr.ub.eid.raw, eid.data(), eid.size());
   const int ret = api.ctx_init(&cfg, &attr, context);
   if (ret != 0 || *context == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_CONTEXT_FAILED role=%s mode=%d physical=%u ret=%d context=%p\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_HCCP_CONTEXT_FAILED role=%s mode=%d physical=%u ret=%d context=%p\n",
                  role, mode, physical_device_id, ret, *context);
     return false;
   }
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_HCCP_CONTEXT_READY role=%s mode=%d physical=%u context=%p\n",
+      "==============[KVAF_AIV]=========== DIRECT_HCCP_CONTEXT_READY role=%s mode=%d physical=%u context=%p\n",
       role, mode, physical_device_id, *context);
   return true;
 }
@@ -128,12 +128,12 @@ bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, vo
   hccp::TokenId raw{};
   const int ret = api.token_alloc(context, &raw, token_handle);
   if (ret != 0 || *token_handle == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_TOKEN_ALLOC_FAILED role=%s ret=%d handle=%p\n", role, ret,
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_TOKEN_ALLOC_FAILED role=%s ret=%d handle=%p\n", role, ret,
                  *token_handle);
     return false;
   }
   *token_id = raw.token_id >> kTokenIdShift;
-  hccp::VerboseLog("[KVAF_AIV] DIRECT_TOKEN_READY role=%s token_id=0x%x\n", role,
+  hccp::VerboseLog("==============[KVAF_AIV]=========== DIRECT_TOKEN_READY role=%s token_id=0x%x\n", role,
                    *token_id);
   return true;
 }
@@ -166,10 +166,10 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   info.in.ub.flags = hccp::MemRegFlags(true);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
-  const int ret = api.lmem_register(context, &info, &memory->handle);
+  const int ret = hccp::RegisterLocalHbm(api, context, &info, &memory->handle, role);
   if (ret != 0 || memory->handle == nullptr || info.out.key.size == 0U || info.out.key.size > hccp::kMemKeyBytes) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_MEMORY_REGISTER_FAILED role=%s ret=%d handle=%p key_bytes=%u addr=0x%llx "
+                 "==============[KVAF_AIV]=========== DIRECT_MEMORY_REGISTER_FAILED role=%s ret=%d handle=%p key_bytes=%u addr=0x%llx "
                  "bytes=%llu\n",
                  role, ret, memory->handle, info.out.key.size, static_cast<unsigned long long>(aligned_address),
                  static_cast<unsigned long long>(aligned_bytes));
@@ -182,7 +182,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
+      "==============[KVAF_AIV]=========== DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
       static_cast<unsigned long long>(aligned_bytes));
   return true;
@@ -197,10 +197,10 @@ bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMem
   info.in.ub.token_value = remote.token_value;
   const int ret = api.rmem_import(context, &info, import_handle);
   if (ret != 0 || *import_handle == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_REMOTE_DDR_IMPORT_FAILED ret=%d handle=%p\n", ret, *import_handle);
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_REMOTE_DDR_IMPORT_FAILED ret=%d handle=%p\n", ret, *import_handle);
     return false;
   }
-  hccp::VerboseLog("[KVAF_AIV] DIRECT_REMOTE_DDR_IMPORTED target_seg=0x%llx\n",
+  hccp::VerboseLog("==============[KVAF_AIV]=========== DIRECT_REMOTE_DDR_IMPORTED target_seg=0x%llx\n",
                    static_cast<unsigned long long>(info.out.ub.target_seg_handle));
   return true;
 }
@@ -216,12 +216,12 @@ bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t d
   info->in.ub.flag = 0U;
   const int ret = api.cq_create(context, info, handle);
   if (ret != 0 || *handle == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_CQ_CREATE_FAILED role=%s mode=%u depth=%u ret=%d handle=%p\n", role,
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_CQ_CREATE_FAILED role=%s mode=%u depth=%u ret=%d handle=%p\n", role,
                  mode, depth, ret, *handle);
     return false;
   }
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_CQ_READY role=%s mode=%u jfc_id=%u cq_va=0x%llx cqe_size=%u db_va=0x%llx\n",
+      "==============[KVAF_AIV]=========== DIRECT_CQ_READY role=%s mode=%u jfc_id=%u cq_va=0x%llx cqe_size=%u db_va=0x%llx\n",
       role, mode, info->out.id, static_cast<unsigned long long>(info->out.buffer_addr),
       info->out.cqe_size, static_cast<unsigned long long>(info->out.swdb_addr));
   return true;
@@ -338,14 +338,14 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
       static_cast<uint64_t>(state->worker_count) * sizeof(KvafBatchPutQueueState);
 
   if (!hccp::GetCurrentNpuPhysicalDeviceId(&physical_device_id)) {
-    std::fprintf(stderr, "[KVAF_AIV] unable to resolve physical device id from selected ACL device\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== unable to resolve physical device id from selected ACL device\n");
     result = KVAF_BATCH_PUT_EID_ERROR;
     goto failed;
   }
   state->physical_device_id = physical_device_id;
   std::memcpy(device_eid.data(), peer_local_eid, device_eid.size());
   hccp::VerboseLog(
-      "[KVAF_AIV] PEER_LINK_LOCAL_EID_READY physical_device=%u eid=%s\n",
+      "==============[KVAF_AIV]=========== PEER_LINK_LOCAL_EID_READY physical_device=%u eid=%s\n",
       physical_device_id, EidToHex(device_eid).c_str());
   if (!hccp::LoadPeerMemory(state->peer_link, state->peer_memory_address,
                             &state->peer_memory, &peer_eid)) {
@@ -433,7 +433,7 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
       state->device_queue_state == nullptr ||
       aclrtMemset(state->device_queue_state, queue_bytes, 0, queue_bytes) != ACL_SUCCESS) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_QUEUE_STATE_ALLOC_FAILED cores=%u jettys_per_core=%u\n",
+                 "==============[KVAF_AIV]=========== DIRECT_QUEUE_STATE_ALLOC_FAILED cores=%u jettys_per_core=%u\n",
                  aiv_core_count, jettys_per_core);
     goto failed;
   }
@@ -474,7 +474,7 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
       ++existing->reference_count;
       *local_buffer = existing.get();
       hccp::VerboseLog(
-          "[KVAF_AIV] DIRECT_LOCAL_BUFFER_CACHE_HIT input=%p bytes=%llu refs=%u\n",
+          "==============[KVAF_AIV]=========== DIRECT_LOCAL_BUFFER_CACHE_HIT input=%p bytes=%llu refs=%u\n",
           input_device, static_cast<unsigned long long>(input_device_bytes),
           existing->reference_count);
       return KVAF_BATCH_PUT_SUCCESS;
@@ -527,7 +527,7 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   *local_buffer = candidate.get();
   transport->local_buffers.push_back(std::move(candidate));
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_LOCAL_BUFFER_REGISTERED input=%p bytes=%llu cached_mrs=%zu\n",
+      "==============[KVAF_AIV]=========== DIRECT_LOCAL_BUFFER_REGISTERED input=%p bytes=%llu cached_mrs=%zu\n",
       input_device, static_cast<unsigned long long>(input_device_bytes),
       transport->local_buffers.size());
   return KVAF_BATCH_PUT_SUCCESS;
@@ -541,7 +541,7 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
   if (transport == nullptr) return;
   std::lock_guard<std::mutex> lock(transport->mutex);
   if (local_buffer->reference_count == 0U) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_LOCAL_BUFFER_RELEASE_WARNING reason=reference_underflow\n");
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_LOCAL_BUFFER_RELEASE_WARNING reason=reference_underflow\n");
     return;
   }
   --local_buffer->reference_count;
@@ -574,7 +574,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
       reinterpret_cast<void *>(arguments->core_status), status_bytes, 0,
       status_bytes, stream);
   if (seed_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=seed_status acl=%d\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_BATCH_PUT_RUNTIME_ERROR phase=seed_status acl=%d\n",
                  static_cast<int>(seed_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
@@ -585,7 +585,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   launch_args.jettys_per_core = transport->jettys_per_core;
   int32_t result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
   if (result != KVAF_BATCH_PUT_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   // Queue the completion status before synchronizing so the host pays one
@@ -594,13 +594,13 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
       core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status),
       status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream);
   if (status_copy_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
+    std::fprintf(stderr, "==============[KVAF_AIV]=========== DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }

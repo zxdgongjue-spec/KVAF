@@ -193,7 +193,7 @@ Status Connection::CreateQpResources() {
                                IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
     return Status::Internal("RoCE QP INIT failed");
   }
-  std::fprintf(stderr, "[KVAF_ROCE] device=%s port=%u gid_index=%u gid=%s qpn=%u mtu=%u read_depth=%u\n",
+  std::fprintf(stderr, "==============[KVAF_ROCE]=========== device=%s port=%u gid_index=%u gid=%s qpn=%u mtu=%u read_depth=%u\n",
                device_name_.c_str(), port_, gid_index_, GidText(local_).c_str(), local_.qpn, local_.mtu,
                local_.read_depth);
   return Status::OK();

@@ -114,10 +114,10 @@ int main(int argc, char** argv) {
   kvaf::CpuRuntime runtime;
   const kvaf::Status initialize = runtime.Initialize(cpu_options);
   if (!initialize.ok()) {
-    std::fprintf(stderr, "[KVAF_CPU] %s\n", initialize.message().c_str());
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== %s\n", initialize.message().c_str());
     return 1;
   }
   const kvaf::Status serve = kvaf::RuntimeService(service_options).Serve(runtime);
-  std::fprintf(stderr, "[KVAF_CPU] %s\n", serve.message().c_str());
+  std::fprintf(stderr, "==============[KVAF_CPU]=========== %s\n", serve.message().c_str());
   return 1;
 }

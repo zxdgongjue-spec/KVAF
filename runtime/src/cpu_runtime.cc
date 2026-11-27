@@ -93,7 +93,7 @@ Status CpuRuntime::ServeConnection(int fd) {
   auto status = impl_->urma.initialized() ? Status::OK()
       : impl_->urma.Initialize(impl_->options, impl_->next_session);
   if (status.ok()) return impl_->urma.ServeConnection(fd, header);
-  std::fprintf(stderr, "[KVAF_CPU] %s\n", status.message().c_str());
+  std::fprintf(stderr, "==============[KVAF_CPU]=========== %s\n", status.message().c_str());
 #endif
   // Match the requested response layout even when this backend is unavailable.
   switch (command) {

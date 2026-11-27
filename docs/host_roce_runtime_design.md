@@ -223,7 +223,7 @@ KVAF_ROCE_MR_TIMING=1 python tests/python/test_npu_batch_get.py --transport roce
 
 集成测试默认启用 RoCE MR 缓存。设置 `KVAF_ROCE_CACHE_HBM=0` 可以用同一测试测每批注册的基线。正常复用时，重复使用 `output_a` 的批次应打印 `phase=cache_hit`。
 
-客户端向 stderr 打印 `[KVAF_ROCE_MR]`。用同一个 `id` 配对 `phase=register` 和 `phase=deregister`。所有耗时单位都是微秒。
+客户端向 stderr 打印 `==============[KVAF_ROCE_MR]===========`。用同一个 `id` 配对 `phase=register` 和 `phase=deregister`。所有耗时单位都是微秒。
 
 | 字段 | 注册阶段 | 注销阶段 |
 | --- | --- | --- |

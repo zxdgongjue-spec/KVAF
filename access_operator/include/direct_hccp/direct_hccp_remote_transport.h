@@ -136,6 +136,8 @@ struct PeerChannel {
 };
 
 bool LoadDirectHccp(DirectHccpApi* api);
+int RegisterLocalHbm(const DirectHccpApi& api, void* context, MrRegInfo* info,
+                     void** handle, const char* role);
 void CloseDirectHccp(DirectHccpApi* api);
 
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id);

@@ -95,6 +95,18 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+### 本地 DDR 的分配和 HBM 注册计时
+
+在启动 NPU 应用前设置 `KVAF_URMA_MR_TIMING=1`，客户端 stderr 会输出
+`==============[KVAF_URMA_MR]===========`。每条记录包含缓冲区字节数和用途，耗时单位是微秒。缓存命中时不产生注册记录。
+
+- AIV 的 `lmem_register_us` 是 `RaCtxLmemRegister` 调用耗时。多 EID 的 Get 可为同一输出分别注册。
+- AICPU GatherRead 的 `token_alloc_us` 和 `register_seg_us` 是设备侧的 token 申请及 segment 注册耗时。
+  `control_us` 包括 Host 启动控制 kernel、等待并读回状态。`phase=prepare` 还包含设备侧 context
+  和队列初始化，统计单次注册的控制耗时时使用 `phase=register`。`device_timed=1` 表示设备包返回了分项计时。
+- UBmem 通过映射 CPU DDR 搬运数据。CPU 服务的 `DDR_EXPORTED alloc_us` 是 DDR 申请和导出耗时，
+  NPU 客户端的 `DEVICE_MAPPING_READY import_us` 是 Fabric handle 导入和映射耗时。
+
 ### 可选单机多进程初始化串行化
 
 同机、同一用户下，多个 worker 连接同一 CPU endpoint 时，可在启动 worker 前设置
@@ -104,7 +116,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 
 锁在参数校验后、启动 RPC 前获取，在 `Initialize` 返回时释放，不影响后续读写。
 `KVAF_INITIALIZE_LOCK_TIMEOUT_SECONDS` 默认为 1800，只限制等锁时长，超时则本次初始化失败。
-`[KVAF_INIT_GATE]` 日志分别记录等锁和持锁耗时；比较多卡启动时也应看所有 worker 的总就绪时间。
+`==============[KVAF_INIT_GATE]===========` 日志分别记录等锁和持锁耗时；比较多卡启动时也应看所有 worker 的总就绪时间。
 
 默认锁文件按用户和 endpoint 区分。若 worker 使用不同 endpoint 别名，可将
 `KVAF_INITIALIZE_LOCK_PATH` 设置为同一个绝对路径；容器中的 worker 必须共享同一锁文件。
@@ -166,7 +178,7 @@ Operator 内部诊断状态，不是 Python 参数或返回值。
 NPU BatchGet 的 `status` 和 `queue_state` 是 AIV kernel ABI 必需的内部 device
 buffer，由 `DefaultAccessOperator.Initialize` 申请并在 `Shutdown` 释放；Python
 和 `BatchGetRequest` 都不传它们。显式 `synchronize=True` 时，Operator 可读取
-其 completion status 并以 `[KVAF_AIV] BATCH_GET_DEVICE_ERROR` 诊断日志记录
+其 completion status 并以 `==============[KVAF_AIV]=========== BATCH_GET_DEVICE_ERROR` 诊断日志记录
 设备侧错误；它不会成为 Python 的额外返回值。
 
 ## 当前 POC 的 NPU AccessTable 边界

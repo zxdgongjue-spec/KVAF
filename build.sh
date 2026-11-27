@@ -110,7 +110,7 @@ ensure_umdk_source() {
   fi
   require_command git
   mkdir -p "$(dirname "$source_root")"
-  echo "[KVAF_BUILD] cloning UMDK branch $UMDK_BRANCH into $source_root"
+  echo "==============[KVAF_BUILD]=========== cloning UMDK branch $UMDK_BRANCH into $source_root"
   git clone --depth 1 --branch "$UMDK_BRANCH" "$UMDK_REPOSITORY" "$source_root"
   [[ -f "$source_root/include/urma_api.h" ]] || die "cloned UMDK is missing include/urma_api.h"
 }
@@ -127,13 +127,13 @@ build_cpu() {
     cmake -S "$KVAF_ROOT" -B "$build_dir" -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
       -DKVAF_CPU_ENABLE_URMA=OFF -DBUILD_TESTING=ON
     cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
-    echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
+    echo "==============[KVAF_BUILD]=========== CPU service: $build_dir/runtime/kvaf_cpu_service"
     return
   fi
   ensure_umdk_source "$umdk_root"
   urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
   if [[ -z "$urma_library" ]]; then
-    echo "[KVAF_BUILD] liburma.so not found; building bundled UMDK without TPS/HW drivers"
+    echo "==============[KVAF_BUILD]=========== liburma.so not found; building bundled UMDK without TPS/HW drivers"
     cmake -S "$umdk_root" -B "$umdk_build_dir" \
       -DTPS=disable -DHW=disable -DURMA_INSTALL=disable
     cmake --build "$umdk_build_dir" --target urma --parallel "$jobs"
@@ -147,7 +147,7 @@ build_cpu() {
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
-  echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
+  echo "==============[KVAF_BUILD]=========== CPU service: $build_dir/runtime/kvaf_cpu_service"
 }
 
 find_cann_root() {
@@ -187,7 +187,7 @@ build_npu() {
     require_command "$python_bin"
     python_bin="$(command -v "$python_bin")"
     if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
-      echo "[KVAF_BUILD] installing pybind11 for $python_bin"
+      echo "==============[KVAF_BUILD]=========== installing pybind11 for $python_bin"
       "$python_bin" -m pip install --user pybind11
     fi
     cmake_options+=("-DPython_EXECUTABLE=$python_bin" "-DPython3_EXECUTABLE=$python_bin"
@@ -222,10 +222,10 @@ build_npu() {
       ${package_options[@]+"${package_options[@]}"} --install \
       "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
   fi
-  if [[ "$build_python" == ON ]]; then echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"; fi
+  if [[ "$build_python" == ON ]]; then echo "==============[KVAF_BUILD]=========== NPU Python package: $build_dir/python/kvaf"; fi
   if [[ "$build_aiv" == ON ]]; then
-    echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
-    echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+    echo "==============[KVAF_BUILD]=========== BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
+    echo "==============[KVAF_BUILD]=========== BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
   fi
 }
 

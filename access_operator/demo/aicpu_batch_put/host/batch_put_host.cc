@@ -24,7 +24,8 @@ Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPut
       request.keys.size() != exec.put_desc->entries.size())
     return Status::InvalidArgument("invalid BatchPut layout");
   auto ready =
-      session_.Ensure(region.base, const_cast<void*>(request.input.data), request.input.bytes);
+      session_.Ensure(region.base, const_cast<void*>(request.input.data), request.input.bytes,
+                      "put_source");
   if (!ready.ok()) return ready;
   auto& transfers = host_transfers_;
   transfers.clear();

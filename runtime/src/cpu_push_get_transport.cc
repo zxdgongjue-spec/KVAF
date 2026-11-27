@@ -19,9 +19,9 @@ constexpr std::uint32_t kPostPayloadWrs = 128;
 constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
-    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s\n", stage);
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH_INIT stage=%s\n", stage);
   else
-    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s queue=%u\n", stage, queue);
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH_INIT stage=%s queue=%u\n", stage, queue);
   errno = 0;
 }
 }  // namespace
@@ -30,7 +30,7 @@ Transport::~Transport() {
   if (!Shutdown().ok()) {
     // Outstanding DMA must retain its WR/SGL storage and registered buffers.
     // Owners call Shutdown before destruction; a failed transport is quarantined.
-    std::fprintf(stderr, "CPU_PUSH: transport destroyed before successful Shutdown\n");
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH: transport destroyed before successful Shutdown\n");
     std::terminate();
   }
 }
@@ -58,7 +58,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
-  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u"
+  std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u"
                " post_payload_wrs=%u\n", max_sge_, max_bytes_, workers_, token_bytes_, kPostPayloadWrs);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
@@ -494,7 +494,7 @@ void Transport::PrintProfile() const {
   const auto build_ns = p.write_ns - p.post_ns - p.cq_wait_ns;
   const auto submit_ns = p.first_post_ns ? p.last_cqe_ns - p.first_post_ns : 0;
   std::fprintf(stderr,
-      "CPU_PUSH_PROFILE sequence=%" PRIu64 " workers=%u rows=%u bytes=%" PRIu64
+      "==============[KVAF_CPU]=========== CPU_PUSH_PROFILE sequence=%" PRIu64 " workers=%u rows=%u bytes=%" PRIu64
       " header_read_us=%.1f address_read_us=%.1f build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
       " write_us=%.1f submit_to_cqe_us=%.1f done_us=%.1f"
       " data_wrs=%u ready_wrs=%u post_calls=%u waves=%u tail_cqes=%u cpu_threads=%u plan_reused=%u optimized=%u\n",

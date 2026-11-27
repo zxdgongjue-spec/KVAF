@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kUmdkControlMagic = 0x4b564146554d444bULL;
+constexpr std::uint32_t kUmdkHbmTimingMagic = 0x4d525431U;
 // Setup slot for the control queue; data worker indices remain 0..7.
 constexpr std::uint32_t kUmdkControlQueueIndex = 8;
 enum class UmdkControlOp : std::uint32_t {
@@ -39,6 +41,7 @@ struct UmdkControlArgs {
   std::uint32_t transfer_count;
   // Selected by NpuRuntime; device/index are resolved internally from this EID.
   std::uint8_t local_eid[16];
+  std::uint32_t hbm_timing;
 };
 
 struct alignas(64) UmdkControlStatus {
@@ -47,7 +50,12 @@ struct alignas(64) UmdkControlStatus {
   std::uint32_t key_bytes;
   std::uint8_t eid[16], key[32];
   char stage[64], detail[256];
+  std::uint64_t hbm_timing_magic, token_alloc_ns, segment_register_ns;
 };
+
+// The optional timing fields occupy the previous trailing padding.
+static_assert(offsetof(UmdkControlArgs, hbm_timing) == 676 && sizeof(UmdkControlArgs) == 680);
+static_assert(offsetof(UmdkControlStatus, hbm_timing_magic) == 424 && sizeof(UmdkControlStatus) == 448);
 
 struct UmdkContext {
   std::uint64_t session{0U}, owner_pid{0U};

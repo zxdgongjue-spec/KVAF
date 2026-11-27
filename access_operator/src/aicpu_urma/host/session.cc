@@ -1,7 +1,9 @@
 #include "aicpu_urma/session.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -57,13 +59,36 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
   if (status.result != 0) {
     failed_ = true;
     std::fprintf(stderr,
-                 "UMDK_SETUP_ERROR op=%u workers=%u "
+                 "==============[KVAF_AICPU_URMA]=========== UMDK_SETUP_ERROR op=%u workers=%u "
                  "result=%d errno=%d stage=%s detail=%s\n",
                  static_cast<unsigned>(op), args_.worker_count, status.result,
                  status.error_number, status.stage, status.detail);
     return Status::Internal("UMDK setup/cleanup failed");
   }
   return Status::OK();
+}
+
+Status UmdkSession::RunHbmRegistration(UmdkControlOp op, UmdkControlStatus& status,
+                                       const char* buffer_role) {
+  const char* timing = std::getenv("KVAF_URMA_MR_TIMING");
+  if (timing == nullptr || std::strcmp(timing, "1") != 0) return Run(op, status);
+
+  args_.hbm_timing = kUmdkHbmTimingMagic;
+  const auto start = std::chrono::steady_clock::now();
+  auto result = Run(op, status);
+  const auto control_us = std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - start).count();
+  args_.hbm_timing = 0;
+  const bool device_timed = status.hbm_timing_magic == kUmdkHbmTimingMagic;
+  std::fprintf(stderr,
+      "==============[KVAF_URMA_MR]=========== backend=aicpu phase=%s role=%s session=%llu bytes=%llu "
+      "failed=%d control_us=%.1f device_timed=%d token_alloc_us=%.1f register_seg_us=%.1f\n",
+      op == UmdkControlOp::kPrepare ? "prepare" : "register", buffer_role,
+      static_cast<unsigned long long>(args_.session),
+      static_cast<unsigned long long>(args_.buffer_bytes), !result.ok(), control_us, device_timed,
+      device_timed ? status.token_alloc_ns / 1000.0 : 0.0,
+      device_timed ? status.segment_register_ns / 1000.0 : 0.0);
+  return result;
 }
 
 Status UmdkSession::Shutdown() {
@@ -94,7 +119,7 @@ Status UmdkSession::Load() {
 }
 
 Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,
-                           bool prepared_only) {
+                           const char* buffer_role, bool prepared_only) {
   if (failed_ || pending_)
     return Status::InvalidState("UMDK session failed; shut down before reuse");
   auto& link = *config_.peer_link;
@@ -110,7 +135,7 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     args_.local_buffer = address;
     args_.buffer_bytes = output_bytes;
     UmdkControlStatus registered{};
-    auto result = Run(UmdkControlOp::kRegisterBuffer, registered);
+    auto result = RunHbmRegistration(UmdkControlOp::kRegisterBuffer, registered, buffer_role);
     if (result.ok()) registered_buffers_.push_back({address, output_bytes});
     return result;
   }
@@ -138,7 +163,7 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);
   std::copy(config_.local_eid.begin(), config_.local_eid.end(), args_.local_eid);
   UmdkControlStatus prepared{};
-  result = Run(UmdkControlOp::kPrepare, prepared);
+  result = RunHbmRegistration(UmdkControlOp::kPrepare, prepared, buffer_role);
   if (!result.ok()) return result;
   if (!std::equal(config_.local_eid.begin(), config_.local_eid.end(), prepared.eid))
     return Status::Internal("AICPU context EID differs from the Host-selected EID");

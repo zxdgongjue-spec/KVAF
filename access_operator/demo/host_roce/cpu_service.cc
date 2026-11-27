@@ -45,7 +45,7 @@ bool Serve(int fd, const kvaf::RoceOptions& options) {
       bytes == 0 || bytes > kMaxRegionBytes || slot_size == 0 || slot_size > UINT32_MAX ||
       qp_count == 0 || qp_count > kMaxQpCount || bytes % qp_count != 0 ||
       bytes / qp_count < slot_size || (bytes / qp_count) % slot_size != 0) {
-    std::fprintf(stderr, "[KVAF_CPU] invalid region request (max=%llu bytes)\n",
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== invalid region request (max=%llu bytes)\n",
                  static_cast<unsigned long long>(kMaxRegionBytes));
     return false;
   }
@@ -58,7 +58,7 @@ bool Serve(int fd, const kvaf::RoceOptions& options) {
     auto connection = std::make_unique<wire::Connection>();
     const auto opened = i == 0 ? connection->Open(options) : connection->OpenSibling(*connections[0]);
     if (!opened.ok()) {
-      std::fprintf(stderr, "[KVAF_CPU] open QP %u failed: %s\n", i, opened.message().c_str());
+      std::fprintf(stderr, "==============[KVAF_CPU]=========== open QP %u failed: %s\n", i, opened.message().c_str());
       reset_siblings();
       return false;
     }
@@ -66,7 +66,7 @@ bool Serve(int fd, const kvaf::RoceOptions& options) {
   }
   void* ddr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (ddr == MAP_FAILED) {
-    std::perror("[KVAF_CPU] mmap");
+    std::perror("==============[KVAF_CPU]=========== mmap");
     reset_siblings();
     return false;
   }
@@ -75,7 +75,7 @@ bool Serve(int fd, const kvaf::RoceOptions& options) {
   bool released = false;
   bool setup_ok = mr != nullptr;
   if (!mr) {
-    std::perror("[KVAF_CPU] ibv_reg_mr");
+    std::perror("==============[KVAF_CPU]=========== ibv_reg_mr");
   }
   const auto per_qp_bytes = bytes / qp_count;
   for (std::uint32_t i = 0; setup_ok && i < qp_count; ++i) {
@@ -90,14 +90,14 @@ bool Serve(int fd, const kvaf::RoceOptions& options) {
     }
     const auto connected = connections[i]->Connect(peer);
     if (!connected.ok()) {
-      std::fprintf(stderr, "[KVAF_CPU] QP %u connect failed: %s\n", i, connected.message().c_str());
+      std::fprintf(stderr, "==============[KVAF_CPU]=========== QP %u connect failed: %s\n", i, connected.message().c_str());
       setup_ok = false;
       break;
     }
     if (!wire::SendEndpoint(fd, true, connections[i]->local())) setup_ok = false;
   }
   if (setup_ok && wire::SetControlTimeout(fd, false)) {
-    std::fprintf(stderr, "[KVAF_CPU] REGION_READY bytes=%llu slot_size=%llu qp_count=%u\n",
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== REGION_READY bytes=%llu slot_size=%llu qp_count=%u\n",
                  static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(slot_size), qp_count);
     released = wire::ReceiveRelease(fd, false);
   } else if (setup_ok) {
@@ -108,17 +108,17 @@ bool Serve(int fd, const kvaf::RoceOptions& options) {
   for (std::uint32_t i = 0; i < qp_count; ++i) {
     const auto stopped = connections[i]->Stop();
     if (!stopped.ok()) {
-      std::fprintf(stderr, "[KVAF_CPU] stop QP %u failed: %s\n", i, stopped.message().c_str());
+      std::fprintf(stderr, "==============[KVAF_CPU]=========== stop QP %u failed: %s\n", i, stopped.message().c_str());
       std::_Exit(1);
     }
   }
   if (mr && ibv_dereg_mr(mr) != 0) {
-    std::perror("[KVAF_CPU] ibv_dereg_mr");
+    std::perror("==============[KVAF_CPU]=========== ibv_dereg_mr");
     reset_siblings();
     return false;
   }
   if (munmap(ddr, bytes) != 0) {
-    std::perror("[KVAF_CPU] munmap");
+    std::perror("==============[KVAF_CPU]=========== munmap");
     reset_siblings();
     return false;
   }
@@ -162,14 +162,14 @@ int main(int argc, char** argv) {
   }
   const int listener = Listen(address, port);
   if (listener < 0) {
-    std::fprintf(stderr, "[KVAF_CPU] cannot listen on %s:%u\n", address, port);
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== cannot listen on %s:%u\n", address, port);
     return 1;
   }
-  std::fprintf(stderr, "[KVAF_CPU] LISTEN address=%s port=%u\n", address, port);
+  std::fprintf(stderr, "==============[KVAF_CPU]=========== LISTEN address=%s port=%u\n", address, port);
   const int fd = accept(listener, nullptr, nullptr);
   close(listener);
   if (fd < 0) {
-    std::perror("[KVAF_CPU] accept");
+    std::perror("==============[KVAF_CPU]=========== accept");
     return 1;
   }
   const bool ok = Serve(fd, options);

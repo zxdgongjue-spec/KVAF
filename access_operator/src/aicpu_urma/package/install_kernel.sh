@@ -13,7 +13,7 @@ usage() {
 }
 
 die() {
-  echo "[KVAF_AICPU_URMA] $*" >&2
+  echo "==============[KVAF_AICPU_URMA]=========== $*" >&2
   exit 1
 }
 
@@ -57,7 +57,7 @@ check_installed() {
     cmp -s "$artifact_dir/$package" "$kernel_dir/$package" || die "installed package differs from build artifact"
     cmp -s "$artifact_dir/kernel.json" "$config_dir/$json" || die "installed JSON differs from build artifact"
   fi
-  echo "[KVAF_AICPU_URMA] CHECK_OK root=$cann_root package=$kernel_dir/$package json=$config_dir/$json"
+  echo "==============[KVAF_AICPU_URMA]=========== CHECK_OK root=$cann_root package=$kernel_dir/$package json=$config_dir/$json"
 }
 
 prepare_load_config() {
@@ -115,7 +115,7 @@ install_package() (
       done
     fi
     if [[ "$failed" == true ]]; then
-      echo "[KVAF_AICPU_URMA] rollback incomplete; recovery files retained: ${staging[*]}" >&2
+      echo "==============[KVAF_AICPU_URMA]=========== rollback incomplete; recovery files retained: ${staging[*]}" >&2
       exit 1
     fi
     for directory in ${staging[@]+"${staging[@]}"}; do rm -rf "$directory"; done
@@ -201,7 +201,7 @@ fi
 case "$action" in
   --install)
     install_package
-    echo "[KVAF_AICPU_URMA] installed; restart the NPU client process"
+    echo "==============[KVAF_AICPU_URMA]=========== installed; restart the NPU client process"
     ;;
   --check)
     check_installed "$artifact_dir"
@@ -215,6 +215,6 @@ case "$action" in
     if grep -Fxq "$header" "$load_config"; then
       die "failed to remove $header from $load_config"
     fi
-    echo "[KVAF_AICPU_URMA] UNINSTALLED root=$cann_root; restart the NPU client process"
+    echo "==============[KVAF_AICPU_URMA]=========== UNINSTALLED root=$cann_root; restart the NPU client process"
     ;;
 esac

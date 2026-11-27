@@ -3,6 +3,7 @@
 
 #include <sys/socket.h>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -50,7 +51,10 @@ struct UbmemCpuBackend::Impl {
     const auto mapping_bytes = invalid ? 0 : (request.ddr_bytes + kPageBytes - 1) / kPageBytes * kPageBytes;
     Status status = invalid ? Status::InvalidArgument("DDR bytes must be a multiple of slot_size")
                             : hal->Load(library);
+    const auto start = std::chrono::steady_clock::now();
     if (status.ok()) status = region->AllocateHost(mapping_bytes, &handle);
+    const auto alloc_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - start).count();
     response.result = static_cast<int>(status.ok() ? peer::Result::kOk : peer::Result::kResourceError);
     if (status.ok()) {
       response.session_id = next_session++;
@@ -59,9 +63,10 @@ struct UbmemCpuBackend::Impl {
       response.mapping_bytes = region->bytes();
       std::memcpy(response.fabric_handle, handle.data(), handle.size());
       regions.emplace(response.session_id, std::move(region));
-      std::fprintf(stderr, "[KVAF_UBMEM] DDR_EXPORTED session=%llu bytes=%llu\n",
+      std::fprintf(stderr, "==============[KVAF_UBMEM]=========== DDR_EXPORTED session=%llu bytes=%llu mapping_bytes=%llu alloc_us=%.1f\n",
           static_cast<unsigned long long>(response.session_id),
-          static_cast<unsigned long long>(response.peer_length));
+          static_cast<unsigned long long>(response.peer_length),
+          static_cast<unsigned long long>(mapping_bytes), alloc_us);
     } else {
       std::snprintf(response.error_message, sizeof(response.error_message), "%s", status.message().c_str());
     }

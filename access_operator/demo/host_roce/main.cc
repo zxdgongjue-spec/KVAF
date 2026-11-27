@@ -97,18 +97,18 @@ void Usage(const char* executable) {
 
 bool Check(int code, const char* stage) {
   if (code == 0) return true;
-  std::fprintf(stderr, "[HOST_ROCE_BW] %s failed rc=%d\n", stage, code);
+  std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s failed rc=%d\n", stage, code);
   return false;
 }
 
 bool Check(const kvaf::Status& status, const char* stage) {
   if (status.ok()) return true;
-  std::fprintf(stderr, "[HOST_ROCE_BW] %s failed: %s\n", stage, status.message().c_str());
+  std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s failed: %s\n", stage, status.message().c_str());
   return false;
 }
 
 [[noreturn]] void UnsafeTeardown(const char* stage) {
-  std::fprintf(stderr, "[HOST_ROCE_BW] %s failed, exiting with RDMA resources still owned\n", stage);
+  std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s failed, exiting with RDMA resources still owned\n", stage);
   std::_Exit(1);
 }
 
@@ -134,7 +134,7 @@ struct Session {
     }
     for (const auto& queue : queues) {
       if (options.depth > queue.connection->depth()) {
-        std::fprintf(stderr, "[HOST_ROCE_BW] depth=%u exceeds local QP capacity=%u\n",
+        std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== depth=%u exceeds local QP capacity=%u\n",
                      options.depth, queue.connection->depth());
         return false;
       }
@@ -142,32 +142,32 @@ struct Session {
 
     fd = wire::ConnectControl(options.server);
     if (fd < 0 || !wire::SendAllocation(fd, buffer_bytes, options.bytes, options.qp_count)) {
-      std::fprintf(stderr, "[HOST_ROCE_BW] TCP allocation handshake failed for %s\n", options.server);
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== TCP allocation handshake failed for %s\n", options.server);
       return false;
     }
     for (auto& queue : queues) {
       if (!wire::ReceiveRegion(fd, &queue.region) || queue.region.base == 0 ||
           queue.region.bytes < per_qp_bytes ||
           queue.region.base > std::numeric_limits<std::uint64_t>::max() - per_qp_bytes) {
-        std::fprintf(stderr, "[HOST_ROCE_BW] invalid remote DDR region descriptor\n");
+        std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== invalid remote DDR region descriptor\n");
         return false;
       }
     }
     remote_ready = true;
     for (const auto& queue : queues) {
       if (!wire::SendEndpoint(fd, false, queue.connection->local())) {
-        std::fprintf(stderr, "[HOST_ROCE_BW] failed to send local QP descriptor\n");
+        std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== failed to send local QP descriptor\n");
         return false;
       }
     }
     for (std::size_t i = 0; i < queues.size(); ++i) {
       wire::Endpoint peer{};
       if (!wire::ReceiveEndpoint(fd, true, &peer)) {
-        std::fprintf(stderr, "[HOST_ROCE_BW] failed to receive peer QP descriptor index=%zu\n", i);
+        std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== failed to receive peer QP descriptor index=%zu\n", i);
         return false;
       }
       if (!Check(queues[i].connection->Connect(peer), "connect RC QP")) return false;
-      std::fprintf(stderr, "[HOST_ROCE_BW] QP_READY index=%zu local=%u remote=%u read_depth=%u\n",
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== QP_READY index=%zu local=%u remote=%u read_depth=%u\n",
                    i, queues[i].connection->local().qpn, peer.qpn,
                    queues[i].connection->read_depth());
     }
@@ -186,7 +186,7 @@ struct Session {
     const auto address = reinterpret_cast<std::uintptr_t>(hbm);
     if (base == 0 || address < base || allocation_bytes < buffer_bytes ||
         address - base > allocation_bytes - buffer_bytes) {
-      std::fprintf(stderr, "[HOST_ROCE_BW] HBM buffer exceeds its backing allocation\n");
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== HBM buffer exceeds its backing allocation\n");
       return false;
     }
     if (!Check(halMemRegUbSegment(options.device, base, allocation_bytes), "halMemRegUbSegment(HBM)")) return false;
@@ -194,7 +194,7 @@ struct Session {
     local_mr = ibv_reg_mr(queues[0].connection->pd(), hbm, buffer_bytes, IBV_ACCESS_LOCAL_WRITE);
     if (!local_mr) {
       const int error = errno;
-      std::fprintf(stderr, "[HOST_ROCE_BW] ibv_reg_mr(HBM) failed errno=%d (%s)\n",
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== ibv_reg_mr(HBM) failed errno=%d (%s)\n",
                    error, std::strerror(error));
       return false;
     }
@@ -202,7 +202,7 @@ struct Session {
       queue.sges.resize(options.depth);
       queue.requests.resize(options.depth);
     }
-    std::fprintf(stderr, "[HOST_ROCE_BW] HBM_MR_READY bytes=%zu qp_count=%u bytes_per_qp=%zu\n",
+    std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== HBM_MR_READY bytes=%zu qp_count=%u bytes_per_qp=%zu\n",
                  buffer_bytes, options.qp_count, per_qp_bytes);
     return true;
   }
@@ -229,7 +229,7 @@ struct Session {
     const int rc = ibv_post_send(queue.connection->qp(), queue.requests.data(), &bad);
     if (rc != 0) {
       const auto index = bad ? static_cast<std::size_t>(bad - queue.requests.data()) : 0;
-      std::fprintf(stderr, "[HOST_ROCE_BW] ibv_post_send qp=%zu failed rc=%d first_bad=%zu\n", qp_index, rc, index);
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== ibv_post_send qp=%zu failed rc=%d first_bad=%zu\n", qp_index, rc, index);
       return false;
     }
     unsigned completed = 0;
@@ -238,14 +238,14 @@ struct Session {
       std::array<ibv_wc, 32> completions{};
       const int got = ibv_poll_cq(queue.connection->cq(), static_cast<int>(completions.size()), completions.data());
       if (got < 0) {
-        std::fprintf(stderr, "[HOST_ROCE_BW] ibv_poll_cq qp=%zu failed rc=%d\n", qp_index, got);
+        std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== ibv_poll_cq qp=%zu failed rc=%d\n", qp_index, got);
         return false;
       }
       for (int i = 0; i < got; ++i) {
         if (completions[i].status != IBV_WC_SUCCESS ||
             completions[i].opcode != (read ? IBV_WC_RDMA_READ : IBV_WC_RDMA_WRITE) ||
             completions[i].wr_id >= count) {
-          std::fprintf(stderr, "[HOST_ROCE_BW] %s completion qp=%zu failed: %s (%d), vendor_err=%u\n",
+          std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s completion qp=%zu failed: %s (%d), vendor_err=%u\n",
                        read ? "READ" : "WRITE", qp_index, ibv_wc_status_str(completions[i].status),
                        completions[i].status, completions[i].vendor_err);
           return false;
@@ -254,7 +254,7 @@ struct Session {
       }
     }
     if (completed != count) {
-      std::fprintf(stderr, "[HOST_ROCE_BW] %s completion timeout qp=%zu completed=%u expected=%u\n",
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s completion timeout qp=%zu completed=%u expected=%u\n",
                    read ? "READ" : "WRITE", qp_index, completed, count);
       return false;
     }
@@ -337,12 +337,12 @@ struct Session {
         const auto global_offset = offset + i;
         const auto expected = static_cast<std::uint8_t>((global_offset % options.bytes) * 131U + 0x40U);
         if (output[i] == expected) continue;
-        std::fprintf(stderr, "[HOST_ROCE_BW] %s data mismatch at byte %zu expected=0x%02x actual=0x%02x\n",
+        std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s data mismatch at byte %zu expected=0x%02x actual=0x%02x\n",
                      read ? "READ" : "WRITE", global_offset, expected, output[i]);
         return false;
       }
     }
-    std::fprintf(stderr, "[HOST_ROCE_BW] %s_VALIDATION_PASS bytes=%zu qp_count=%u\n",
+    std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== %s_VALIDATION_PASS bytes=%zu qp_count=%u\n",
                  read ? "READ" : "WRITE", buffer_bytes, options.qp_count);
     return true;
   }
@@ -375,7 +375,7 @@ struct Session {
       UnsafeTeardown("halMemUnRegUbSegment(HBM)");
     bool ok = true;
     if (remote_ready && (!wire::SendRelease(fd, false) || !wire::ReceiveRelease(fd, true))) {
-      std::fprintf(stderr, "[HOST_ROCE_BW] remote DDR release handshake failed\n");
+      std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== remote DDR release handshake failed\n");
       ok = false;
     }
     if (fd >= 0) close(fd);
@@ -407,6 +407,6 @@ int main(int argc, char** argv) {
   Session session(options);
   const bool ok = session.Connect() && session.Benchmark();
   if (!session.Close() || !ok) return 1;
-  std::fprintf(stderr, "[HOST_ROCE_BW] PASS qp_count=%u\n", options.qp_count);
+  std::fprintf(stderr, "==============[HOST_ROCE_BW]=========== PASS qp_count=%u\n", options.qp_count);
   return 0;
 }

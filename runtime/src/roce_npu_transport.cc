@@ -91,7 +91,7 @@ struct RoceCallLatency {
   ~RoceCallLatency() {
     if (!id) return;
     std::fprintf(stderr,
-                 "[KVAF_ROCE_LATENCY] pid=%ld id=%llu device=%u op=%s phase=call ok=%d "
+                 "==============[KVAF_ROCE_LATENCY]=========== pid=%ld id=%llu device=%u op=%s phase=call ok=%d "
                  "total_us=%.3f requests_or_capacity=%zu wait_prev_get_us=%.3f "
                  "stream_sync_us=%.3f mr_us=%.3f mr_mode=%s staging_us=%.3f "
                  "enqueue_us=%.3f wait_current_get_us=%.3f queue_lock_us=%.3f "
@@ -143,7 +143,7 @@ bool IsOnNpu(const void* address, std::uint32_t device) {
 }
 
 [[noreturn]] void UnsafeTeardown(const char* reason) {
-  std::fprintf(stderr, "[KVAF_ROCE] unsafe teardown: %s\n", reason);
+  std::fprintf(stderr, "==============[KVAF_ROCE]=========== unsafe teardown: %s\n", reason);
   // The C++ API borrows the Tensor. Returning to the caller could free it
   // while the provider still owns the registration or may DMA into it.
   std::abort();
@@ -249,7 +249,7 @@ class HbmRegistration {
  private:
   void LogTiming(const char* phase, int failed, bool hal_called, double hal_us, bool verbs_called,
                  double verbs_us, MrClock::time_point start) const {
-    std::fprintf(stderr, "[KVAF_ROCE_MR] id=%llu device=%u phase=%s failed=%d bytes=%zu "
+    std::fprintf(stderr, "==============[KVAF_ROCE_MR]=========== id=%llu device=%u phase=%s failed=%d bytes=%zu "
                          "hal_called=%d hal_us=%.3f verbs_called=%d verbs_us=%.3f total_us=%.3f\n",
                  static_cast<unsigned long long>(timing_id_), key_.first, phase, failed, bytes_,
                  hal_called, hal_us, verbs_called, verbs_us, MrElapsedUs(true, start));
@@ -509,7 +509,7 @@ class RoceSession {
         *result = *cached;
         cache_.splice(cache_.end(), cache_, cached);
         if (mr_mode) *mr_mode = "cache_hit";
-        if (timing) std::fprintf(stderr, "[KVAF_ROCE_MR] device=%u phase=cache_hit bytes=%zu\n",
+        if (timing) std::fprintf(stderr, "==============[KVAF_ROCE_MR]=========== device=%u phase=cache_hit bytes=%zu\n",
                                  device_id_, bytes);
         return Status::OK();
       }
@@ -1140,7 +1140,7 @@ class RoceOperator final : public AccessOperator {
       op.worker_changed_.wait(lock, [&job] { return job.worker_done; });
     }
     if (!job.result.ok() && !job.synchronous && !job.ranges) {
-      std::fprintf(stderr, "[KVAF_ROCE] asynchronous BatchGet failed: %s\n",
+      std::fprintf(stderr, "==============[KVAF_ROCE]=========== asynchronous BatchGet failed: %s\n",
                    job.result.message().c_str());
       // This callback has no error return to the stream. Letting it return
       // would permit downstream consumption of a partial or invalid result.
@@ -1171,7 +1171,7 @@ class RoceOperator final : public AccessOperator {
         if (timing) {
           const auto finished = MrClock::now();
           std::snprintf(timing_line, sizeof(timing_line),
-                       "[KVAF_ROCE_LATENCY] pid=%ld id=%llu device=%u op=%s phase=worker ok=%d "
+                       "==============[KVAF_ROCE_LATENCY]=========== pid=%ld id=%llu device=%u op=%s phase=worker ok=%d "
                        "active_requests=%d enqueue_to_callback_us=%.3f worker_queue_us=%.3f "
                        "worker_us=%.3f parse_us=%.3f mr_release_us=%.3f queue_lock_us=%.3f "
                        "post_send_us=%.3f cq_wait_us=%.3f posted_bytes=%llu posted_wrs=%llu "

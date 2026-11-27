@@ -82,7 +82,7 @@ import json, os, pathlib, sys
 with pathlib.Path(os.environ["CALL_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
 if "--adaptive-calibration-only" in sys.argv:
-    print("[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED reason=k_side_device_filter")
+    print("==============[KVAF_AIV]=========== UB_DEVICE_ADAPTIVE_SKIPPED reason=k_side_device_filter")
 for stage in ("total", "post", "completion_wait"):
     print(f"PERF_RESULT operation=batch_get_kernel_{stage} detail=0 "
           "mean_ms=0.001 p50_ms=0.001 p90_ms=0.001 p99_ms=0.001 "

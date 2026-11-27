@@ -34,7 +34,10 @@ void Worker::Run() {
   while (!stop_.load(std::memory_order_acquire)) {
     std::uint64_t sequence = 0;
     auto status = transport_->ReadRequest(&sequence);
-    if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    if (!status.ok()) {
+      std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH: %s\n", status.message().c_str());
+      return;
+    }
     if (!sequence || sequence == last) continue;
     if (sequence <= last || sequence > UINT32_MAX) {
       (void)transport_->Complete(sequence, Result::kSequenceError);
@@ -46,12 +49,15 @@ void Worker::Run() {
       // Header errors occur before any data WRITE. A transport error may
       // leave the queue poisoned; Complete then fails without reusing its slots.
       (void)transport_->Complete(sequence, Result::kInvalidRequest);
-      std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str());
+      std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH: %s\n", status.message().c_str());
       return;
     }
     status = transport_->WriteBatch();
     if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
-    if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    if (!status.ok()) {
+      std::fprintf(stderr, "==============[KVAF_CPU]=========== CPU_PUSH: %s\n", status.message().c_str());
+      return;
+    }
     transport_->PrintProfile();
   }
 }

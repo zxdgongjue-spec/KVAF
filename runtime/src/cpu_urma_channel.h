@@ -83,7 +83,7 @@ struct UrmaChannel {
 
   bool Fail(const char* operation, std::uint32_t depth, std::uint32_t token) {
     const int error = errno;
-    std::fprintf(stderr, "[KVAF_CPU] %s failed depth=%u token=0x%x errno=%d\n", operation, depth,
+    std::fprintf(stderr, "==============[KVAF_CPU]=========== %s failed depth=%u token=0x%x errno=%d\n", operation, depth,
                  token, error);
     Reset();
     errno = error;

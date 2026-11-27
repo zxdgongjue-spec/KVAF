@@ -145,12 +145,12 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
 void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
                              std::uint32_t npu_core_count,
                              int32_t result) {
-  std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_EXECUTION_ERROR result=%d\n",
+  std::fprintf(stderr, "==============[KVAF_AIV]=========== BATCH_PUT_EXECUTION_ERROR result=%d\n",
                static_cast<int>(result));
   for (std::uint32_t core = 0; core < npu_core_count; ++core) {
     const KvafBatchPutCoreStatus& status = execution.host_core_status[core];
     std::fprintf(stderr,
-                 "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
+                 "==============[KVAF_AIV]=========== BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
                  "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
                  "cq_sub_status=%llu completed_batches=%llu sq_pi=%llu cq_ci=%llu "
                  "last_wqe=0x%llx\n",
@@ -261,7 +261,7 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
       execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
   if (copy_result != ACL_SUCCESS) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
+                 "==============[KVAF_AIV]=========== BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
                  static_cast<int>(copy_result));
     return;
   }
@@ -272,7 +272,7 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
       // than turning the kernel status buffer into a Python BatchGet result.
       // Deployments can route this marker through their CANN/plog collection.
       std::fprintf(stderr,
-                   "[KVAF_AIV] BATCH_GET_DEVICE_ERROR core=%u magic=0x%llx "
+                   "==============[KVAF_AIV]=========== BATCH_GET_DEVICE_ERROR core=%u magic=0x%llx "
                    "result=%llu processed=%llu failed_request=%llu\n",
                    core, static_cast<unsigned long long>(status.magic),
                    static_cast<unsigned long long>(status.result),
@@ -476,7 +476,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     impl_->batch_put_transport = batch_put_transport;
     impl_->batch_put_execution = std::move(batch_put_execution);
     std::fprintf(stderr,
-                 "[KVAF_AIV] RUNTIME_BATCH_PUT_TRANSPORT_READY cores=%u "
+                 "==============[KVAF_AIV]=========== RUNTIME_BATCH_PUT_TRANSPORT_READY cores=%u "
                  "jettys_per_core=%u "
                  "metadata_staging=reusable\n",
                  impl_->config.npu_core_count,

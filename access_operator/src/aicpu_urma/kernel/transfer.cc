@@ -192,6 +192,7 @@ std::uint32_t UmdkTransferSync(const UmdkContext* args, bool write, const UmdkTr
   const bool success = TransferControl(write, transfers, count, status, worker_index);
   if (!success)
     std::fprintf(stderr,
+                 "==============[KVAF_AICPU_URMA]=========== "
                  "UMDK_CONTROL_ERROR worker=%u write=%u stage=%s result=%d errno=%d cq_status=%d\n",
                  worker_index, write ? 1U : 0U, status.stage, status.result, status.error_number,
                  status.cq_status);

@@ -5,6 +5,7 @@
 #include "meta_manager.h"
 
 #include <acl/acl.h>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <unordered_map>
@@ -144,7 +145,7 @@ struct AccessOperator::Impl {
         state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
     if (status.ok()) status = Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(stream));
     if (!status.ok()) {
-      std::fprintf(stderr, "[KVAF_UBMEM] FAILED_LAUNCH op=%u rows=%u local_base=0x%llx local_bytes=%llu "
+      std::fprintf(stderr, "==============[KVAF_UBMEM]=========== FAILED_LAUNCH op=%u rows=%u local_base=0x%llx local_bytes=%llu "
           "mapped_base=0x%llx remote_bytes=%llu metadata=0x%llx\n",
           static_cast<unsigned>(args.operation), args.capacity,
           static_cast<unsigned long long>(args.local_base),
@@ -162,7 +163,7 @@ struct AccessOperator::Impl {
         return Status::Internal("UBmem kernel status was not written (still 0xFF)");
       }
       if (reports[i].result != 0) {
-        std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
+        std::fprintf(stderr, "==============[KVAF_UBMEM]=========== KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
             static_cast<unsigned long long>(reports[i].result),
             static_cast<unsigned long long>(reports[i].failed_request));
         return Status::InvalidArgument("UBmem kernel rejected a request; see KERNEL_ERROR");
@@ -180,7 +181,7 @@ struct AccessOperator::Impl {
 AccessOperator::AccessOperator(OperatorOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}
 AccessOperator::~AccessOperator() {
   if (!Shutdown().ok()) {
-    std::fprintf(stderr, "[KVAF_UBMEM] retaining mapping/resources after failed drain or cleanup\n");
+    std::fprintf(stderr, "==============[KVAF_UBMEM]=========== retaining mapping/resources after failed drain or cleanup\n");
     (void)impl_.release();
   }
 }
@@ -195,11 +196,14 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
   peer::PeerRegion peer;
   if (status.ok()) status = impl_->options.peer_link->LookupRegion(region.base, &peer);
   if (status.ok()) status = impl_->options.peer_link->RetainUbmemMapping(region.base);
+  double import_us = 0.0;
   if (status.ok()) {
     impl_->remote = region;
     impl_->retained = true;
     impl_->mapping = std::make_unique<DeviceMapping>();
+    const auto start = std::chrono::steady_clock::now();
     status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
+    import_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
   }
   if (status.ok()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
       "KvafExecuteBatchGetUbmemKernelV2");
@@ -208,13 +212,14 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
         "KvafExecuteBatchPutUbmemKernelV2");
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY transport=ubmem mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
-      "host_base=0x%llx mapped_base=0x%llx\n",
+  std::fprintf(stderr, "==============[KVAF_UBMEM]=========== DEVICE_MAPPING_READY transport=ubmem mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
+      "host_base=0x%llx mapped_base=0x%llx mapping_bytes=%llu import_us=%.1f\n",
       kMteBufferBytes,
       static_cast<unsigned long long>(region.length), impl_->options.cores,
       impl_->options.device_id,
       static_cast<unsigned long long>(region.base),
-      static_cast<unsigned long long>(impl_->mapping->address()));
+      static_cast<unsigned long long>(impl_->mapping->address()),
+      static_cast<unsigned long long>(peer.fabric_mapping_bytes), import_us);
   return Status::OK();
 }
 
