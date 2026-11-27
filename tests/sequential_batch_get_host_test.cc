@@ -1,7 +1,8 @@
 // Exercise the real Host owner with deferred ACL work and transport doubles.
 #include "scatter_batch_get.h"
-#include "gather_batch_get.h"
+#include "gather_execution.h"
 #include "kvaf_aiv_batch_get.h"
+#include "sequential_batch_get.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
@@ -395,9 +396,18 @@ int main() {
     auto owner = CreateSequentialBatchGet(algorithm, config);
     auto resources = owner->TakeResources();
     assert(resources && resources->Initialize(region).ok());
+    auto* gather = static_cast<GatherResources*>(resources.get());
+    const auto fallback_view = gather->View();
+    assert(fallback_view.common.Validate(&gather->fallback, ExecutionDirection::Get).ok());
+    assert(!fallback_view.common.Validate(&gather->fallback, ExecutionDirection::Put).ok());
     auto invocation = owner->CreateExecutionState();
     assert(owner->BindExecutionState(invocation.get()).ok());
+    assert(GatherHostOperator::Execute(exec, fallback_view, gather->fallback, gather->fallback).code() ==
+        StatusCode::kInvalidState);
+    assert(launches == 0);
     assert(owner->ExecuteBatchGet(exec).ok()); assert(completed == 0 && refs == 2);
+    auto other = owner->CreateExecutionState();
+    assert(owner->BindExecutionState(other.get()).code() == StatusCode::kBusy);
     assert(last_coalesce_sges == 0);
     assert(owner->ExecuteBatchGet(exec).ok()); assert(completed == 1 && refs == 2);
     assert(owner->DrainGet().ok()); assert(completed == 2 && refs == 1);
@@ -408,7 +418,9 @@ int main() {
     assert(owner->ExecuteBatchGet(exec).ok()); assert(completed == 3 && refs == 1);
     exec.execution.synchronize = false;
     assert(owner->ExecuteBatchGet(exec).ok());
+    const auto closing_view = gather->View();
     assert(resources->Close().ok()); assert(completed == 4 && !refs && !allocations);
+    assert(!closing_view.common.ready());
     assert(owner->BindExecutionState(nullptr).ok());
     assert((sequences == std::vector<uint64_t>{1, 2, 3, 4}));
   }
@@ -417,6 +429,8 @@ int main() {
     kernel_result = KVAF_SEQ_CQ_ERROR;
     assert(owner->ExecuteBatchGet(exec).ok()); assert(!owner->DrainGet().ok());
     assert(!owner->ExecuteBatchGet(exec).ok()); assert(refs == 2);
+    auto other = owner->CreateExecutionState();
+    assert(owner->BindExecutionState(other.get()).code() == StatusCode::kBusy);
     fail_quiesce = true; assert(!owner->Shutdown().ok());
     assert(refs == 2 && allocations == 4);
     fail_quiesce = false; assert(owner->Shutdown().ok());

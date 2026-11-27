@@ -1,10 +1,14 @@
 #include "gather_execution.h"
+#include "peer_link.h"
+#include "gather_prefix_layout.h"
+#include "gather_workspace.h"
+#include "sequential_batch_get_common.h"
 
 #include <charconv>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <sstream>
 
 namespace kvaf {
 using namespace sequential_detail;
@@ -19,7 +23,7 @@ Status ReadProbe(uint32_t* probe) {
 }
 }  // namespace
 
-Status GatherBatchGet::Resources::InitializeGather() {
+Status GatherResources::InitializeGather() {
   const auto workers = config.npu_core_count;
   args.lane_descriptor_bytes = GatherLaneDescriptorBytes(workers);
   args.lane_staging_bytes = GatherLaneStagingBytes(config.batch_get_token_bytes, workers);
@@ -41,23 +45,25 @@ Status GatherBatchGet::Resources::InitializeGather() {
                   workers * 2 * sizeof(KvafBatchGetQueueState)) != ACL_SUCCESS)
     return Error("allocate gather workspace");
   if (KvafBatchGetTransportCreateWithPeerLink(reinterpret_cast<void*>(remote_workspace.base), remote_workspace.length,
-      workers, 2, config.peer_link.get(), config.peer_local_eid.data(), &gather_transport))
+      workers, 2, config.peer_link.get(), config.peer_local_eid.data(), &outputs.transport_))
     return Error("create gather control/data queues");
-  if (KvafBatchGetLocalBufferAcquire(gather_transport, workspace, args.workspace_bytes,
+  if (KvafBatchGetLocalBufferAcquire(outputs.transport_, workspace, args.workspace_bytes,
       &workspace_buffer, &args.workspace_entity)) return Error("register gather workspace");
   gather_enabled = true;  // STOP also handles an uncertain enable response.
   return config.peer_link->EnableGatherLanes(region.base, args.remote_control, workers, true);
 }
 
-Status GatherBatchGet::Resources::Close() {
+Status GatherResources::Close() {
   std::lock_guard<std::mutex> lock(mutex);
-  if (live_graph) return Status::Busy("release the Gather graph lease before shutdown");
+  if (progress.live_graph) return Status::Busy("release the Gather graph lease before shutdown");
   // Finish pending CPU work; on errors quiesce transports before freeing memory.
-  const auto execution_status = failed ? Status::OK() : Drain();
-  failed = true;  // A partially closed transport cannot accept another Execute.
+  const auto execution_status = progress.health.failed ? Status::OK() :
+      GatherHostOperator::Drain(View(), *active, *eager);
+  progress.health.failed = true;  // A partially closed transport cannot accept another Execute.
+  views.Close();
   if (eager->pending) {
     const aclError synchronized = aclrtSynchronizeStream(eager->pending);
-    if (synchronized != ACL_SUCCESS) return AclFailure("shutdown_synchronize", synchronized);
+    if (synchronized != ACL_SUCCESS) return View().AclFailure("shutdown_synchronize", synchronized);
   }
   eager->pending = nullptr;
   // Stop CPU copy workers before releasing descriptor/staging resources.
@@ -66,15 +72,14 @@ Status GatherBatchGet::Resources::Close() {
     if (!result.ok()) return result;
     gather_enabled = false;
   }
-  if (gather_transport && KvafGatherBatchGetTransportQuiesce(gather_transport))
+  if (outputs.transport_ && KvafGatherBatchGetTransportQuiesce(outputs.transport_))
     return Error("cannot quiesce gather DMA; resources retained");
-  if (eager->output_buffer) KvafBatchGetLocalBufferRelease(eager->output_buffer);
-  if (retained_graph_output) KvafBatchGetLocalBufferRelease(retained_graph_output);
-  retained_graph_output = nullptr;
+  outputs.Release(eager->output_buffer);
+  outputs.Release(outputs.retained_);
   if (workspace_buffer) KvafBatchGetLocalBufferRelease(workspace_buffer);
-  eager->output_buffer = workspace_buffer = nullptr;
-  if (gather_transport) KvafBatchGetTransportDestroy(gather_transport);
-  gather_transport = nullptr;
+  workspace_buffer = nullptr;
+  if (outputs.transport_) KvafBatchGetTransportDestroy(outputs.transport_);
+  outputs.transport_ = nullptr;
   for (auto p : {&workspace, &queues, &status_device, &profile_device}) {
     if (*p && aclrtFree(*p) != ACL_SUCCESS) return Error("free device memory");
     *p = nullptr;
@@ -87,128 +92,16 @@ Status GatherBatchGet::Resources::Close() {
   profiling = eager->pending_profile = eager->profile_valid = false;
   check_async_status = eager->pending_status_check = false;
   eager->latest_profile = {};
-  initialized = failed = false; sequence = 0; args = {};
+  initialized = false;
+  progress = {};
+  args = {};
   return execution_status;
 }
 
-Status GatherBatchGet::Resources::CaptureProfile() {
-  const auto* profiles = static_cast<const KvafGatherBatchGetCoreProfile*>(profile_host);
-  const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
-  eager->latest_profile.cores.clear();
-  eager->latest_profile.cores.reserve(config.npu_core_count);
-  for (uint32_t i = 0; i < config.npu_core_count; ++i) {
-    const auto& p = profiles[i];
-    const auto payload_bytes = p.requests * config.batch_get_token_bytes;
-    const auto chunk_bytes = !p.requests ? 0 :
-        args.cooperative_chunks ? GatherCooperativeChunkBytes(
-            payload_bytes, args.cooperative_chunks, args.first_chunk_divisor) : args.pipeline_chunk_bytes;
-    const char* reason = nullptr;
-    if (p.magic != KVAF_GATHER_PROFILE_MAGIC) reason = "magic";
-    else if (p.sequence != sequence) reason = "sequence";
-    else if (p.result != KVAF_SEQ_OK) reason = "result";
-    else if (p.valid_mask != KVAF_GATHER_PROFILE_ALL_EVENTS) reason = "valid_mask";
-    else if (p.kernel_start_cycle > p.input_done_cycle) reason = "timestamp_start_input";
-    else if (p.input_done_cycle > p.descriptor_done_cycle) reason = "timestamp_input_descriptor";
-    else if (!(eager->head_start && !args.probe && p.requests > kGatherHeadRows) &&
-             p.descriptor_done_cycle > p.notify_done_cycle) reason = "timestamp_descriptor_notify";
-    else if (p.notify_done_cycle > p.ack_done_cycle) reason = "timestamp_notify_ack";
-    else if (!p.pipeline_chunk_bytes && p.ack_done_cycle > p.read_done_cycle) reason = "timestamp_ack_read";
-    else if (p.ack_done_cycle > p.kernel_finish_cycle) reason = "timestamp_ack_finish";
-    else if (p.notify_done_cycle > p.read_done_cycle) reason = "timestamp_notify_read";
-    else if (p.read_done_cycle > p.kernel_finish_cycle) reason = "timestamp_read_finish";
-    else if (!p.window_count || p.requests > statuses[i].requests ||
-             (p.window_count <= 1 && p.requests != statuses[i].requests)) reason = "requests";
-    else if (p.data_wrs > statuses[i].data_wrs ||
-             (p.window_count <= 1 && p.data_wrs != statuses[i].data_wrs)) reason = "data_wrs";
-    else if (p.pipeline_chunk_bytes != chunk_bytes) reason = "pipeline_chunk_bytes";
-    else if (p.prepare_ahead != (p.requests ? args.prepare_ahead : 0)) reason = "prepare_ahead";
-    else if (p.cooperative_chunks != (p.requests ? args.cooperative_chunks : 0)) reason = "cooperative_chunks";
-    else if (p.pipeline_chunk_bytes &&
-        (p.first_ready_cycle < p.notify_done_cycle || p.first_ready_cycle > p.first_read_submit_cycle ||
-         p.first_read_submit_cycle > p.read_done_cycle || !p.first_read_ready_bytes ||
-         p.first_read_ready_bytes > p.requests * config.batch_get_token_bytes))
-      reason = "timestamp_ready_submit_read";
-    if (reason) {
-      // Preserve the failed record before Shutdown; never return a partial snapshot.
-      std::ostringstream detail;
-      detail << "AIV sequential BatchGet: invalid gather profile worker=" << i
-             << " sequence=" << sequence << " reason=" << reason
-             << " magic=0x" << std::hex << p.magic
-             << " expected_magic=0x" << KVAF_GATHER_PROFILE_MAGIC << std::dec
-             << " observed_sequence=" << p.sequence << " result=" << p.result
-             << " expected_result=" << KVAF_SEQ_OK
-             << " valid_mask=0x" << std::hex << p.valid_mask
-             << " expected_mask=0x" << KVAF_GATHER_PROFILE_ALL_EVENTS << std::dec
-             << " cycles=[start:" << p.kernel_start_cycle << ",input:" << p.input_done_cycle
-             << ",descriptor:" << p.descriptor_done_cycle << ",notify:" << p.notify_done_cycle
-             << ",ack:" << p.ack_done_cycle << ",read:" << p.read_done_cycle
-             << ",finish:" << p.kernel_finish_cycle << "]"
-             << " requests=" << p.requests << " status_requests=" << statuses[i].requests
-             << " data_wrs=" << p.data_wrs << " status_data_wrs=" << statuses[i].data_wrs
-             << " ack_queries=" << p.ack_queries << " data_wqebbs=" << p.data_wqebbs
-             << " data_doorbells=" << p.data_doorbells
-             << " data_cq_wait_cycles=" << p.data_cq_wait_cycles
-             << " read_build_cycles=" << p.read_build_cycles
-             << " pipeline_chunk_bytes=" << p.pipeline_chunk_bytes
-             << " first_ready_cycle=" << p.first_ready_cycle
-             << " first_read_submit_cycle=" << p.first_read_submit_cycle
-             << " first_read_ready_bytes=" << p.first_read_ready_bytes
-             << " ready_queries=" << p.ready_queries << " ready_wait_cycles=" << p.ready_wait_cycles
-             << " prepare_ahead=" << p.prepare_ahead << " cooperative_chunks=" << p.cooperative_chunks
-             << " prepare_ahead_wrs=" << p.prepare_ahead_wrs
-             << " prepare_ahead_cycles=" << p.prepare_ahead_cycles
-             << " args_bytes=" << sizeof(KvafGatherBatchGetArgs)
-             << " record_bytes=" << sizeof(p);
-      return Status::Internal(detail.str());
-    }
-    GatherBatchGetCoreProfile out;
-    out.sequence = p.sequence;
-    out.kernel_start_cycle = p.kernel_start_cycle;
-    out.input_done_cycle = p.input_done_cycle;
-    out.descriptor_done_cycle = p.descriptor_done_cycle;
-    out.notify_done_cycle = p.notify_done_cycle;
-    out.ack_done_cycle = p.ack_done_cycle;
-    out.read_done_cycle = p.read_done_cycle;
-    out.kernel_finish_cycle = p.kernel_finish_cycle;
-    out.requests = p.requests;
-    out.data_wrs = p.data_wrs;
-    out.ack_queries = p.ack_queries;
-    out.data_wqebbs = p.data_wqebbs;
-    out.data_doorbells = p.data_doorbells;
-    out.data_cq_wait_cycles = p.data_cq_wait_cycles;
-    out.read_build_cycles = p.read_build_cycles;
-    out.first_ready_cycle = p.first_ready_cycle;
-    out.first_read_submit_cycle = p.first_read_submit_cycle;
-    out.first_read_ready_bytes = p.first_read_ready_bytes;
-    out.ready_queries = p.ready_queries;
-    out.ready_wait_cycles = p.ready_wait_cycles;
-    out.pipeline_chunk_bytes = p.pipeline_chunk_bytes;
-    out.read_vf_calls = p.read_vf_calls;
-    out.prepare_ahead = p.prepare_ahead;
-    out.cooperative_chunks = p.cooperative_chunks;
-    out.prepare_ahead_wrs = p.prepare_ahead_wrs;
-    out.prepare_ahead_cycles = p.prepare_ahead_cycles;
-    out.window_count = p.window_count;
-    eager->latest_profile.cores.push_back(out);
-  }
-  return Status::OK();
-}
-
-GatherBatchGet::GatherBatchGet(AccessOperatorConfig config)
-    : standalone_(std::make_unique<Resources>(std::move(config))), resources_(standalone_.get()) {}
-GatherBatchGet::~GatherBatchGet() {
-  if (standalone_ && !standalone_->Close().ok()) (void)standalone_.release();
-}
-std::unique_ptr<ExecutionResourceOwner> GatherBatchGet::TakeResources() {
-  return std::move(standalone_);
-}
-Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
-  return resources_->Initialize(region);
-}
-Status GatherBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
+Status GatherResources::Initialize(const RemoteRegionDesc& region) {
   auto& s = *this;
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (s.initialized || s.failed || s.workspace || s.status_device || s.status_host)
+  if (s.initialized || s.progress.health.failed || s.workspace || s.status_device || s.status_host)
     return Status::InvalidState("sequential transport already initialized; shutdown before retry");
   if (!s.config.peer_link || !s.config.npu_core_count || s.config.npu_core_count > KVAF_SEQ_MAX_WORKERS ||
       !s.config.batch_get_token_bytes || uint64_t(s.config.batch_get_token_bytes) * kDefaultGetWindow > UINT32_MAX ||
@@ -292,6 +185,8 @@ Status GatherBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
+  s.views.Initialize(region);
+  s.views.Bind(s.active);
   const char* pipeline = s.args.first_chunk_divisor ? "bootstrap_prefix" :
       s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch";
   std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u "
@@ -299,99 +194,18 @@ Status GatherBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
       s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks, s.args.first_chunk_divisor);
   return Status::OK();
 }
-Status GatherBatchGet::DrainGet() {
-  std::lock_guard<std::mutex> lock(resources_->mutex);
-  return resources_->Drain();
-}
-std::unique_ptr<ExecutionState> GatherBatchGet::CreateExecutionState() {
-  return std::make_unique<Invocation>(resources_);
-}
-Status GatherBatchGet::BindExecutionState(ExecutionState* state) {
-  auto* invocation = dynamic_cast<Invocation*>(state);
-  if (state && (!invocation || invocation->owner != resources_))
-    return Status::InvalidArgument("Get invocation belongs to another resource owner");
-  node_ = invocation && invocation->graph_node ? invocation : nullptr;
-  if (!node_) resources_->eager = invocation ? invocation : &resources_->fallback;
-  return Status::OK();
-}
-Status GatherBatchGet::PrepareGetGraph(const GetGraphOptions& options) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!s.initialized || s.failed || !node_ || s.live_graph || s.eager->pending ||
-      s.profiling || s.args.probe || s.sequence == UINT32_MAX)
-    return Status::InvalidState("Gather requires one graph lease on an idle provider without profiling or probes");
-  if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
-      !options.request_capacity)
-    return Status::InvalidArgument("invalid Gather graph stream, output or capacity");
-  const auto stream = static_cast<aclrtStream>(options.stream);
-  bool capturing = false;
-  auto status = s.QueryCapture(stream, &capturing);
-  if (!status.ok()) return status;
-  if (capturing) return Status::InvalidState("prepare the Gather graph lease before capture");
-  auto* lanes = static_cast<KvafSequentialStatus*>(s.status_host);
-  for (uint32_t i = 0; i < s.config.npu_core_count; ++i)
-    lanes[i] = {KVAF_SEQ_STATUS_MAGIC, s.sequence, KVAF_SEQ_OK, KVAF_SEQ_COMPLETE, 0, 0, 0, 0};
-  const auto copied = aclrtMemcpy(s.status_device, s.StatusBytes(), s.status_host,
-                                 s.StatusBytes(), ACL_MEMCPY_HOST_TO_DEVICE);
-  if (copied != ACL_SUCCESS) return s.AclFailure("initialize_graph_status", copied);
-  uint64_t entity = 0;
-  if (KvafBatchGetLocalBufferAcquire(s.gather_transport, options.output.data, options.output.bytes,
-                                   &node_->output_buffer, &entity)) return Error("register graph output");
-  node_->graph = {stream, s.sequence, entity, false};
-  s.live_graph = node_;
-  s.eager->profile_valid = false;
-  return Status::OK();
-}
-Status GatherBatchGet::CheckBatchGetStatus(void* stream) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (s.live_graph != node_ || !node_ || !node_->graph.captured || node_->graph.stream != stream || s.failed)
-    return Status::InvalidState("check Gather replay using its captured graph lease and stream");
-  bool capturing = false;
-  auto status = s.QueryCapture(node_->graph.stream, &capturing);
-  if (!status.ok()) return status;
-  if (capturing) return Status::InvalidState("finish Gather graph capture before checking replay");
-  return s.ReadGraphStatus(*node_, true);
-}
-Status GatherBatchGet::FinishGetGraph(void* stream, bool discard) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (s.live_graph != node_ || !node_ || !node_->graph.stream || node_->graph.stream != stream)
-    return Status::InvalidState("finish Gather using its prepared graph lease and stream");
-  if (s.failed && !discard) return Status::InvalidState("destroy and discard the failed Gather graph");
-  bool capturing = false;
-  auto status = s.QueryCapture(node_->graph.stream, &capturing);
-  if (!status.ok()) return status;
-  if (capturing) return Status::InvalidState("finish Gather graph capture before releasing its lease");
-  if (node_->graph.captured && !s.failed) {
-    status = s.ReadGraphStatus(*node_, false);
-    if (!status.ok() && !discard) return status;
-  }
-  if (s.failed) {
-    const auto synchronized = aclrtSynchronizeStream(node_->graph.stream);
-    if (synchronized != ACL_SUCCESS) return s.AclFailure("discard_graph_synchronize", synchronized);
-    node_->recovery_fenced = true;
-    // Failed DMA may still reference the registration after this node is unbound.
-    s.retained_graph_output = std::exchange(node_->output_buffer, nullptr);
-  } else {
-    KvafBatchGetLocalBufferRelease(node_->output_buffer);
-    node_->output_buffer = nullptr;
-  }
-  node_->graph = {};
-  s.live_graph = nullptr;
-  return Status::OK();
-}
-bool GatherBatchGet::GetGraphNeedsRecovery() const {
-  return node_ && node_->recovery_fenced;
-}
-Status GatherBatchGet::SetBatchGetKernelProfiling(bool enabled) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
+
+Status GatherResources::SetProfiling(bool enabled) {
+  auto& s = *this;
   if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
-  if (!enabled) { s.profiling = false; return Status::OK(); }
-  if (s.live_graph) return Status::InvalidState("release the Gather graph lease before profiling");
+  if (!enabled) {
+    s.profiling = false;
+    views.Prepare(ExecutionDirection::Get);
+    return Status::OK();
+  }
+  if (s.progress.live_graph) return Status::InvalidState("release the Gather graph lease before profiling");
   if (s.args.probe) return Status::InvalidState("gather prefix probes cannot collect performance profiles");
-  auto result = s.Drain();
+  auto result = GatherHostOperator::Drain(View(), *active, *eager);
   if (!result.ok()) return result;
   if (!s.profile_device &&
       aclrtMalloc(&s.profile_device, s.ProfileBytes(), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
@@ -400,108 +214,24 @@ Status GatherBatchGet::SetBatchGetKernelProfiling(bool enabled) {
     return Error("allocate gather Host profile");
   s.profiling = true;
   s.eager->profile_valid = false;
+  views.Prepare(ExecutionDirection::Get);
   return Status::OK();
-}
-Status GatherBatchGet::CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!profile) return Status::InvalidArgument("gather profile output must not be null");
-  *profile = {};
-  if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
-  if (s.failed || !s.eager->profile_valid)
-    return Status::InvalidState("no successful synchronous gather profile is available");
-  *profile = s.eager->latest_profile;
-  return Status::OK();
-}
-Status GatherBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
-  auto& s = *resources_;
-  auto& invocation = *s.eager;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
-  if (s.failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
-  if (!exec.request || !exec.execution.stream) return Status::InvalidArgument("BatchGet needs request and stream");
-  const bool attach_graph = exec.execution.graph_lease != 0;
-  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  const GatherLaunchView view{s.config.npu_core_count, s.config.batch_get_token_bytes,
-                              Ptr(s.status_device), Ptr(s.queues)};
-  if (s.live_graph && !attach_graph)
-    return Status::InvalidState("release the Gather graph lease before eager BatchGet");
-  if (attach_graph || !exec.execution.trusted_npu_request) {
-    bool capturing = false;
-    auto status = s.QueryCapture(stream, &capturing);
-    if (!status.ok()) return status;
-    if (attach_graph) {
-      if (!capturing || !node_ || s.live_graph != node_ ||
-          node_->graph.stream != stream || node_->graph.captured || exec.execution.synchronize)
-        return Status::InvalidState("capture Gather with its unused graph lease and stream");
-      auto args = s.args;
-      status = PrepareGatherBatchGetArguments(exec, view, args);
-      if (!status.ok()) return status;
-      args.request.channel_entity = node_->graph.output_entity;
-      args.sequence = 0;
-      node_->graph.captured = true;
-      if (KvafGatherBatchGetLaunch(&args, stream)) {
-        s.failed = true;
-        return Status::CompletionUnknown("Gather graph launch failed; destroy and discard the graph");
-      }
-      return Status::OK();
-    }
-    if (capturing) return Status::InvalidState("use a Get graph lease for Gather capture");
-  }
-  if (s.profiling && !exec.execution.synchronize)
-    return Status::InvalidArgument("gather profiling requires synchronize=True");
-  if (s.args.probe && !exec.execution.synchronize)
-    return Status::InvalidArgument("gather prefix probes require synchronize=True");
-  // Stream order protects shared workspace/queues; fence on stream switch or checked calls.
-  Status result = Status::OK();
-  if (invocation.pending && (invocation.pending != exec.execution.stream || invocation.pending_status_check)) {
-    result = s.Drain();
-    if (!result.ok()) return result;
-  }
-  invocation.profile_valid = false;
-  if (s.profiling) {
-    invocation.profile_begin_ns = BatchGetProfileNowNs();
-    invocation.latest_profile = {};
-  }
-  auto args = s.args;
-  result = PrepareGatherBatchGetArguments(exec, view, args);
-  if (!result.ok()) return result;
-  if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
-  if (KvafBatchGetLocalBufferAcquire(s.gather_transport, exec.request->output.data,
-      exec.request->output.bytes, &invocation.output_buffer, &args.request.channel_entity))
-    return Error("register output");
-  invocation.head_start = args.head_start;
-  args.sequence = ++s.sequence;
-  args.profile = s.profiling ? Ptr(s.profile_device) : 0;
-  invocation.pending_profile = s.profiling;
-  invocation.pending_status_check = exec.execution.synchronize || s.profiling ||
-      args.probe || s.check_async_status;
-  const auto launch_begin = s.profiling ? BatchGetProfileNowNs() : 0;
-  if (s.profiling) {
-    invocation.latest_profile.sequence = s.sequence;
-    invocation.latest_profile.prepare_ns = launch_begin - invocation.profile_begin_ns;
-  }
-  invocation.pending = static_cast<aclrtStream>(exec.execution.stream);
-  if (args.probe)
-    std::fprintf(stderr, "[KVAF_AIV_GATHER_PROBE_BEGIN] stage=%s sequence=%llu cores=%u "
-        "token_bytes=%u request_capacity=%u\n", ProbeName(args.probe),
-        static_cast<unsigned long long>(args.sequence), args.request.block_count,
-        args.request.token_bytes, args.request.request_capacity);
-  // Each core initializes status/profile; avoid redundant Host clears.
-  if (KvafGatherBatchGetLaunch(&args, invocation.pending)) {
-    s.failed = true; return Error("enqueue failed; resources retained");
-  }
-  if (s.profiling) invocation.latest_profile.launch_ns = BatchGetProfileNowNs() - launch_begin;
-  if (!invocation.pending_status_check) {
-    // MR/entity cache outlives these references, until transport shutdown.
-    KvafBatchGetLocalBufferRelease(invocation.output_buffer);
-    invocation.output_buffer = nullptr;
-  }
-  return exec.execution.synchronize ? s.Drain() : Status::OK();
 }
 
-Status GatherBatchGet::Shutdown() { return resources_->Close(); }
-std::unique_ptr<SequentialBatchGet> CreateGatherBatchGet(AccessOperatorConfig config) {
-  return std::make_unique<GatherBatchGet>(std::move(config));
+int GatherOutputRegistration::Acquire(const MutableBufferView& output,
+    KvafBatchGetLocalBuffer** buffer, uint64_t* entity) {
+  return KvafBatchGetLocalBufferAcquire(transport_, output.data, output.bytes, buffer, entity);
+}
+void GatherOutputRegistration::Release(KvafBatchGetLocalBuffer*& buffer) {
+  if (buffer) KvafBatchGetLocalBufferRelease(std::exchange(buffer, nullptr));
+}
+void GatherOutputRegistration::Preserve(KvafBatchGetLocalBuffer*& buffer) {
+  retained_ = std::exchange(buffer, nullptr);
+}
+
+GatherLaunchView GatherResources::View() {
+  return {views.View(ExecutionDirection::Get), args, progress, outputs,
+          config.npu_core_count, config.batch_get_token_bytes, status_device,
+          status_host, queues, profile_device, profile_host, initialized, profiling, check_async_status};
 }
 }  // namespace kvaf

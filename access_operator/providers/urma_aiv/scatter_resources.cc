@@ -1,5 +1,10 @@
 #include "scatter_execution.h"
+#include "peer_link.h"
+#include "cpu_push_get_layout.h"
+#include "scatter_mailbox_templates.h"
+#include "sequential_batch_get_common.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,7 +18,7 @@ namespace {
 constexpr uint32_t kSegmentBytes = 48;
 }  // namespace
 
-Status ScatterBatchGet::Resources::InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
+Status ScatterResources::InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
   cpu_push::Layout layout;
   if (config.npu_core_count > cpu_push::kMaxAivWorkers ||
       !cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout,
@@ -127,18 +132,20 @@ Status ScatterBatchGet::Resources::InitializePush(const peer::PeerRegion& peer, 
   return config.peer_link->StartAivCpuPushGet(region.base);
 }
 
-Status ScatterBatchGet::Resources::Close() {
+Status ScatterResources::Close() {
   std::lock_guard<std::mutex> lock(mutex);
-  if (graph.leases)
+  if (progress.graph.leases)
     return Status::InvalidState("release Scatter graph leases before shutdown");
   // A normal close must let the CPU finish serving the pending request first.
   // On execution errors, keep closing the transports before releasing memory.
-  const auto execution_status = failed ? Status::OK() : Drain();
-  const bool execution_failed = failed || !execution_status.ok();
-  failed = true;  // A partially closed transport cannot accept another Execute.
+  const auto execution_status = progress.health.failed ? Status::OK() :
+      ScatterHostOperator::Drain(View(), *active, *eager);
+  const bool execution_failed = progress.health.failed || !execution_status.ok();
+  progress.health.failed = true;  // A partially closed transport cannot accept another Execute.
+  views.Close();
   if (eager->pending) {
     const aclError synchronized = aclrtSynchronizeStream(eager->pending);
-    if (synchronized != ACL_SUCCESS) return AclFailure("shutdown_synchronize", synchronized);
+    if (synchronized != ACL_SUCCESS) return View().AclFailure("shutdown_synchronize", synchronized);
   }
   eager->pending = nullptr;
   // A timed-out control WRITE can still reference the CPU mailbox. Retire
@@ -176,25 +183,17 @@ Status ScatterBatchGet::Resources::Close() {
   }
   if (status_host && aclrtFreeHost(status_host) != ACL_SUCCESS) return Error("free status memory");
   status_host = nullptr;
-  initialized = failed = profile_ready = false; sequence = mailbox_context = 0; args = {};
+  initialized = false;
+  progress = {};
+  mailbox_context = 0;
+  args = {};
   return execution_status;
 }
 
-ScatterBatchGet::ScatterBatchGet(AccessOperatorConfig config)
-    : standalone_(std::make_unique<Resources>(std::move(config))), resources_(standalone_.get()) {}
-ScatterBatchGet::~ScatterBatchGet() {
-  if (standalone_ && !standalone_->Close().ok()) (void)standalone_.release();
-}
-std::unique_ptr<ExecutionResourceOwner> ScatterBatchGet::TakeResources() {
-  return std::move(standalone_);
-}
-Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
-  return resources_->Initialize(region);
-}
-Status ScatterBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
+Status ScatterResources::Initialize(const RemoteRegionDesc& region) {
   auto& s = *this;
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (s.initialized || s.failed || s.workspace || s.status_device || s.status_host)
+  if (s.initialized || s.progress.health.failed || s.workspace || s.status_device || s.status_host)
     return Status::InvalidState("sequential transport already initialized; shutdown before retry");
   if (!s.config.peer_link || !s.config.npu_core_count || s.config.npu_core_count > KVAF_SEQ_MAX_WORKERS ||
       !s.config.batch_get_token_bytes || uint64_t(s.config.batch_get_token_bytes) * kDefaultGetWindow > UINT32_MAX ||
@@ -261,206 +260,29 @@ Status ScatterBatchGet::Resources::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
+  s.views.Initialize(region);
+  s.views.Bind(s.active);
   std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u\n",
                unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys);
   return Status::OK();
 }
-Status ScatterBatchGet::DrainGet() {
-  std::lock_guard<std::mutex> lock(resources_->mutex);
-  return resources_->Drain();
-}
-std::unique_ptr<ExecutionState> ScatterBatchGet::CreateExecutionState() {
-  return std::make_unique<Invocation>(resources_);
-}
-Status ScatterBatchGet::BindExecutionState(ExecutionState* state) {
-  auto* invocation = dynamic_cast<Invocation*>(state);
-  if (state && (!invocation || invocation->owner != resources_))
-    return Status::InvalidArgument("Get invocation belongs to another resource owner");
-  node_ = invocation && invocation->graph_node ? invocation : nullptr;
-  if (!node_) resources_->eager = invocation ? invocation : &resources_->fallback;
-  return Status::OK();
-}
-Status ScatterBatchGet::PrepareGetGraph(const GetGraphOptions& options) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  const auto status = s.CheckExecutionState();
-  if (!status.ok()) return status;
-  const auto stream = static_cast<aclrtStream>(options.stream);
-  if (!node_ || node_->prepared || !stream || s.eager->pending || s.graph.id || s.graph.retiring ||
-      (s.graph.stream && s.graph.stream != stream) || s.graph.leases == UINT32_MAX)
-    return Status::InvalidState("prepare all Scatter graph leases on one idle stream before capture");
-  auto capture = s.RequireOutsideCapture(stream);
-  if (!capture.ok()) return capture;
-  s.graph.stream = stream;
-  ++s.graph.leases;
-  node_->prepared = true;
-  return Status::OK();
-}
-Status ScatterBatchGet::CheckBatchGetStatus(void* stream) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  const auto status = s.CheckExecutionState();
-  if (!status.ok()) return status;
-  if (!node_ || !node_->captured || s.graph.stream != stream || s.graph.retiring)
-    return Status::InvalidState("check Scatter replay using a captured graph lease and its stream");
-  auto capture = s.RequireOutsideCapture(s.graph.stream);
-  return capture.ok() ? s.ReadGraphStatus(false) : capture;
-}
-Status ScatterBatchGet::FinishGetGraph(void* stream, bool discard) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!node_ || !node_->prepared || s.graph.stream != stream)
-    return Status::InvalidState("finish Scatter using its prepared graph lease and stream");
-  if (s.failed && !discard)
-    return Status::InvalidState("destroy and discard the failed Scatter graph");
-  if (!s.graph.retiring) {
-    auto status = s.RequireOutsideCapture(s.graph.stream);
-    if (!status.ok()) return status;
-    if (s.graph.nodes && !s.failed) {
-      status = s.ReadGraphStatus(true);
-      if (!status.ok() && !discard) return status;
-    }
-    if (s.failed) {
-      const auto result = aclrtSynchronizeStream(s.graph.stream);
-      if (result != ACL_SUCCESS) return s.AclFailure("external_graph_synchronize", result);
-    }
-    s.graph.retiring = true;
-  }
-  node_->prepared = false;
-  node_->recovery_fenced = s.failed;
-  if (--s.graph.leases == 0) {
-    s.graph = {};
-    s.profile_ready = false;
-  }
-  return Status::OK();
-}
-bool ScatterBatchGet::GetGraphNeedsRecovery() const {
-  return node_ && node_->recovery_fenced;
-}
-Status ScatterBatchGet::ExecuteBatchGet(const BatchGetExecRequest& exec) {
-  auto* timing = exec.host_timing;
-  BatchGetProfileScope total(timing ? &timing->total_ns : nullptr);
-  auto& s = *resources_;
-  auto& invocation = *s.eager;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  auto state = s.CheckExecutionState();
-  if (!state.ok()) return state;
-  const bool attach_graph = exec.execution.graph_lease != 0;
-  if (s.graph.leases && !attach_graph)
-    return Status::InvalidState("release Scatter graph leases before another eager BatchGet");
-  if (!exec.request || !exec.execution.stream)
-    return Status::InvalidArgument("BatchGet needs a request and stream");
-  const auto prepare = GetHostTimingStart(timing);
-  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  aclmdlRI external_capture = nullptr;
-  if (attach_graph || !exec.execution.trusted_npu_request) {
-    bool capturing = false;
-    const auto status = s.QueryCapture(stream, &capturing, &external_capture);
-    if (!status.ok()) return status;
-    if (attach_graph) {
-      if (!capturing || !node_ || !node_->prepared || node_->captured ||
-          s.graph.retiring || invocation.pending || exec.execution.synchronize)
-        return Status::InvalidState("capture Scatter with an unused graph lease");
-      if (!external_capture || stream != s.graph.stream ||
-          (s.graph.id && external_capture != s.graph.id))
-        return Status::InvalidState("capture all Scatter leases in the same graph and stream");
-      if (s.graph.nodes >= UINT32_MAX - s.sequence)
-        return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
-    } else if (capturing) {
-      return Status::InvalidState("use a Get graph lease for Scatter capture");
-    }
-  }
-  auto result = s.Drain(timing);
-  if (!result.ok()) return result;
-  auto args = s.args;
-  const ScatterLaunchView view{s.config.npu_core_count, s.config.batch_get_token_bytes,
-                               s.payload_jettys_per_core, Ptr(s.status_device), s.mailbox_context};
-  result = PrepareScatterBatchGetArguments(exec, view, args);
-  if (!result.ok()) return result;
-  if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
-  GetHostTimingRecord(timing, &GetProviderTiming::prepare_ns, prepare);
-  if (attach_graph) {
-    args.sequence = 0;
-    args.reserved |= kScatterDeviceSequence;
-    s.graph.id = external_capture;
-    node_->captured = true;
-    ++s.graph.nodes;
-    if (KvafScatterBatchGetLaunch(&args, stream)) {
-      s.failed = true;
-      return Status::CompletionUnknown("Scatter graph launch failed; destroy and discard the graph");
-    }
-    s.profile_ready = false;
-    return Status::OK();
-  }
-  args.sequence = ++s.sequence;
-  s.profile_ready = false;
-  invocation.pending = stream;
-  // Every launched core overwrites its complete status. Drain checks this
-  // request's monotonically increasing sequence, so an old status cannot pass.
-  // Avoid submitting a separate device memset task before every kernel.
-  const auto launch = GetHostTimingStart(timing);
-  const auto launch_result = KvafScatterBatchGetLaunch(&args, invocation.pending);
-  if (timing) {
-    const auto elapsed = GetHostTimingStart(timing) - launch;
-    timing->submit_ns += elapsed;
-    timing->aiv_kernel_launch_ns += elapsed;
-  }
-  if (launch_result) {
-    s.failed = true; return Error("enqueue failed; resources retained");
-  }
-  s.profile_ready = ScatterProfileEnabled(args.reserved);
-  return exec.execution.synchronize ? s.Drain(timing) : Status::OK();
-}
 
-Status ScatterBatchGet::SetBatchGetKernelProfiling(bool enabled) {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
+Status ScatterResources::SetProfiling(bool enabled) {
+  auto& s = *this;
   if (!s.initialized) return Status::NotInitialized("scatter is not initialized");
-  auto result = s.Drain();
+  auto result = ScatterHostOperator::Drain(View(), *active, *eager);
   if (!result.ok()) return result;
-  if (s.graph.stream && enabled != ScatterProfileEnabled(s.args.reserved))
+  if (s.progress.graph.stream && enabled != ScatterProfileEnabled(s.args.reserved))
     return Status::InvalidState("detach the Scatter graph before changing profiling");
   s.args.reserved = ScatterWithProfiling(s.args.reserved, enabled);
-  s.profile_ready = false;
+  s.progress.profile_ready = false;
+  views.Prepare(ExecutionDirection::Get);
   return Status::OK();
 }
-Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const {
-  auto& s = *resources_;
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!profiles) return Status::InvalidArgument("scatter profile output is null");
-  if (!s.initialized || !ScatterProfileEnabled(s.args.reserved) || !s.profile_ready)
-    return Status::InvalidState("enable scatter profiling and complete a BatchGet first");
-  auto result = s.Drain();
-  if (!result.ok()) return result;
-  profiles->resize(s.config.npu_core_count);
-  const auto* source = static_cast<const char*>(s.status_device) + s.StatusBytes();
-  const auto copied = aclrtMemcpy(profiles->data(), s.ProfileBytes(), source,
-                                 s.ProfileBytes(), ACL_MEMCPY_DEVICE_TO_HOST);
-  if (copied != ACL_SUCCESS) { s.failed = true; return s.AclFailure("copy_profile", copied); }
-  uint64_t requests = 0;
-  const auto& first = profiles->front();
-  for (uint32_t core = 0; core < profiles->size(); ++core) {
-    const auto& p = (*profiles)[core];
-    if (p.magic != kScatterProfileMagic || p.sequence != s.sequence ||
-        !p.window_count || p.window_count != first.window_count || p.wire_sequence != first.wire_sequence ||
-        !p.start_cycle || p.inputs_ready_cycle < p.start_cycle ||
-        p.done_cycle < p.inputs_ready_cycle || p.finish_cycle < p.done_cycle ||
-        p.pipeline != ScatterOptionEnabled(s.args.reserved, kScatterPipeline) ||
-        (p.requests && (!p.scatter_cycles || !p.scatter_chunks ||
-            p.scatter_start_cycle < p.inputs_ready_cycle ||
-            p.scatter_finish_cycle > p.finish_cycle || p.scatter_finish_cycle <= p.scatter_start_cycle ||
-            p.scatter_cycles > p.scatter_finish_cycle - p.scatter_start_cycle)) ||
-        p.bytes != p.requests * s.config.batch_get_token_bytes ||
-        (!core && p.notify_cycle && (p.notify_cycle < p.inputs_ready_cycle || p.notify_cycle > p.done_cycle)))
-      return Error("invalid scatter profile; rebuild Host and AIV kernel together");
-    requests += p.requests;
-  }
-  if (requests && (!first.wire_sequence || first.cpu_magic != cpu_push::ProfileToken(first.wire_sequence)))
-    return Error("CPU push profile report missing; rebuild and restart the CPU service");
-  return Status::OK();
-}
-Status ScatterBatchGet::Shutdown() { return resources_->Close(); }
-std::unique_ptr<SequentialBatchGet> CreateScatterBatchGet(AccessOperatorConfig config) {
-  return std::make_unique<ScatterBatchGet>(std::move(config));
+
+ScatterLaunchView ScatterResources::View() {
+  return {views.View(ExecutionDirection::Get), args, progress, config.npu_core_count,
+          config.batch_get_token_bytes, payload_jettys_per_core, status_device, status_host,
+          mailbox_context, initialized};
 }
 }  // namespace kvaf
