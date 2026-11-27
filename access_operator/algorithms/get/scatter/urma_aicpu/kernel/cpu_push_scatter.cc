@@ -49,6 +49,7 @@ struct Execution {
   const MailboxLaunch* mailbox{};
   std::uint32_t head_rows{kChunkRows};
   bool cooperative{};
+  bool publisher_only{};
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   ChunkPushState& ChunkState() const { return *reinterpret_cast<ChunkPushState*>(Memory() + layout.staging); }
@@ -94,7 +95,7 @@ struct Execution {
   }
   std::uint32_t request_count{};
   std::uint64_t Relay() {
-    return cooperative ? RelayCooperativeChunks(*this, request_count, args.workers, args.sequence, head_rows)
+    return cooperative ? RelayCooperativeChunks(*this, request_count, args.workers, args.sequence, head_rows, publisher_only)
         : RelayReadyChunks(*this, request_count, args.workers, args.sequence, head_rows);
   }
   bool WaitBuildWindow(std::uint32_t chunk, std::uint32_t worker) {
@@ -212,7 +213,7 @@ struct Execution {
         header->mode = kChunkedOutput;
         header->reserved_words[0] = kChunkRows;
         if (mailbox && head_rows != kChunkRows) header->reserved_words[1] = head_rows;
-        if (mailbox && cooperative) header->reserved_words[2] = 1;
+        if (mailbox && cooperative) header->reserved_words[2] = publisher_only ? 2 : 1;
       }
       if (direct)
         *reinterpret_cast<OutputTarget*>(Memory() + layout.output_target) = *output_target;
@@ -237,11 +238,13 @@ struct Execution {
 
 static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target,
                                     bool pipeline = false, bool chunked = false,
-                                    const MailboxLaunch* mailbox = nullptr, std::uint32_t head_rows = kChunkRows, bool cooperative = false) {
+                                    const MailboxLaunch* mailbox = nullptr, std::uint32_t head_rows = kChunkRows,
+                                    bool cooperative = false, bool publisher_only = false) {
   const auto entered = mailbox && args && args->profile ? BatchGetProfileNowNs() : 0;
   Layout layout;
   if (!ValidPushHeadRows(head_rows) || (cooperative && !ValidCooperativeHeadRows(head_rows)) ||
       !args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
+      (publisher_only && (!cooperative || !chunked || !mailbox || args->workers < 2)) ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.
@@ -260,7 +263,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
     if (mailbox) profile->head_profile_tag = kCpuSglPushHeadProfileV1;
   }
   Execution io{*args, output_target, layout, c, CounterNow(),
-      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox, head_rows, cooperative};
+      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline, chunked, mailbox, head_rows, cooperative, publisher_only};
   if (mailbox && chunked && !worker) io.InitChunks();
   std::uint32_t count = 0;
   Range range{};
@@ -274,9 +277,13 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
     auto* progress = reinterpret_cast<Word*>(io.Memory() + layout.ready) + worker;
     std::uint32_t completed = 0;
     for (auto chunk = cooperative ? 0U : worker; chunk < chunks; chunk += cooperative ? 1U : args->workers) {
+      // Worker 0 joins the Head, then immediately enters the relay loop below.
+      if (publisher_only && !worker && chunk) break;
       const auto first = PushChunkBegin(chunk, head_rows), last = PushChunkEnd(count, chunk, head_rows);
-      const Range part{cooperative ? PushBuildBoundary(first, last, worker, args->workers) : first,
-                       cooperative ? PushBuildBoundary(first, last, worker + 1, args->workers) : last};
+      const auto builders = args->workers - (publisher_only && chunk ? 1U : 0U);
+      const auto builder = worker - (publisher_only && chunk ? 1U : 0U);
+      const Range part{cooperative ? PushBuildBoundary(first, last, builder, builders) : first,
+                       cooperative ? PushBuildBoundary(first, last, builder + 1, builders) : last};
       range.end += part.end - part.begin;
       if (io.Status() != Result::kPending) continue;
       if (cooperative && !io.WaitBuildWindow(chunk, worker)) continue;
@@ -429,8 +436,10 @@ std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
 namespace kvaf::cpu_push {
 std::uint32_t ExecuteCpuSglPush(CpuSglPushArgs* args) {
   const bool chunks = args && (args->write.execution.sequence & kChunkPipelineLaunch);
+  if (args && PushLaunchHeadCooperative(args->write.execution.sequence)) return 1; // AIV-only experiment.
   return args ? ExecuteCpuPush(&args->write.execution, &args->write.output_target, !chunks, chunks,
       &args->mailbox, chunks ? PushLaunchHeadRows(args->write.execution.sequence) : kChunkRows,
-      chunks && PushLaunchCooperative(args->write.execution.sequence)) : 1;
+      chunks && PushLaunchCooperative(args->write.execution.sequence),
+      args && PushLaunchPublisherOnly(args->write.execution.sequence)) : 1;
 }
 }  // namespace kvaf::cpu_push

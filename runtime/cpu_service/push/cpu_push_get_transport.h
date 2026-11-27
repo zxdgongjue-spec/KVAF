@@ -113,7 +113,8 @@ class Transport {
   urma_target_seg_t* remote_{};
   urma_target_seg_t* output_remote_{};
   OutputTarget output_;
-  bool device_push_{}, cooperative_{};
+  bool device_push_{};
+  std::uint32_t build_mode_{};
   bool direct_output_{};
   bool payload_only_{};
   bool pipeline_{};

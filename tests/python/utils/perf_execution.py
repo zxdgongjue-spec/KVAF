@@ -18,7 +18,7 @@ class BenchmarkExecution:
                  algorithm="direct", put_capacity=128, get_capacity=65536,
                  get_cores=0, get_jettys=0, put_cores=0, put_jettys=0, get_kernel="", put_kernel="",
                  max_inflight_total=2048, sge_per_wr=0, sgl_payload_only=False, sgl_pipeline=False,
-                 sgl_push_chunked=False, sgl_push_head_rows=1024, sgl_push_cooperative=False):
+                 sgl_push_chunked=False, sgl_push_head_rows=1024, sgl_push_cooperative=False, sgl_push_publisher_only=False, sgl_push_head_cooperative=False):
         if not 1 <= put_capacity <= 65536 or not 1 <= get_capacity <= 65536:
             raise ValueError("Put/Get request capacities must be in [1, 65536]")
         self.mode = "unified"
@@ -49,6 +49,10 @@ class BenchmarkExecution:
             get_budget["sgl_push_chunked"] = True
         if sgl_push_cooperative:
             get_budget["sgl_push_cooperative"] = True
+        if sgl_push_publisher_only:
+            get_budget["sgl_push_publisher_only"] = True
+        if sgl_push_head_cooperative:
+            get_budget["sgl_push_head_cooperative"] = True
         if sgl_push_head_rows != 1024:
             get_budget["sgl_push_head_rows"] = sgl_push_head_rows
         if executor == "aiv":

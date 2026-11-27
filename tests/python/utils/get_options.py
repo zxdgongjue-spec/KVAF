@@ -102,6 +102,10 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="device-WRITE each ready 1024-row chunk; cpu_sgl_push/aiv_cpu_sgl_push only")
     group.add_argument("--sgl-push-cooperative", action="store_true",
                        help="all device workers build each chunk together; requires --sgl-push-chunked and Head rows divisible by 8")
+    group.add_argument("--sgl-push-publisher-only", action="store_true",
+                       help="AICPU worker 0 only publishes after joining the Head; requires --sgl-push-cooperative and at least 2 workers")
+    group.add_argument("--sgl-push-head-cooperative", action="store_true",
+                       help="AIV workers cooperate only on the Head; requires --sgl-push-chunked, aligned Head rows, no full cooperation")
     group.add_argument("--sgl-push-head-rows", type=int, default=1024,
                        help="first device-push chunk rows (1..1024); requires --sgl-push-chunked for nondefault values")
     group.add_argument("--npu-eids", type=parse_npu_eids,
@@ -165,6 +169,11 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
+    if args.sgl_push_publisher_only and (args.backend != "cpu_sgl_push" or not args.sgl_push_cooperative or args.parallelism == 1):
+        return "--sgl-push-publisher-only requires AICPU --sgl-push-cooperative and at least 2 workers"
+    if args.sgl_push_head_cooperative and (args.backend != "aiv_cpu_sgl_push" or not args.sgl_push_chunked or
+                                         args.sgl_push_cooperative or args.sgl_push_publisher_only or args.sgl_push_head_rows % 8):
+        return "--sgl-push-head-cooperative requires AIV --sgl-push-chunked, aligned Head rows and no full cooperation"
     if args.sgl_push_cooperative and (not args.sgl_push_chunked or args.backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push")):
         return "--sgl-push-cooperative requires a device-push backend with --sgl-push-chunked"
     if args.sgl_push_cooperative and args.sgl_push_head_rows % 8:
@@ -243,6 +252,10 @@ def workload_command(args):
             command += ["--sgl-pipeline"]
         if getattr(args, "sgl_push_chunked", False):
             command += ["--sgl-push-chunked"]
+            if args.sgl_push_publisher_only:
+                command += ["--sgl-push-publisher-only"]
+            if args.sgl_push_head_cooperative:
+                command += ["--sgl-push-head-cooperative"]
             if args.sgl_push_cooperative:
                 command += ["--sgl-push-cooperative"]
             if args.sgl_push_head_rows != 1024:
@@ -271,7 +284,7 @@ def configure_backend_help(parser, argv=None):
     if backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write", "cpu_sgl_push", "aiv_cpu_sgl_push"):
         hidden.update(("sge_per_wr", "sgl_payload_only", "sgl_pipeline"))
     if backend not in ("cpu_sgl_push", "aiv_cpu_sgl_push"):
-        hidden.update(("sgl_push_chunked", "sgl_push_head_rows", "sgl_push_cooperative"))
+        hidden.update(("sgl_push_chunked", "sgl_push_head_rows", "sgl_push_cooperative", "sgl_push_publisher_only", "sgl_push_head_cooperative"))
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

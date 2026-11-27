@@ -39,6 +39,8 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
     resources.sgl_push_chunked = configured->sgl_push_chunked;
     resources.sgl_push_head_rows = configured->sgl_push_head_rows;
     resources.sgl_push_cooperative = configured->sgl_push_cooperative;
+    resources.sgl_push_publisher_only = configured->sgl_push_publisher_only;
+    resources.sgl_push_head_cooperative = configured->sgl_push_head_cooperative;
     resources.request_capacity = configured->request_capacity;
     if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
   }

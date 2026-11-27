@@ -234,6 +234,12 @@ struct NpuRuntime::Impl {
         throw std::invalid_argument("sgl_push_cooperative requires chunked CPU SGL Push Get");
       if (r.sgl_push_cooperative && r.sgl_push_head_rows % 8)
         throw std::invalid_argument("sgl_push_cooperative requires sgl_push_head_rows to be a multiple of 8");
+      if (r.sgl_push_publisher_only && (!r.sgl_push_cooperative || e != Executor::Aicpu || budget.cores < 2))
+        throw std::invalid_argument("sgl_push_publisher_only requires AICPU cooperative push and at least 2 workers");
+      if (r.sgl_push_head_cooperative && (!get || t != Transport::Urma || e != Executor::Aiv ||
+          algorithm != GetAlgorithm::CpuSglPush || !r.sgl_push_chunked || r.sgl_push_cooperative || r.sgl_push_publisher_only ||
+          r.sgl_push_head_rows % 8))
+        throw std::invalid_argument("sgl_push_head_cooperative requires AIV chunked push, aligned Head rows and no full cooperation");
       if (!r.sgl_push_head_rows || r.sgl_push_head_rows > 1024 ||
           (r.sgl_push_head_rows != 1024 && (!get || t != Transport::Urma || algorithm != GetAlgorithm::CpuSglPush || !r.sgl_push_chunked)))
         throw std::invalid_argument("sgl_push_head_rows requires chunked CPU SGL Push Get and a value in [1, 1024]");
@@ -375,7 +381,7 @@ struct NpuRuntime::Impl {
         return cpu_push::CreateAivCpuSglWriteOperator(cpu_push::Config{
             link, budget.kernel_path, eids.front(), options.batch_get_token_bytes, budget.cores,
             true, budget.sge_per_wr, budget.sgl_payload_only, true, budget.sgl_pipeline,
-            algorithm == GetAlgorithm::CpuSglPush, budget.sgl_push_chunked, budget.sgl_push_head_rows, budget.sgl_push_cooperative});
+            algorithm == GetAlgorithm::CpuSglPush, budget.sgl_push_chunked, budget.sgl_push_head_rows, budget.sgl_push_cooperative, budget.sgl_push_publisher_only, budget.sgl_push_head_cooperative});
       AccessOperatorConfig c;
       c.peer_local = cache_peer_local;
       c.peer_link = link;
@@ -402,7 +408,7 @@ struct NpuRuntime::Impl {
         algorithm == GetAlgorithm::CpuSglPush ? "cpu_sgl_push" :
         IsCpuSgl(algorithm) ? "cpu_sgl_write" :
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        eids.front(), get, budget.sge_per_wr, budget.sgl_payload_only, budget.sgl_pipeline, budget.sgl_push_chunked, budget.sgl_push_head_rows, budget.sgl_push_cooperative});
+        eids.front(), get, budget.sge_per_wr, budget.sgl_payload_only, budget.sgl_pipeline, budget.sgl_push_chunked, budget.sgl_push_head_rows, budget.sgl_push_cooperative, budget.sgl_push_publisher_only, budget.sgl_push_head_cooperative});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif

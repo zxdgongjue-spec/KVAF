@@ -493,6 +493,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         get_capacity=args.request_length, sge_per_wr=args.sge_per_wr, sgl_payload_only=args.sgl_payload_only,
         sgl_pipeline=args.sgl_pipeline, sgl_push_chunked=args.sgl_push_chunked,
         sgl_push_head_rows=args.sgl_push_head_rows, sgl_push_cooperative=args.sgl_push_cooperative,
+        sgl_push_publisher_only=args.sgl_push_publisher_only, sgl_push_head_cooperative=args.sgl_push_head_cooperative,
     )
     stream = torch.npu.current_stream()
     if args.multi_graph_check:
@@ -1026,6 +1027,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         max_inflight_total=args.max_inflight_total, sge_per_wr=args.sge_per_wr, sgl_payload_only=args.sgl_payload_only,
         sgl_pipeline=args.sgl_pipeline, sgl_push_chunked=args.sgl_push_chunked,
         sgl_push_head_rows=args.sgl_push_head_rows, sgl_push_cooperative=args.sgl_push_cooperative,
+        sgl_push_publisher_only=args.sgl_push_publisher_only, sgl_push_head_cooperative=args.sgl_push_head_cooperative,
     )
     runtime = kvaf.NpuRuntime(
         **runtime_options(args),
@@ -1065,7 +1067,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"sge_per_wr={args.sge_per_wr} "
             f"sgl_pipeline={int(args.sgl_pipeline)} sgl_push_chunked={int(args.sgl_push_chunked)} "
             f"sgl_push_head_rows={args.sgl_push_head_rows} sgl_push_cooperative={int(args.sgl_push_cooperative)} "
-            f"sgl_push_build_mode={'cooperative' if args.sgl_push_cooperative else 'round_robin'} "
+            f"sgl_push_publisher_only={int(args.sgl_push_publisher_only)} sgl_push_head_cooperative={int(args.sgl_push_head_cooperative)} "
+            f"sgl_push_build_mode={'publisher_only' if args.sgl_push_publisher_only else 'head_cooperative' if args.sgl_push_head_cooperative else 'cooperative' if args.sgl_push_cooperative else 'round_robin'} "
             f"sgl_pipeline_mode={'device_push_chunked' if args.sgl_push_chunked else 'device_push_head_suffix' if args.backend in ('cpu_sgl_push', 'aiv_cpu_sgl_push') else 'chunked' if args.sgl_pipeline else 'disabled'} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "

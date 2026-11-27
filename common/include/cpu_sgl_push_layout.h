@@ -5,31 +5,56 @@
 #endif
 namespace kvaf::cpu_push {
 // Mode 5 and its registered layout stay compatible. Mode 6 carries Head rows
-// in bits 8..31. Mode 7 additionally selects cooperative builders; older CPU
-// services reject these modes before any device launch.
+// in bits 8..31. Modes 7/8/9 select full cooperation, AICPU publisher-only and
+// AIV Head-only cooperation; older CPU services reject unsupported modes.
 constexpr std::uint32_t kPushHeadOutput = 6;
 constexpr std::uint32_t kPushCooperativeOutput = 7;
+constexpr std::uint32_t kPushPublisherOutput = 8;
+constexpr std::uint32_t kPushHeadCooperativeOutput = 9;
 constexpr std::uint64_t kPushHeadLaunch = std::uint64_t{1} << 60;
 constexpr std::uint64_t kPushCooperativeLaunch = std::uint64_t{1} << 59;
+constexpr std::uint64_t kPushPublisherLaunch = std::uint64_t{1} << 58;
+constexpr std::uint64_t kPushHeadCooperativeLaunch = std::uint64_t{1} << 57;
+// Local builder progress only. Never forward this bit to the CPU mailbox.
+constexpr std::uint32_t kPushHeadBuilt = 1U << 30;
 KVAF_SGL_LAYOUT_INLINE bool ValidPushHeadRows(std::uint32_t head) { return head && head <= kChunkRows; }
 KVAF_SGL_LAYOUT_INLINE bool ValidCooperativeHeadRows(std::uint32_t head) {
   return ValidPushHeadRows(head) && head % 8 == 0;
 }
-KVAF_SGL_LAYOUT_INLINE std::uint32_t PushOutputMode(std::uint32_t head, bool cooperative = false) {
+KVAF_SGL_LAYOUT_INLINE std::uint32_t PushOutputMode(std::uint32_t head, bool cooperative = false,
+    bool publisher_only = false, bool head_cooperative = false) {
+  if (publisher_only) return kPushPublisherOutput | (head << 8);
+  if (head_cooperative) return kPushHeadCooperativeOutput | (head << 8);
   if (cooperative) return kPushCooperativeOutput | (head << 8);
   return head == kChunkRows ? kPushChunkedOutput : kPushHeadOutput | (head << 8);
 }
 KVAF_SGL_LAYOUT_INLINE std::uint32_t PushSetupHeadRows(std::uint32_t mode) {
   const auto head = mode >> 8;
   return head && (((mode & 255U) == kPushHeadOutput && head < kChunkRows) ||
-      ((mode & 255U) == kPushCooperativeOutput && ValidCooperativeHeadRows(head))) ? head : 0;
+      ((mode & 255U) >= kPushCooperativeOutput && (mode & 255U) <= kPushHeadCooperativeOutput &&
+       ValidCooperativeHeadRows(head))) ? head : 0;
 }
-KVAF_SGL_LAYOUT_INLINE std::uint64_t PushLaunch(std::uint32_t head, bool cooperative = false) {
+KVAF_SGL_LAYOUT_INLINE std::uint64_t PushLaunch(std::uint32_t head, bool cooperative = false,
+    bool publisher_only = false, bool head_cooperative = false) {
   return kChunkPipelineLaunch | (head == kChunkRows ? 0 : kPushHeadLaunch | head) |
-      (cooperative ? kPushCooperativeLaunch : 0);
+      (cooperative ? kPushCooperativeLaunch : 0) | (publisher_only ? kPushPublisherLaunch : 0) |
+      (head_cooperative ? kPushHeadCooperativeLaunch : 0);
 }
 KVAF_SGL_LAYOUT_INLINE bool PushLaunchCooperative(std::uint64_t hint) {
   return (hint & kPushCooperativeLaunch) != 0;
+}
+KVAF_SGL_LAYOUT_INLINE bool PushLaunchPublisherOnly(std::uint64_t hint) {
+  return (hint & kPushPublisherLaunch) != 0;
+}
+KVAF_SGL_LAYOUT_INLINE bool PushLaunchHeadCooperative(std::uint64_t hint) {
+  return (hint & kPushHeadCooperativeLaunch) != 0;
+}
+KVAF_SGL_LAYOUT_INLINE std::uint32_t PushLaunchBuildMode(std::uint64_t hint) {
+  return PushLaunchPublisherOnly(hint) ? 2 : PushLaunchHeadCooperative(hint) ? 3 : PushLaunchCooperative(hint) ? 1 : 0;
+}
+KVAF_SGL_LAYOUT_INLINE std::uint32_t PushSetupBuildMode(std::uint32_t mode) {
+  const auto kind = mode & 255U;
+  return kind >= kPushCooperativeOutput && kind <= kPushHeadCooperativeOutput ? kind - kPushCooperativeOutput + 1 : 0;
 }
 KVAF_SGL_LAYOUT_INLINE std::uint32_t PushLaunchHeadRows(std::uint64_t hint) {
   return hint & kPushHeadLaunch ? std::uint32_t(hint & 0xffffU) : kChunkRows;

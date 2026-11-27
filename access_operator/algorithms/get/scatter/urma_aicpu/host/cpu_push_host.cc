@@ -138,7 +138,7 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
       {profile ? profile->device : s.profile_device, profile ? profile->host : s.profile_host,
        s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling, s.config.direct_output,
       s.bound_outputs.count(s.invocation) ? s.outputs.at(s.bound_outputs.at(s.invocation)).target : OutputTarget{},
-      s.config.sgl_pipeline, s.config.device_push, s.mailbox, s.config.sgl_push_chunked, s.config.sgl_push_head_rows, s.config.sgl_push_cooperative};
+      s.config.sgl_pipeline, s.config.device_push, s.mailbox, s.config.sgl_push_chunked, s.config.sgl_push_head_rows, s.config.sgl_push_cooperative, s.config.sgl_push_publisher_only, s.config.sgl_push_head_cooperative};
 }
 bool CpuPushTransport::direct_output() const { return impl_->config.direct_output; }
 Status CpuPushTransport::RegisterOutput(const MutableBufferView& output) {
@@ -400,6 +400,11 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     return Status::InvalidArgument("sgl_push_cooperative requires chunked device push");
   if (s.config.sgl_push_cooperative && !ValidCooperativeHeadRows(s.config.sgl_push_head_rows))
     return Status::InvalidArgument("sgl_push_cooperative requires Head rows in [8, 1024], a multiple of 8");
+  if (s.config.sgl_push_publisher_only && (!s.config.sgl_push_cooperative || s.config.aiv || s.config.workers < 2))
+    return Status::InvalidArgument("sgl_push_publisher_only requires AICPU cooperative push and at least 2 workers");
+  if (s.config.sgl_push_head_cooperative && (!s.config.aiv || !s.config.sgl_push_chunked || s.config.sgl_push_cooperative ||
+      s.config.sgl_push_publisher_only || !ValidCooperativeHeadRows(s.config.sgl_push_head_rows)))
+    return Status::InvalidArgument("sgl_push_head_cooperative requires AIV chunked push, aligned Head rows and no full cooperation");
   if (!ValidPushHeadRows(s.config.sgl_push_head_rows) ||
       (s.config.sgl_push_head_rows != kChunkRows && !s.config.sgl_push_chunked))
     return Status::InvalidArgument("sgl_push_head_rows requires chunked device push and a value in [1, 1024]");
@@ -471,7 +476,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
   if (s.config.sgl_payload_only) open.output_mode = kPayloadOnlyOutput;
   if (s.config.sgl_pipeline) open.output_mode = kChunkedOutput;
-  if (s.config.device_push) open.output_mode = s.config.sgl_push_chunked ? PushOutputMode(s.config.sgl_push_head_rows, s.config.sgl_push_cooperative) : kPipelinedOutput;
+  if (s.config.device_push) open.output_mode = s.config.sgl_push_chunked ? PushOutputMode(s.config.sgl_push_head_rows, s.config.sgl_push_cooperative, s.config.sgl_push_publisher_only, s.config.sgl_push_head_cooperative) : kPipelinedOutput;
   open.sge_per_wr = s.config.sge_per_wr;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
@@ -694,7 +699,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
   if ((view.sgl_pipeline && !view.device_push) || view.sgl_push_chunked) args.sequence = kChunkPipelineLaunch;
-  if (view.sgl_push_chunked) args.sequence = PushLaunch(view.sgl_push_head_rows, view.sgl_push_cooperative);
+  if (view.sgl_push_chunked) args.sequence = PushLaunch(view.sgl_push_head_rows, view.sgl_push_cooperative, view.sgl_push_publisher_only, view.sgl_push_head_cooperative);
   const CpuSglWriteArgs direct_args{args, view.output_target};
   const CpuSglPushArgs pushed_args{direct_args, view.mailbox};
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);

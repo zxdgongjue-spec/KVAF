@@ -10,6 +10,7 @@ void RunPush(Fixture& f, Result expected = Result::kOk) {
   mailbox_model::first_wait_ns = 0;
   const bool chunks = (f.args.sequence & kChunkPipelineLaunch) != 0;
   const bool cooperative = chunks && PushLaunchCooperative(f.args.sequence);
+  const bool publisher_only = chunks && PushLaunchPublisherOnly(f.args.sequence);
   const auto head_rows = chunks ? PushLaunchHeadRows(f.args.sequence) : kChunkRows;
   std::vector<Word> mailbox(f.layout.staging / 64);
   const auto remote = reinterpret_cast<uint64_t>(mailbox.data());
@@ -45,7 +46,7 @@ void RunPush(Fixture& f, Result expected = Result::kOk) {
     const auto head = std::min(uint32_t(f.count), kPipelineHeadRows);
     assert(request->reserved_words[0] == (chunks ? kChunkRows : head));
     assert(request->reserved_words[1] == (chunks && head_rows < kChunkRows ? head_rows : 0));
-    assert(request->reserved_words[2] == (cooperative ? 1U : 0U));
+    assert(request->reserved_words[2] == PushLaunchBuildMode(f.args.sequence));
     const auto* target = reinterpret_cast<OutputTarget*>(remote + f.layout.output_target);
     assert(target->base == f.args.output);
     const auto* sources = reinterpret_cast<uint64_t*>(remote + f.layout.descriptor);
@@ -98,7 +99,10 @@ void RunPush(Fixture& f, Result expected = Result::kOk) {
         uint64_t rows = 0;
         for (uint32_t c = 0; c < PushChunkCount(uint32_t(f.count), head_rows); ++c) {
           const auto begin = PushChunkBegin(c, head_rows), end = PushChunkEnd(uint32_t(f.count), c, head_rows);
-          rows += PushBuildBoundary(begin, end, w + 1, f.args.workers) - PushBuildBoundary(begin, end, w, f.args.workers);
+          if (publisher_only && c && !w) continue;
+          const auto first = w - (publisher_only && c ? 1U : 0U);
+          const auto builders = f.args.workers - (publisher_only && c ? 1U : 0U);
+          rows += PushBuildBoundary(begin, end, first + 1, builders) - PushBuildBoundary(begin, end, first, builders);
         }
         assert(p.spans == rows);
       }
@@ -114,12 +118,22 @@ void RunPush(Fixture& f, Result expected = Result::kOk) {
     assert(!std::memcmp(f.output.data() + i * kBytes, reinterpret_cast<void*>(f.addresses[f.indices[i]] + f.offsets[i]), kBytes));
 }
 }
-void ConfigureHead(Fixture& f, uint32_t head, bool cooperative = false) {
+void ConfigureHead(Fixture& f, uint32_t head, bool cooperative = false, bool publisher_only = false) {
   std::free(f.workspace); f.workspace = std::aligned_alloc(64, f.layout.bytes + PushWorkspaceBytes(head));
   std::memset(f.workspace, 0, f.layout.bytes + PushWorkspaceBytes(head));
-  f.args.workspace = reinterpret_cast<uint64_t>(f.workspace); f.args.sequence = PushLaunch(head, cooperative);
+  f.args.workspace = reinterpret_cast<uint64_t>(f.workspace); f.args.sequence = PushLaunch(head, cooperative, publisher_only);
 }
 int main() {
+  for (uint32_t head : {8U, 128U, 256U, 512U, 1024U}) for (uint32_t workers : {2U, 4U, 5U, 8U}) {
+    Fixture f(workers); ConfigureHead(f, head, true, true);
+    for (uint32_t count : {1U, 7U, head, head + 1, head + 1024, head + 1025, 0U, 4097U}) { f.count = count; RunPush(f); }
+  }
+  { Fixture f(5, 65536); ConfigureHead(f, 256, true, true); f.count = 65536; RunPush(f); }
+  { Fixture f(5); ConfigureHead(f, 512, true, true); f.rows[511] = -1; RunPush(f, Result::kInvalidRequest); }
+  { Fixture f(2); ConfigureHead(f, 512, true, true); f.rows[3000] = -1; RunPush(f, Result::kInvalidRequest); }
+  { Fixture f(1); ConfigureHead(f, 1024, true, true);
+    CpuSglPushArgs invalid{f.direct_args, {1, 1, 0, 1, 1}};
+    assert(ExecuteCpuSglPush(&invalid) != 0 && !f.coordination.claimed.value); }
   for (uint32_t head : {128U, 256U, 512U, 1024U}) for (uint32_t workers : {1U, 4U, 5U, 8U}) {
     Fixture f(workers); ConfigureHead(f, head, true);
     for (uint32_t count : {7U, head, head + 1, head + 1024, head + 1025, 0U, 4097U}) { f.count = count; RunPush(f); }

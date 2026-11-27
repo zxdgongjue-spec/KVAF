@@ -59,7 +59,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (push && (setup.output_mode == kPushChunkedOutput || small_head) && setup.hbm_bytes < layout_.bytes + PushWorkspaceBytes(head_rows_))
     return Status::InvalidArgument("missing device-push chunk commit storage");
   device_push_ = push != nullptr;
-  cooperative_ = (setup.output_mode & 255U) == kPushCooperativeOutput;
+  build_mode_ = PushSetupBuildMode(setup.output_mode);
+  if (build_mode_ == 2 && setup.workers < 2)
+    return Status::InvalidArgument("publisher-only push requires at least 2 workers");
   context_ = context;
   source_ = source;
   source_base_ = canonical_base ? canonical_base : source->seg.ubva.va;
@@ -317,7 +319,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   batch_result_ = Result::kOk;
   head_count_ = pipeline_ ? static_cast<std::uint32_t>(r.reserved_words[0]) : 0;
   if (chunked_ && (r.reserved_words[0] != kChunkRows || r.reserved_words[1] != (head_rows_ < kChunkRows ? head_rows_ : 0) ||
-      r.reserved_words[2] != (cooperative_ ? 1U : 0U) || !r.count))
+      r.reserved_words[2] != build_mode_ || !r.count))
     return Status::InvalidArgument("invalid CPU SGL chunk size");
   if (pipeline_ && !chunked_ && (r.reserved_words[0] != std::min(r.count, kPipelineHeadRows) || !head_count_))
     return Status::InvalidArgument("invalid CPU SGL pipeline head");
@@ -1057,7 +1059,9 @@ void Transport::PrintProfile() const {
         " source_sge_update_us=%.3f payload_post_us=%.3f done_post_us=%.3f done_cq_wait_us=%.3f cpu_total_us=%.3f"
         " no_ready_us=%.3f no_ready_inflight_us=%.3f no_ready_idle_us=%.3f"
         " local_progress_polls=%u data_wrs=%u tail_cqes=%u post_calls=%u max_inflight=%u plan_reused=%u result=%u\n",
-        request().sequence, request().count, head_rows_, kChunkRows, p.chunks, cooperative_ ? "cooperative" : "round_robin", p.address_validate_ns / 1000.0,
+        request().sequence, request().count, head_rows_, kChunkRows, p.chunks,
+        build_mode_ == 2 ? "publisher_only" : build_mode_ == 3 ? "head_cooperative" : build_mode_ == 1 ? "cooperative" : "round_robin",
+        p.address_validate_ns / 1000.0,
         p.first_post_ns ? (p.first_post_ns - p.cpu_start_ns) / 1000.0 : 0,
         p.chunk_ready_ns / 1000.0, p.chunk_submit_ns / 1000.0, p.chunk_cq_wait_ns / 1000.0,
         p.source_sge_update_ns / 1000.0, p.post_ns / 1000.0, p.done_post_ns / 1000.0,

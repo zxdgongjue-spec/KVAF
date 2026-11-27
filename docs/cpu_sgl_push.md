@@ -154,6 +154,69 @@ CPU 先验证协商值，再接受请求头；旧 CPU 服务会拒绝该 setup�
 配置/CSV 记录 `sgl_push_cooperative`，设备配置输出 `sgl_push_build_mode`，
 CPU chunk 日志输出 `build_mode=cooperative/round_robin`。
 
+### AICPU 专职发布核与 AIV 仅 Head 协同
+
+两个实验模式分别保留开关，默认关闭；本轮不修改 CPU 的数据 WR 计划、提交粒度、
+128 WR post 上限、四条数据 Jetty、四计划在途窗口及 CQ 调度，不做 CPU 后段合批。
+
+| 模式 | 配置 | 设备行为 |
+| --- | --- | --- |
+| AICPU 专职发布 | `sgl_push_chunked=True, sgl_push_cooperative=True, sgl_push_publisher_only=True` | Head 全部 worker 协同；之后 0 只发布，其余 worker 协同构建后段 |
+| AIV 仅 Head 协同 | `sgl_push_chunked=True, sgl_push_head_cooperative=True` | Head 全部核协同；后续段按原 `chunk % workers` 分核，0 继续构建和统一发布 |
+
+两种模式均要求 Head 行数为 8..1024 中的 8 的倍数。AICPU 专职发布仅支持 AICPU、
+至少 2 worker，要求同时打开全段协同；5 worker 时 Head 分给 5 个 worker，后段分给 1..4。
+发布 Head 前依然汇齐所有 worker，发布后只聚合 1..N-1 的后段前缀，0 的进度停留在 1。
+后段仍保留四段提前构建窗口。该模式不会额外创建 worker，核数仍为原配置总数。
+
+AIV 仅 Head 协同仅支持 AIV，与全段协同及专职发布互斥。Head 分片构建后，各核可直接
+继续自己的整段后缀，无需全局复位进度。每个本地 Ready 使用独立的 Head 完成 bit 与
+原循环 owner 完成段数；该 bit 只在设备内部使用，CPU 收到的仍是原进度格式。
+因此“worker 1 的 Head 部分已完成”不会被当作“第 1 个后续段已完成”。
+Head=1024、4 核、8192 行时，共有 4 次 Head 分片构建和 7 次后段构建；
+0 核仍负责后段 4，其他核负责后段 1/5、2/6、3/7。
+
+两者的 `head_build` 都包含 0 核自己的 Head 构建及汇齐等待；其他核和空请求仍为零。
+`head_doorbell`、kernel 和端到端的计时口径保持不变。
+
+协议分别使用 setup mode 8/9（高位为 Head 行数），请求头 `reserved_words[2]=2/3`。
+CPU 只增加模式协商、请求头核对和 `build_mode=publisher_only/head_cooperative` 标识，
+数据调度仍按原虚拟 owner 消费。须同步重建 CPU 服务、NPU Host/Python 和 kernel，重启两端；
+旧 CPU 会拒绝新 setup，旧 kernel 的请求头标记也会在数据 WRITE 之前被拒绝。
+
+以下在 NPU 仓库根目录执行，两组均固定 Head=1024、SGE4、ACL 图模式：
+
+```bash
+# AICPU：5 worker，0 核在 Head 后专职发布
+KVAF_CPU_SERVICE_ADDR=141.62.38.71:21112 DEVICE_ID=7 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend cpu_sgl_push --aicpu-workers 5 --sge-per-wr 4 \
+  --sgl-push-chunked --sgl-push-cooperative --sgl-push-publisher-only \
+  --sgl-push-head-rows 1024 --execution graph --graph-api acl \
+  --request-length 32768 --table-capacity 1277952 --miss-count 8192 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+  --warmup 10 --iterations 100 --kernel-profile \
+  --output-dir reports/aicpu-publisher-only/head1024-sge4
+
+# AIV：4 核仅 Head 协同，后段恢复按段分核
+KVAF_CPU_SERVICE_ADDR=141.62.38.71:21112 DEVICE_ID=7 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv_cpu_sgl_push --aiv-cores 4 --sge-per-wr 4 \
+  --sgl-push-chunked --sgl-push-head-cooperative \
+  --sgl-push-head-rows 1024 --execution graph --graph-api acl \
+  --request-length 32768 --table-capacity 1277952 --miss-count 8192 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+  --warmup 10 --iterations 100 --kernel-profile \
+  --output-dir reports/aiv-head-cooperative/head1024-sge4
+```
+
+AICPU 去掉 `--sgl-push-publisher-only` 即为原全段协同对照；AIV 去掉
+`--sgl-push-head-cooperative` 即为原按段分核对照。各自使用不同报告目录。
+配置输出和 CPU profile 应分别显示 `publisher_only` / `head_cooperative`。
+资源查询、Python 构造参数、子命令和 summary.csv 同时记录两个新布尔开关。
+
 流水发布后发生后缀错误时，CPU 不提交错误后缀，排空已提交的合法数据后返回失败 done。
 失败请求可能已写入 head，output 不可消费；按现有执行资源失效和重建流程处理。
 Shutdown 先确认设备发送 kernel 已停止，再销毁描述符发送队列；CPU STOP 完成后才释放
@@ -403,6 +466,10 @@ FIFO 回收/槽位复用及部分提交失败后 WR/SGE 存储保留；资源解
 `no_ready_inflight_us` 覆盖完整等待区间而不只是本地扫描耗时。
 协同模型覆盖所有核的实际构建范围与缓存行唯一所有权、短 Head/空子区间、慢核导致 Head 延迟、
 其他核可提前构建、Head 发布前/后失败、65 段、多轮进度和 mode 7/请求头标记不匹配拒绝。
+新增模式检查 AICPU 0 核的构建范围仅为其 Head 分片、剩余 worker 覆盖所有后段、
+0 的前缀停在 1 时发布仍能完成；AIV 检查 Head 分片加循环后段的实际复制范围、
+暂停后段时不会把 Head 完成误当作后段就绪，并覆盖空请求、空分片、失败、65 段及跨轮次进度。
+CPU fake-provider 对 mode 8/9 验证成功、错误/STOP 排空及四种请求头标记之间的错误混用拒绝。
 没有 UMDK 头文件时跳过 CPU 传输模型和原生 UMDK 语法检查。
 
 这些检查不替代 CANN/ccec 编译、真实 DMA 可见性、注册退役及 NPU 图回放验证。

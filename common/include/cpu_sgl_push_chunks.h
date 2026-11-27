@@ -24,17 +24,20 @@ template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t FailChunkControl(IO& io, 
 }
 template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t RelayReadyChunks(IO& io, std::uint32_t count,
                                                 std::uint32_t workers, std::uint64_t sequence,
-                                                std::uint32_t head = kChunkRows) {
+                                                std::uint32_t head = kChunkRows, bool head_cooperative = false) {
   const auto chunks = PushChunkCount(count, head);
   for (std::uint32_t owner = 0; owner < workers; ++owner) {
     const auto token = io.ProgressWord(owner), epoch = token >> 32;
     if (epoch < sequence) continue;
     if (epoch > sequence) return FailChunkControl(io, owner, std::uint32_t(Result::kSequenceError));
-    const auto progress = std::uint32_t(token), sent = io.Sent(owner);
-    if (progress & kChunkFailed) {
-      const auto error = progress & ~kChunkFailed;
+    const auto raw = std::uint32_t(token), sent = io.Sent(owner);
+    if (raw & kChunkFailed) {
+      const auto error = raw & ~kChunkFailed;
       return FailChunkControl(io, owner, error >= 2 && error <= 6 ? error : std::uint32_t(Result::kInvalidRequest));
     }
+    if (head_cooperative && !(raw & kPushHeadBuilt))
+      return FailChunkControl(io, owner, std::uint32_t(Result::kInvalidRequest));
+    const auto progress = head_cooperative ? raw & ~kPushHeadBuilt : raw;
     const auto owned = chunks / workers + (owner < chunks % workers);
     if (progress > owned || progress < sent)
       return FailChunkControl(io, owner, std::uint32_t(Result::kInvalidRequest));
@@ -61,9 +64,9 @@ template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t DrainChunkControls(IO& io
 // Read only builder-owned Ready lines; publisher bookkeeping may still belong
 // to a previous replay while the cooperative Head is being built.
 template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t CooperativeProgress(IO& io,
-    std::uint32_t chunks, std::uint32_t workers, std::uint64_t sequence) {
+    std::uint32_t chunks, std::uint32_t workers, std::uint64_t sequence, std::uint32_t first_worker = 0) {
   auto ready = chunks;
-  for (std::uint32_t w = 0; w < workers; ++w) {
+  for (std::uint32_t w = first_worker; w < workers; ++w) {
     const auto token = io.ProgressWord(w), epoch = token >> 32;
     if (epoch < sequence) { ready = 0; continue; }
     if (epoch > sequence) return std::uint64_t(Result::kSequenceError) << 32;
@@ -78,8 +81,12 @@ template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t CooperativeProgress(IO& i
   return ready;
 }
 template<class IO> KVAF_SGL_CHUNK_INLINE std::uint64_t RelayCooperativeChunks(IO& io,
-    std::uint32_t count, std::uint32_t workers, std::uint64_t sequence, std::uint32_t head) {
-  const auto snapshot = CooperativeProgress(io, PushChunkCount(count, head), workers, sequence);
+    std::uint32_t count, std::uint32_t workers, std::uint64_t sequence, std::uint32_t head,
+    bool publisher_only = false) {
+  // All workers join the Head. Afterwards worker 0 owns only the control SQ;
+  // suffix prefixes are the minimum of workers 1..N-1.
+  const auto snapshot = CooperativeProgress(io, PushChunkCount(count, head), workers, sequence,
+      publisher_only && io.Notified() ? 1 : 0);
   if (snapshot >> 32) return FailChunkControl(io, 0, std::uint32_t(snapshot >> 32));
   const auto ready = std::uint32_t(snapshot);
   if (ready < io.Total()) return FailChunkControl(io, 0, std::uint32_t(Result::kInvalidRequest));

@@ -16,6 +16,43 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_publisher_only_and_head_cooperative_resources(self):
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        for backend, executor, flag, resource, coop in (
+            ("cpu_sgl_push", "aicpu", "--sgl-push-publisher-only", "sgl_push_publisher_only", True),
+            ("aiv_cpu_sgl_push", "aiv", "--sgl-push-head-cooperative", "sgl_push_head_cooperative", False),
+        ):
+            self.assertFalse(getattr(parse_args(["--backend", backend]), resource))
+            for head in (8, 256, 512, 1024):
+                flags = ["--backend", backend, "--sgl-push-chunked", flag, "--sgl-push-head-rows", str(head)]
+                if coop: flags += ["--sgl-push-cooperative"]
+                args = parse_args(flags)
+                self.assertIsNone(validate_args(args))
+                self.assertTrue(getattr(parse_args(workload_command(args)), resource))
+                execution = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_push",
+                    sgl_push_chunked=True, sgl_push_cooperative=coop, sgl_push_head_rows=head, **{resource: True})
+                self.assertTrue(execution.runtime_kwargs["get_resources"][0][1][resource])
+                self.assertNotIn(resource, execution.runtime_kwargs["put_resources"][0][1])
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+                    args.output_dir = Path(directory)
+                    report = BatchGetCsv(args); report.add_summary("graph", {}); report.write()
+                    with report.summary_path.open() as source:
+                        self.assertEqual(next(csv.DictReader(source))[resource], "1")
+
+    def test_reject_invalid_publisher_and_head_only_modes(self):
+        for flags in (
+            ["--backend", "cpu_sgl_push", "--sgl-push-chunked", "--sgl-push-publisher-only"],
+            ["--backend", "cpu_sgl_push", "--sgl-push-chunked", "--sgl-push-cooperative", "--sgl-push-publisher-only", "--aicpu-workers", "1"],
+            ["--backend", "aiv_cpu_sgl_push", "--sgl-push-chunked", "--sgl-push-cooperative", "--sgl-push-publisher-only"],
+            ["--backend", "cpu_sgl_push", "--sgl-push-chunked", "--sgl-push-head-cooperative"],
+            ["--backend", "aiv_cpu_sgl_push", "--sgl-push-head-cooperative"],
+            ["--backend", "aiv_cpu_sgl_push", "--sgl-push-chunked", "--sgl-push-cooperative", "--sgl-push-head-cooperative"],
+            ["--backend", "aiv_cpu_sgl_push", "--sgl-push-chunked", "--sgl-push-head-cooperative", "--sgl-push-head-rows", "7"],
+        ):
+            self.assertIsNotNone(validate_args(parse_args(flags)), flags)
+
     def test_cooperative_build_is_opt_in_and_forwarded(self):
         kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
                                PutExecutionConfig=lambda *args: args,

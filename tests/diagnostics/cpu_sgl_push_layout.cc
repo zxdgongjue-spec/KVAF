@@ -9,10 +9,13 @@ using namespace kvaf::cpu_push;
 struct RelayIO {
   struct Posted { unsigned chunk, owner, progress; bool first; };
   std::array<std::uint64_t, 8> progress{};
+  std::array<unsigned, 8> sent{};
   std::vector<Posted> posts;
   unsigned pending{}, total{}, waits{}, errors{};
   bool notified{}, error_sent{};
   std::uint64_t ProgressWord(unsigned w) const { return progress[w]; }
+  unsigned Sent(unsigned w) const { return sent[w]; }
+  void SetSent(unsigned w, unsigned s) { sent[w] = s; }
   unsigned Pending() const { return pending; }
   void SetPending(unsigned p) { assert(p <= kPushControlWindow); pending = p; }
   unsigned Total() const { return total; }
@@ -22,7 +25,7 @@ struct RelayIO {
   bool ErrorSent() const { return error_sent; }
   void SetErrorSent() { error_sent = true; }
   unsigned Wait() { assert(pending); ++waits; return 0; }
-  unsigned Error(unsigned owner, unsigned error) { assert(owner == 0 && error); ++errors; return 0; }
+  unsigned Error(unsigned owner, unsigned error) { assert(owner < 8 && error); ++errors; return 0; }
   unsigned Post(unsigned c, unsigned w, unsigned p, bool first) { posts.push_back({c, w, p, first}); return 0; }
 };
 void CheckRelay() {
@@ -54,6 +57,32 @@ void CheckRelay() {
   assert(CooperativeProgress(failed, chunks, workers, sequence) == (std::uint64_t(Result::kSequenceError) << 32));
   failed.progress[2] = Progress(sequence, chunks + 1);
   assert(CooperativeProgress(failed, chunks, workers, sequence) == (std::uint64_t(Result::kInvalidRequest) << 32));
+
+  RelayIO publisher;
+  publisher.progress.fill(Progress(sequence, chunks));
+  publisher.progress[0] = Progress(sequence, 0);
+  auto publish = [&] { return RelayCooperativeChunks(publisher, count, workers, sequence, head, true); };
+  assert(!publish() && publisher.posts.empty()); // Head must include worker 0.
+  publisher.progress[0] = Progress(sequence, 1);
+  assert(!publish() && publisher.total == 1);
+  assert(!publish() && publisher.total == chunks); // Worker 0 stays at Head forever.
+  assert(publisher.posts.size() == chunks && publisher.progress[0] == Progress(sequence, 1));
+  for (unsigned c = 0; c < chunks; ++c)
+    assert(publisher.posts[c].owner == c % workers && publisher.posts[c].progress == c / workers + 1);
+  assert(!DrainChunkControls(publisher));
+
+  RelayIO hybrid;
+  hybrid.progress.fill(Progress(sequence, kPushHeadBuilt));
+  hybrid.progress[0] = Progress(sequence, kPushHeadBuilt | 1U);
+  auto relay_head = [&] { return RelayReadyChunks(hybrid, count, workers, sequence, head, true); };
+  assert(!relay_head() && hybrid.posts.size() == 1 && hybrid.posts[0].chunk == 0);
+  // Head completion on peers must not imply suffix readiness. An independent
+  // suffix can be forwarded while another owner's suffix remains stalled.
+  hybrid.progress[2] = Progress(sequence, kPushHeadBuilt | 1U);
+  assert(!relay_head() && hybrid.posts.size() == 2 && hybrid.posts[1].chunk == 2);
+  hybrid.progress[1] = Progress(sequence, kChunkFailed | unsigned(Result::kInvalidRequest));
+  assert(relay_head() == unsigned(Result::kInvalidRequest) && hybrid.errors == 1);
+  assert(!DrainChunkControls(hybrid));
 }
 }
 int main() {
@@ -67,6 +96,14 @@ int main() {
     assert(PushLaunchCooperative(PushLaunch(head, true)) && !PushLaunchCooperative(PushLaunch(head)));
     assert(PushLaunchHeadRows(PushLaunch(head, true)) == head);
     assert(PushLaunchHeadRows(PushLaunch(head)) == head);
+    for (const bool publisher : {false, true}) {
+      const auto launch = PushLaunch(head, publisher, publisher, !publisher);
+      const auto mode = PushOutputMode(head, publisher, publisher, !publisher);
+      assert(PushSetupHeadRows(mode) == (head % 8 ? 0 : head));
+      assert(PushLaunchBuildMode(launch) == (publisher ? 2U : 3U));
+      assert(PushSetupBuildMode(mode) == PushLaunchBuildMode(launch));
+      assert(PushLaunchHeadRows(launch) == head);
+    }
     if (head < 1024) assert(PushSetupHeadRows(PushOutputMode(head)) == head && PushOutputMode(head) > kPushChunkedOutput);
     for (unsigned count : {0U, 1U, head - 1, head, head + 1, 1024U, 1025U, 65535U, 65536U}) {
       const auto chunks = PushChunkCount(count, head);

@@ -116,6 +116,11 @@ struct Fixture {
     uint64_t spans = 0;
     for (uint32_t w = 0; w < args.execution.workers; ++w) {
       assert(statuses[w].magic == kMagic && statuses[w].sequence == sequence && statuses[w].worker == w);
+      if (statuses[w].result != uint64_t(result) || statuses[w].consumed != 0)
+        std::fprintf(stderr, "AIV model failure: hint=%llu workers=%u count=%d sequence=%llu core=%u result=%llu expected=%llu consumed=%llu\n",
+            static_cast<unsigned long long>(args.execution.sequence), args.execution.workers, count,
+            static_cast<unsigned long long>(sequence), w, static_cast<unsigned long long>(statuses[w].result),
+            static_cast<unsigned long long>(result), static_cast<unsigned long long>(statuses[w].consumed));
       assert(statuses[w].result == uint64_t(result) && statuses[w].consumed == 0);
       for (auto reserved : statuses[w].reserved) assert(reserved == 0);
       assert(profiles[w].scatter_ns == 0 && profiles[w].scatter_copies == 0 && profiles[w].ready_queries == 0);
