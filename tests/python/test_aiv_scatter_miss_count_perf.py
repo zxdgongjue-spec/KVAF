@@ -26,12 +26,12 @@ from utils.get_graph import end_get_graph_leases
 from utils.get_options import add_workload_arguments, environment_int, validate_workload_shape
 from utils.npu_eids import parse_npu_eids
 from utils.statistics import percentile
-from scatter_perf_common import PAYLOAD_TIMINGS, SCATTER_CHUNK_ROWS, profile_metrics, sample_metrics
+from scatter_perf_common import (SCATTER_CHUNK_ROWS, SCATTER_WINDOW_ROWS, WINDOW_PROFILE_FIELDS,
+                                 payload_bytes_for_timing, profile_metrics, sample_metrics)
 from test_aiv_scatter_perf import (SCATTER_MAX_JETTYS, resolve_scatter_options,
                                    scatter_payload_jettys, write_results)
 
 TOKEN_SIZES = (128, 256, 512, 656, 1024, 2048, 4096)
-SCATTER_WINDOW_ROWS = 65_536
 MISS_COUNTS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 CORE_COUNTS = (1, 2, 4, 8)
 STAGES = {
@@ -41,6 +41,12 @@ STAGES = {
     "cpu_write_ns": "cpu_write", "aiv_build_notify_ns": "build_notify",
     "aiv_scatter_ns": "scatter", "call_outside_aiv_ns": "call_outside_aiv",
     "graph_total_ns": "graph_total",
+    "last_window_aiv_body_ns": "last_window_kernel_body",
+    "last_window_aiv_wall_ns": "last_window_kernel_wall",
+    "last_window_cpu_comm_ns": "last_window_cpu_comm",
+    "last_window_cpu_write_ns": "last_window_cpu_write",
+    "last_window_aiv_build_notify_ns": "last_window_build_notify",
+    "last_window_aiv_scatter_ns": "last_window_scatter",
 }
 SUMMARY_COLUMNS = (
     "token_bytes", "miss_count", "aiv_cores", "jettys_per_core", "cpu_jettys",
@@ -162,8 +168,6 @@ def validate_scatter(args):
         return "scatter supports one local NPU EID"
     if not 1 <= args.miss_count <= args.request_length <= 0x7fffffff:
         return "scatter performance requires 1 <= miss-count <= request-length <= INT32_MAX"
-    if args.miss_count > SCATTER_WINDOW_ROWS and args.kernel_profile:
-        return "use --no-kernel-profile for multi-window end-to-end measurements"
     if not 1 <= args.token_bytes <= 65535 or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
         return "scatter token_bytes must be <=65535 and block bytes must fit uint32"
     if args.case_timeout <= 0:
@@ -313,13 +317,17 @@ def measure_call(runtime, args, iteration, submit, wait, check_replay=None, cloc
         if calls == 1:
             sample.update(metrics)
         else:
-            # The device profile slab is overwritten by each graph node. It
-            # describes the last call, not the average or the graph envelope.
+            # Each graph node overwrites the slab. Export the final node's
+            # measured scope, separately from the per-call graph average.
             sample["sequence"] = metrics["sequence"]
             sample["sequence_first"] = metrics["sequence"] - calls + 1
             sample["last_call_profile"] = metrics
-            for key in ("cpu_comm_ns", "cpu_write_ns", "aiv_wall_ns", "aiv_scatter_ns"):
-                sample["last_call_" + key] = metrics[key]
+            sample.update({key: metrics[key] for key in WINDOW_PROFILE_FIELDS})
+            if metrics["profile_window_count"] > 1:
+                sample.update({key: value for key, value in metrics.items() if key.startswith("last_window_")})
+            else:
+                for key in ("cpu_comm_ns", "cpu_write_ns", "aiv_wall_ns", "aiv_scatter_ns"):
+                    sample["last_call_" + key] = metrics[key]
         sample["workers"] = records
         sample["snapshot_ns"] = clock() - begin
     else:
@@ -390,6 +398,10 @@ def run_case(args):
     cpu_transfer = "CPU_GATHER_CONTIGUOUS_WRITE" if cpu_gather else "CPU_SGL_WRITE"
     graph_mode = args.acl_graph
     calls = graph_call_count(args)
+    multi_window = args.miss_count > SCATTER_WINDOW_ROWS
+    profile_scope = "last_window" if multi_window else "single_call"
+    if calls > 1:
+        profile_scope = "last_window_of_last_call" if multi_window else "last_call"
     put = kvaf.PutExecutionConfig("urma", "aiv")
     get = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
     runtime = kvaf.NpuRuntime(
@@ -424,7 +436,7 @@ def run_case(args):
         request_plans_per_sample=calls,
         sample_timing_scope=("replay_to_completion_divided_by_calls" if graph_mode
                              else "single_call_to_completion"),
-        profile_scope="last_call" if calls > 1 else "single_call",
+        profile_scope=profile_scope,
         graph_execution="same_stream_ordered_shared_transport" if graph_mode else "eager",
         graph_payload_bytes=payload * calls,
         output_storage="shared_last_call_visible",
@@ -516,6 +528,11 @@ def run_case(args):
         # so consecutive calls use distinct random requests, as in inference.
         for _ in range(1, calls):
             input_plans.append(request_plan())
+
+        def refresh_inputs():
+            for inputs in input_plans:
+                refresh_request_buffers(request_plan(), inputs)
+
         # Dedicated stream for capture and for the same-stream eager comparison.
         stream = torch.npu.Stream() if graph_mode or args.completion_scope != "device" else None
         wait = (None if args.completion_scope == "native-stream" else
@@ -571,7 +588,7 @@ def run_case(args):
         complete_outside_measurement(runtime, graph_mode and args.kernel_profile, check_replay)
         verify(input_plans[-1], label="graph_preflight" if graph_mode else "eager_preflight",
                guard=calls == 1 or args.output_access_pattern == "contiguous")
-        if graph_mode and calls == 1 and args.miss_count > SCATTER_WINDOW_ROWS:
+        if graph_mode and multi_window and calls == 1:
             for active in (0, SCATTER_WINDOW_ROWS, args.miss_count):
                 output.zero_()
                 count.fill_(active)
@@ -580,13 +597,21 @@ def run_case(args):
                 wait()
                 check_replay()
                 verify(input_plans[0], label=f"graph_preflight_count_{active}", guard=True, active_count=active)
+        elif graph_mode and multi_window:
+            # Exercise a second submission of the same captured nodes with
+            # changed input contents, before reporting correctness success.
+            with setup_phase(report, "graph_preflight_refreshed"):
+                output.zero_()
+                refresh_inputs()
+                torch.npu.synchronize()
+                submit()
+                wait()
+                complete_outside_measurement(runtime, args.kernel_profile, check_replay)
+                verify(input_plans[-1], label="graph_preflight_refreshed",
+                       guard=args.output_access_pattern == "contiguous")
         check = "per_node_preflight_and_last_payload" if calls > 1 else "active_prefix_and_guard"
         print(f"SCATTER_ALIGNED_CORRECTNESS_PASS {check}=1", flush=True)
         log_phase("preflight", "end")
-
-        def refresh_inputs():
-            for inputs in input_plans:
-                refresh_request_buffers(request_plan(), inputs)
 
         if args.kernel_profile and not graph_mode:
             runtime.start_scatter_profile()
@@ -605,7 +630,7 @@ def run_case(args):
         report["summary"][phase] = {
             key: statistics_ns([r[key] for r in samples],
                                payload * calls if key == "graph_total_ns" else
-                               payload if key in PAYLOAD_TIMINGS else None)
+                               payload_bytes_for_timing(samples[0], key))
             for key in samples[0] if key.endswith("_ns")}
         if caller_graph is None and args.kernel_profile:
             runtime.stop_scatter_profile()

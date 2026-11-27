@@ -12,9 +12,10 @@ import time
 
 from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
 from aiv_kernel_metadata import check_aiv_kernel_metadata
-from scatter_perf_common import (HOST_TIMINGS, PAYLOAD_TIMINGS, RANDOM_SOURCE_CHUNK_BYTES, SCATTER_CHUNK_ROWS,
-                                 fill_random_bytes, percentile, profile_metrics,
-                                 request_values, sample_metrics, summarize)
+from scatter_perf_common import (LAST_WINDOW_PAYLOAD_TIMINGS, PAYLOAD_TIMINGS,
+                                 RANDOM_SOURCE_CHUNK_BYTES, SCATTER_CHUNK_ROWS, SCATTER_WINDOW_ROWS,
+                                 WINDOW_PROFILE_FIELDS, fill_random_bytes, payload_bytes_for_timing,
+                                 percentile, profile_metrics, request_values, sample_metrics, summarize)
 
 SCATTER_DEFAULT_JETTYS = 4
 SCATTER_MAX_JETTYS = 32
@@ -39,6 +40,10 @@ CSV_COLUMNS = (
     "calls_per_sample", "graph_total_us", "graph_payload_bytes", "graph_total_gbps",
     "sequence_first", "last_call_cpu_comm_us", "last_call_cpu_write_us",
     "last_call_aiv_wall_us", "last_call_aiv_scatter_us",
+    *WINDOW_PROFILE_FIELDS,
+    *(key[:-3] + suffix for key in LAST_WINDOW_PAYLOAD_TIMINGS for suffix in ("_us", "_gbps")),
+    "last_window_aiv_input_wall_us", "last_window_aiv_build_notify_us", "last_window_aiv_notify_to_done_us",
+    "last_window_aiv_scatter_tail_us", "last_window_aiv_ready_wait_us",
 )
 
 
@@ -135,8 +140,6 @@ def arguments(argv=None):
         args.request_length = workload_tokens
     if not 1 <= args.miss_count <= args.request_length <= 0x7fffffff:
         parser.error("require 1 <= miss-count <= request-length <= INT32_MAX")
-    if args.miss_count > 65536 and args.profile_iterations:
-        parser.error("use --profile-iterations 0 for multi-window end-to-end measurements")
     if args.workload != "sampled-tokens" and args.miss_count > workload_tokens:
         parser.error("miss-count exceeds this workload; use sampled-tokens for repeated requests")
     pattern_step = {"dense": 1, "strided": 2}.get(args.output_pattern)
@@ -282,6 +285,7 @@ def main(argv=None):
                   torch_version=str(torch.__version__),
                   timing="synchronous BatchGet call through status validation; setup/verification excluded",
                   calls_per_sample=1, active_tokens_per_call=args.miss_count,
+                  profile_scope="last_window" if args.miss_count > SCATTER_WINDOW_ROWS else "single_call",
                   payload_bytes_per_call=args.miss_count * args.token_bytes,
                   request_capacity=args.request_length,
                   verification="every_round_full_output_and_npu_consumer",
@@ -291,7 +295,7 @@ def main(argv=None):
                   source_generation_chunk_bytes=(RANDOM_SOURCE_CHUNK_BYTES
                                                  if args.input_mode == "changing" else None),
                   output_bytes=output_rows * args.token_bytes,
-                  staging_bytes=65536 * args.token_bytes,
+                  staging_bytes=SCATTER_WINDOW_ROWS * args.token_bytes,
                   get_sha256=hashlib.sha256(Path(kernel).read_bytes()).hexdigest(),
                   put_sha256=hashlib.sha256(Path(put_kernel).read_bytes()).hexdigest())
     config = {k: str(v) if isinstance(v, Path) else v for k, v in config.items()}
@@ -420,15 +424,13 @@ def main(argv=None):
             samples, wall_ns = measure_pass(call, iterations, payload, snapshot if profiling else None,
                                            prepare=prepare, verify=check)
             report["samples"][phase] = samples
-            metrics = {key: summarize([sample[key] for sample in samples], payload)
-                       for key in PAYLOAD_TIMINGS
+            metrics = {key: summarize([sample[key] for sample in samples],
+                                      payload_bytes_for_timing(samples[0], key))
+                       for key in (*PAYLOAD_TIMINGS, *LAST_WINDOW_PAYLOAD_TIMINGS)
                        if key in samples[0]}
             # Non-payload subphases get latency statistics, without misleading bandwidths.
-            for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns",
-                        "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns",
-                        "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_ready_wait_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns",
-                        *HOST_TIMINGS, "host_python_dispatch_ns"):
-                if key in samples[0]:
+            for key in samples[0]:
+                if key.endswith("_ns") and key not in metrics:
                     values = [s[key] for s in samples]
                     metrics[key] = dict(mean_ms=sum(values) / len(values) / 1e6,
                                         min_ms=min(values) / 1e6, max_ms=max(values) / 1e6)

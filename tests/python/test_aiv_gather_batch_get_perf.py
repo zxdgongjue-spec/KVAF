@@ -39,6 +39,7 @@ from pathlib import Path
 from aiv_batch_get_common import kernel_paths, shutdown_runtime
 
 
+GATHER_WINDOW_ROWS = 65_536
 STAGE_BOUNDARIES = (
     ("input", "kernel_start_cycle", "input_done_cycle"),
     ("descriptor", "input_done_cycle", "descriptor_done_cycle"),
@@ -239,16 +240,17 @@ def percentile(values: Sequence[float], fraction: float) -> float:
 
 
 def summarize_profiles(
-    samples: Sequence[Mapping[str, object]], cores: int, requests: int,
+    samples: Sequence[Mapping[str, object]], cores: int, requests: int, coalesce_sges: bool,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
-    """Validate a batch timeline and keep parallel lanes separate in the summary."""
+    """Validate each lane's final window and keep parallel lanes separate."""
     if not samples or not 1 <= cores <= 8 or requests < 0:
         raise ValueError("profile summary requires samples, 1..8 cores and a request count")
     host_values = {field: [] for field in HOST_FIELDS}
     core_values = [
-        {field: [] for field in ("requests", *COUNTERS, *(s[0] for s in STAGE_BOUNDARIES))}
+        {field: [] for field in ("requests", "window_count", *COUNTERS, *(s[0] for s in STAGE_BOUNDARIES))}
         for _ in range(cores)
     ]
+    lane_capacity = (GATHER_WINDOW_ROWS + cores - 1) // cores
     last_sequence = -1
     for snapshot in samples:
         sequence = int(snapshot["sequence"])
@@ -272,11 +274,17 @@ def summarize_profiles(
             seen.add(core)
             if int(lane["sequence"]) != sequence or int(lane.get("result", 0)) != 0:
                 raise ValueError("profile has a stale sequence or failed lane")
-            expected_requests = requests * (core + 1) // cores - requests * core // cores
-            if int(lane["requests"]) != expected_requests:
-                raise ValueError("profile request count does not match the lane partition")
+            lane_requests = requests * (core + 1) // cores - requests * core // cores
+            capacity = lane_capacity
+            if coalesce_sges and lane_requests > capacity:
+                capacity -= capacity % GATHER_SGL_SIZE
+            windows = max(1, (lane_requests + capacity - 1) // capacity)
+            final_requests = lane_requests - (windows - 1) * capacity
+            if int(lane.get("window_count", 1)) != windows or int(lane["requests"]) != final_requests:
+                raise ValueError(f"core {core} profile does not match its final window")
             values = core_values[core]
-            values["requests"].append(expected_requests)
+            values["requests"].append(final_requests)
+            values["window_count"].append(windows)
             for name, duration in profile_stage_cycles(lane).items():
                 values[name].append(duration)
             for field in COUNTERS:
@@ -290,20 +298,20 @@ def summarize_profiles(
     )
 
 
-def print_profiles(samples: list[dict[str, object]], cores: int, request_count: int) -> None:
-    host, lanes = summarize_profiles(samples, cores, request_count)
+def print_profiles(samples: list[dict[str, object]], cores: int, request_count: int, coalesce_sges: bool) -> None:
+    host, lanes = summarize_profiles(samples, cores, request_count, coalesce_sges)
     print(
         f"GATHER_PROFILE_CONFIG profile=on cpu_profile=external samples={len(samples)} "
         f"first_sequence={samples[0]['sequence']} last_sequence={samples[-1]['sequence']} "
         f"clock_mhz={PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else 'unverified'} "
-        "overhead_included=1 snapshot_copy_outside_call=1",
+        "kernel_scope=last_window_per_lane overhead_included=1 snapshot_copy_outside_call=1",
         flush=True,
     )
     print("GATHER_PROFILE_HOST " + " ".join(
         f"{field.removesuffix('_ns')}_us={value / 1000:.3f}" for field, value in host.items()
     ))
     for core, lane in enumerate(lanes):
-        fields = [f"core={core}", f"requests={lane['requests']:.0f}"]
+        fields = [f"core={core}", f"requests={lane['requests']:.0f}", f"window_count={lane['window_count']:.0f}"]
         fields += [f"{name}_cycles={lane[name]:.1f}" for name, _, _ in STAGE_BOUNDARIES]
         fields += [f"{field}={lane[field]:.1f}" for field in COUNTERS]
         if PROFILE_CLOCK_MHZ is not None:
@@ -338,7 +346,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 10,
+        "schema_version": 11,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -357,6 +365,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
         "configured_first_chunk_divisor": configured_first_chunk_divisor(),
         "trusted_gather_inputs": int(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1"),
         "warmup": warmup, "iterations": iterations, "profile_samples": profile_samples,
+        "kernel_profile_scope": "last_window_per_lane" if profile_samples else "off",
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
         "cpu_profile": "external", "kernel_path": kernel, "put_kernel_path": put_kernel,
@@ -379,17 +388,19 @@ def export_csv_results(
     if len(snapshots) != len(profile_calls_us):
         raise ValueError("profile snapshots and synchronous call samples must match")
     cores, requests = int(metadata["cores"]), int(metadata["request_count"])
-    host_mean, core_means = summarize_profiles(snapshots, cores, requests) if snapshots else ({}, [])
+    coalesce_sges = bool(int(metadata.get("coalesce_sges", 0)))
+    host_mean, core_means = summarize_profiles(snapshots, cores, requests, coalesce_sges) if snapshots else ({}, [])
     clock = metadata["clock_mhz"]
     stages = [name for name, _, _ in STAGE_BOUNDARIES]
     host_columns = [field.removesuffix("_ns") + "_us" for field in HOST_FIELDS]
     timed_counters = [field for field in COUNTERS if field.endswith("_cycles")]
-    core_columns = ["requests", *(name + "_cycles" for name in stages),
+    core_columns = ["requests", "window_count", *(name + "_cycles" for name in stages),
                     *(name + "_us" for name in stages), *COUNTERS,
                     *(field.removesuffix("_cycles") + "_us" for field in timed_counters)]
 
     def core_fields(lane: Mapping[str, object], mean: bool = False) -> dict[str, object]:
-        row = {"requests": lane["requests"], **{key: lane.get(key, 0) for key in COUNTERS}}
+        row = {"requests": lane["requests"], "window_count": lane.get("window_count", 1),
+               **{key: lane.get(key, 0) for key in COUNTERS}}
         durations = None if mean else profile_stage_cycles(lane)
         for name, begin, end in STAGE_BOUNDARIES:
             cycles = lane[name] if mean else durations[name]
@@ -494,10 +505,7 @@ def main(argv=None) -> int:
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iterations", type=int, default=ITERATIONS)
     args = parser.parse_args(argv)
-    # Stage profiles cover the final lane window only. Keep aggregate
-    # bandwidth based on complete calls in the large-request benchmark.
-    single_window = args.request_count <= 65536
-    profile_samples = PROFILE_SAMPLES if single_window and not args.acl_graph else 0
+    profile_samples = 0 if args.acl_graph else PROFILE_SAMPLES
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
@@ -528,7 +536,7 @@ def main(argv=None) -> int:
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware benchmark was requested but NPU Runtime is unavailable")
     coalesce = os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1"
-    check_schedule = single_window and (coalesce or configured_first_chunk_divisor())
+    check_schedule = coalesce or configured_first_chunk_divisor()
     if (profile_samples or check_schedule) and not all(
         hasattr(kvaf.NpuRuntime, method) for method in (
         "start_gather_batch_get_profile", "gather_batch_get_profile", "stop_gather_batch_get_profile",
@@ -667,8 +675,8 @@ def main(argv=None) -> int:
 
             # Cross the window boundary in both directions with the same graph
             # and buffers. Restore the full count before performance sampling.
-            counts = (args.request_count,) * 2 if single_window else (
-                args.request_count, 0, 65536, args.request_count)
+            counts = (args.request_count,) * 2 if args.request_count <= GATHER_WINDOW_ROWS else (
+                args.request_count, 0, GATHER_WINDOW_ROWS, args.request_count)
             for active in counts:
                 miss_count.fill_(active)
                 output.fill_(0xAD)
@@ -720,7 +728,7 @@ def main(argv=None) -> int:
                 snapshots.append(dict(runtime.gather_batch_get_profile()))
                 profile_calls_us.append(elapsed)
             runtime.stop_gather_batch_get_profile()
-            print_profiles(snapshots, cores, args.request_count)
+            print_profiles(snapshots, cores, args.request_count, coalesce)
         return 0
     finally:
         # CSV I/O is outside both timed groups. Preserve successful baseline or

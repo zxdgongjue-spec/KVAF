@@ -31,8 +31,11 @@ def fill_random_bytes(buffer, rng, chunk_bytes=RANDOM_SOURCE_CHUNK_BYTES):
 
 
 SCATTER_CHUNK_ROWS = 1024
+SCATTER_WINDOW_ROWS = 65_536
 PAYLOAD_TIMINGS = ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns",
                    "aiv_body_ns", "aiv_wall_ns", "aiv_scatter_ns")
+LAST_WINDOW_PAYLOAD_TIMINGS = tuple("last_window_" + key for key in PAYLOAD_TIMINGS[1:])
+WINDOW_PROFILE_FIELDS = ("profile_window_count", "profile_window_rows", "profile_payload_bytes", "wire_sequence")
 HOST_TIMINGS = (
     "host_binding_ns", "host_tensor_metadata_ns", "host_stream_resolve_ns",
     "host_native_ns", "host_runtime_validation_ns", "host_operator_ns",
@@ -72,6 +75,14 @@ def request_values(args, seed):
             [row * args.output_row_step for row in rows] + padding)
 
 
+def payload_bytes_for_timing(sample, key):
+    if key in PAYLOAD_TIMINGS:
+        return sample["payload_bytes"]
+    if key in LAST_WINDOW_PAYLOAD_TIMINGS:
+        return sample["profile_payload_bytes"]
+    return None
+
+
 def sample_metrics(sample):
     """Add per-call us and payload GB/s to JSON and CSV, without double counting."""
     result = dict(sample)
@@ -99,11 +110,11 @@ def sample_metrics(sample):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"invalid duration: {key}")
             result[key[:-3] + "_us"] = value / 1000.0
-    for key in PAYLOAD_TIMINGS:
+    for key in (*PAYLOAD_TIMINGS, *LAST_WINDOW_PAYLOAD_TIMINGS):
         if key in result:
             if result[key] <= 0:
                 raise ValueError(f"payload duration must be positive: {key}")
-            result[key[:-3] + "_gbps"] = payload / result[key]
+            result[key[:-3] + "_gbps"] = payload_bytes_for_timing(result, key) / result[key]
     return result
 
 
@@ -127,16 +138,20 @@ def summarize(samples, payload_bytes):
 
 
 def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
-    """Durations only within a clock domain; never subtract CPU and AIV clocks."""
+    """Validate and report the last Scatter window, keeping clock domains separate."""
     if not math.isfinite(clock_mhz) or clock_mhz <= 0:
         raise ValueError("AIV counter frequency must be positive and finite")
     if len(records) != cores or [r["core"] for r in records] != list(range(cores)):
         raise ValueError("profile core count/order mismatch")
     sequence = records[0]["sequence"]
+    windows = max(1, (requests + SCATTER_WINDOW_ROWS - 1) // SCATTER_WINDOW_ROWS)
+    window_rows = requests - (windows - 1) * SCATTER_WINDOW_ROWS
+    wire_sequence = records[0].get("wire_sequence", sequence)
     pipeline = records[0].get("pipeline", 0)
     for core, r in enumerate(records):
-        expected_requests = requests * (core + 1) // cores - requests * core // cores
+        expected_requests = window_rows * (core + 1) // cores - window_rows * core // cores
         if (r["magic"] != PROFILE_MAGIC or not sequence or r["sequence"] != sequence
+                or r.get("window_count", 1) != windows or r.get("wire_sequence", sequence) != wire_sequence
                 or r["requests"] != expected_requests or r["bytes"] != expected_requests * token_bytes):
             raise ValueError("profile sequence/magic/payload mismatch")
         if not 0 < r["start_cycle"] <= r["inputs_ready_cycle"] <= r["done_cycle"] <= r["finish_cycle"]:
@@ -157,7 +172,7 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
     cpu = records[0]
     if not cpu["inputs_ready_cycle"] <= cpu["notify_cycle"] <= cpu["done_cycle"]:
         raise ValueError("invalid notify timeline")
-    if cpu["cpu_magic"] != (CPU_MAGIC ^ (sequence << 32)):
+    if not wire_sequence or cpu["cpu_magic"] != (CPU_MAGIC ^ (wire_sequence << 32)):
         raise ValueError("CPU report missing; rebuild and restart CPU service")
     if not 0 < cpu["cpu_comm_ns"] <= cpu["cpu_write_ns"]:
         raise ValueError("invalid CPU communication window")
@@ -187,6 +202,11 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
     )
     if all("ready_wait_cycles" in r for r in records):
         result["aiv_ready_wait_ns"] = max(r["ready_wait_cycles"] for r in records) * ns_per_cycle
+    if windows > 1:
+        result = {("last_window_" + key if key.endswith("_ns") else key): value
+                  for key, value in result.items()}
+    result.update(profile_window_count=windows, profile_window_rows=window_rows,
+                  profile_payload_bytes=window_rows * token_bytes, wire_sequence=wire_sequence)
     host = cpu.get("host_profile")
     if host is not None:
         if any(key not in host or not math.isfinite(host[key]) or host[key] < 0

@@ -159,8 +159,12 @@ Scatter 和 Gather 的窗口序号达到实现的 32 位范围后，需要重建
 窗口推进使用既有的 CPU mailbox 和 Gather 协议，部署时需一起更新 N 端 Host/Python 和 AIV kernel。
 如显式把 `ExecutionResources.request_capacity` 配到 65536 以上，同时更新 K 端服务的容量校验。
 容量受张量尺寸、输出索引、可用内存和设备执行超时约束。分窗会重复控制通知及尾部完成确认。
-阶段 profile 的 `window_count` 和计数描述该核的分窗情况及末窗数据。跨窗性能测试以整次
-调用的端到端数据为准，Scatter 使用 `--no-kernel-profile`，Gather 性能脚本会自动跳过阶段采样。
+跨窗性能测试的端到端计时和有效字节数覆盖整次调用。阶段 profile 记录末窗，
+完成状态中的 `requests` 和 Gather 的 `data_wrs` 按整次调用累计。
+Scatter 可用 `--kernel-profile` 导出 `profile_window_count`、`profile_window_rows`、
+`profile_payload_bytes` 和 `last_window_*`，阶段带宽用末窗字节数计算。
+Gather READ 的 eager 测试另采各 lane 末窗的阶段数据，`profile_core.csv` 中的
+`window_count` 为该 lane 的窗数，`requests` 为该 lane 的末窗行数。Gather ACL 图只测端到端。
 
 建议用 656 B、16,384 个源块、每块 128 个 token，先测 8192 条回归，再测
 65535 / 65536 / 65537 和 131072 / 131073。两种 Scatter 分别设
@@ -200,6 +204,7 @@ done
 
 测 eager 时省略图参数。用历史小请求配置复测 8192 条时，Scatter 可将
 `--request-length` 恢复为 32768，Gather→Push 可另测 `--graph-calls 8`。
+定位 Scatter 末窗时将 `--no-kernel-profile` 换成 `--kernel-profile`。
 比较端到端 P50/P99 和有效带宽时使用一致的 GiB/s 或 GB/s 单位。
 
 ## Scatter ACL 图模式
@@ -216,8 +221,9 @@ done
 `calls_per_sample`；带宽使用整图有效字节数除以整图总耗时。例如每图 8 次调用、20 个计时
 样本执行 160 次 BatchGet，不含预检和 warmup。P50 表示每图平均耗时的中位数，
 不等于单独提交一次 BatchGet 的 P50。图准备、输入刷新和状态检查在样本计时之外。
-启用 kernel profiling 时，多节点图的阶段数据保存在 `last_call_*` 和 JSON 的
-`last_call_profile`，只描述末次调用；平均值的 `aiv_wall_us` 和 `call_outside_aiv_us` 留空。
+启用 kernel profiling 时，多节点图的阶段数据描述末次调用，阶段指标保存在 JSON 的
+`last_call_profile`。单窗口使用 `last_call_*`，跨窗使用 `last_window_*`。
+跨窗调用和多节点图的 `aiv_wall_us` 和 `call_outside_aiv_us` 留空，避免拿局部阶段耗时拆解整次调用。
 
 推理框架可通过 `runtime.graph_resources()` 把 Scatter 节点接入调用方已有的图。
 显式管理节点时，使用 `begin_get_graph(...)` 预备每个节点的 lease，
