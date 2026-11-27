@@ -54,6 +54,77 @@ double MrElapsedUs(bool enabled, MrClock::time_point start) {
   return enabled ? std::chrono::duration<double, std::micro>(MrClock::now() - start).count() : 0.0;
 }
 
+bool RoceLatencyEnabled() {
+  const char* value = std::getenv("KVAF_ROCE_LATENCY");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+struct ScopedLatency {
+  explicit ScopedLatency(double* elapsed)
+      : elapsed(elapsed), start(MrTimingStart(elapsed != nullptr)) {}
+  ~ScopedLatency() { Finish(); }
+
+  void Finish() {
+    if (!elapsed) return;
+    *elapsed += MrElapsedUs(true, start);
+    elapsed = nullptr;
+  }
+
+  double* elapsed;
+  MrClock::time_point start;
+};
+
+struct RdmaLatency {
+  double queue_lock_us{};
+  double post_send_us{};
+  double cq_wait_us{};
+  std::uint64_t posted_bytes{};
+  std::uint64_t posted_wrs{};
+  std::uint64_t completed_wrs{};
+};
+
+struct RoceCallLatency {
+  RoceCallLatency(bool enabled, const char* operation, std::uint32_t device)
+      : id(enabled ? next_id.fetch_add(1, std::memory_order_relaxed) : 0),
+        operation(operation), device(device), start(MrTimingStart(enabled)) {}
+
+  ~RoceCallLatency() {
+    if (!id) return;
+    std::fprintf(stderr,
+                 "[KVAF_ROCE_LATENCY] pid=%ld id=%llu device=%u op=%s phase=call ok=%d "
+                 "total_us=%.3f requests_or_capacity=%zu wait_prev_get_us=%.3f "
+                 "stream_sync_us=%.3f mr_us=%.3f mr_mode=%s staging_us=%.3f "
+                 "enqueue_us=%.3f wait_current_get_us=%.3f queue_lock_us=%.3f "
+                 "post_send_us=%.3f cq_wait_us=%.3f posted_bytes=%llu posted_wrs=%llu "
+                 "completed_wrs=%llu\n",
+                 static_cast<long>(getpid()), static_cast<unsigned long long>(id), device,
+                 operation, ok, MrElapsedUs(true, start), requests_or_capacity,
+                 wait_prev_get_us, stream_sync_us, mr_us, mr_mode, staging_us,
+                 enqueue_us, wait_current_get_us, rdma.queue_lock_us, rdma.post_send_us,
+                 rdma.cq_wait_us, static_cast<unsigned long long>(rdma.posted_bytes),
+                 static_cast<unsigned long long>(rdma.posted_wrs),
+                 static_cast<unsigned long long>(rdma.completed_wrs));
+  }
+
+  static std::atomic<std::uint64_t> next_id;
+  const std::uint64_t id;
+  const char* operation;
+  std::uint32_t device;
+  MrClock::time_point start;
+  bool ok{};
+  std::size_t requests_or_capacity{};
+  const char* mr_mode{"none"};
+  double wait_prev_get_us{};
+  double stream_sync_us{};
+  double mr_us{};
+  double staging_us{};
+  double enqueue_us{};
+  double wait_current_get_us{};
+  RdmaLatency rdma;
+};
+
+std::atomic<std::uint64_t> RoceCallLatency::next_id{1};
+
 // Serialize HAL registration lifetimes across Runtime instances. The HAL
 // segment is device-wide, while each verbs registration is local to its PD.
 std::mutex hbm_registration_mutex;
@@ -407,7 +478,7 @@ class RoceSession {
   Status Register(const void* buffer, std::size_t bytes, bool read,
                   const std::shared_ptr<void>& owner,
                   std::shared_ptr<HbmRegistration>* result, bool timing = false,
-                  ConstBufferView storage = {}) {
+                  ConstBufferView storage = {}, const char** mr_mode = nullptr) {
     HbmRange range;
     auto status = FindHbmRange(device_id_, buffer, bytes, &range);
     if (!status.ok()) return status;
@@ -437,6 +508,7 @@ class RoceSession {
       if (cached != cache_.end()) {
         *result = *cached;
         cache_.splice(cache_.end(), cache_, cached);
+        if (mr_mode) *mr_mode = "cache_hit";
         if (timing) std::fprintf(stderr, "[KVAF_ROCE_MR] device=%u phase=cache_hit bytes=%zu\n",
                                  device_id_, bytes);
         return Status::OK();
@@ -454,6 +526,7 @@ class RoceSession {
       }
     }
 
+    if (mr_mode) *mr_mode = cacheable ? "cache_register" : "temporary_register";
     auto mr = std::make_shared<HbmRegistration>(timing);
     status = mr->Register(connection_->pd(), device_id_, range, cacheable ? mr_range.base : buffer,
                           cacheable ? mr_range.bytes : bytes,
@@ -536,18 +609,25 @@ class RoceSession {
 
   Status Execute(const void* buffer, std::size_t buffer_bytes,
                  const std::vector<Transfer>& transfers, bool read,
-                 const std::shared_ptr<void>& owner = {}, ConstBufferView storage = {}) {
+                 const std::shared_ptr<void>& owner = {}, ConstBufferView storage = {},
+                 RoceCallLatency* latency = nullptr) {
     if (transfers.empty()) return Status::OK();
     std::shared_ptr<HbmRegistration> registration;
-    auto status = Register(buffer, buffer_bytes, read, owner, &registration, false, storage);
+    ScopedLatency mr_time(latency ? &latency->mr_us : nullptr);
+    auto status = Register(buffer, buffer_bytes, read, owner, &registration, false, storage,
+                           latency ? &latency->mr_mode : nullptr);
+    mr_time.Finish();
     if (!status.ok()) return status;
-    return ExecuteRegistered(*registration, transfers, read);
+    return ExecuteRegistered(*registration, transfers, read, latency ? &latency->rdma : nullptr);
   }
 
   Status ExecuteRegistered(const HbmRegistration& registration,
-                           const std::vector<Transfer>& transfers, bool read) {
+                           const std::vector<Transfer>& transfers, bool read,
+                           RdmaLatency* latency = nullptr) {
     if (transfers.empty()) return Status::OK();
+    ScopedLatency queue_wait(latency ? &latency->queue_lock_us : nullptr);
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    queue_wait.Finish();
     if (!Usable()) return Status::InvalidState("RoCE session is unavailable");
 
     const std::size_t window = read ? read_window() : connection_->depth();
@@ -572,7 +652,9 @@ class RoceSession {
         request.wr.rdma.rkey = region_.rkey;
       }
       ibv_send_wr* bad = nullptr;
+      ScopedLatency post(latency ? &latency->post_send_us : nullptr);
       const int result = ibv_post_send(connection_->qp(), requests.data(), &bad);
+      post.Finish();
       if (result != 0) {
         // A prefix may already be in flight. Stop the QP before any MR,
         // buffer or slot can be reused, even when bad_wr is unavailable.
@@ -581,12 +663,18 @@ class RoceSession {
                                 ", completed before window=" + std::to_string(begin) +
                                 ", window size=" + std::to_string(count));
       }
+      if (latency) {
+        latency->posted_wrs += count;
+        for (std::size_t i = 0; i < count; ++i) latency->posted_bytes += entries[i].length;
+      }
+      ScopedLatency wait(latency ? &latency->cq_wait_us : nullptr);
       const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
       std::size_t completed = 0;
       while (completed < count) {
         ibv_wc completions[16];
         const int polled = ibv_poll_cq(connection_->cq(), 16, completions);
         if (polled < 0 || std::chrono::steady_clock::now() >= deadline) {
+          wait.Finish();
           StopFailedQueue();
           return Status::Internal(std::string(polled < 0 ? "ibv_poll_cq failed" :
                                              "RoCE completion timed out") +
@@ -598,6 +686,7 @@ class RoceSession {
           if (wc.status != IBV_WC_SUCCESS ||
               wc.opcode != (read ? IBV_WC_RDMA_READ : IBV_WC_RDMA_WRITE) || wc.wr_id < begin ||
               wc.wr_id - begin >= count || seen[wc.wr_id - begin]) {
+            wait.Finish();
             StopFailedQueue();
             return Status::Internal("RoCE completion failed: wr=" + std::to_string(wc.wr_id) +
                                     " status=" + std::to_string(wc.status) +
@@ -605,9 +694,11 @@ class RoceSession {
           }
           seen[wc.wr_id - begin] = true;
           ++completed;
+          if (latency) ++latency->completed_wrs;
         }
         if (polled == 0) std::this_thread::yield();
       }
+      wait.Finish();
       begin += count;
     }
     return Status::OK();
@@ -749,7 +840,11 @@ class RoceOperator final : public AccessOperator {
   }
 
   Status ExecuteBatchPut(const BatchPutExecRequest& exec) override try {
+    RoceCallLatency latency(latency_enabled_, "PUT", session_->device_id());
+    latency.requests_or_capacity = exec.request->keys.size();
+    ScopedLatency wait_prev(latency.id ? &latency.wait_prev_get_us : nullptr);
     auto status = FinishPendingRange();
+    wait_prev.Finish();
     if (!status.ok()) return status;
     ReapCompleted();
     const auto& request = *exec.request;
@@ -774,9 +869,13 @@ class RoceOperator final : public AccessOperator {
     }
     status = CheckStream(exec.execution.stream, session_->device_id());
     if (!status.ok()) return status;
+    ScopedLatency stream_sync(latency.id ? &latency.stream_sync_us : nullptr);
     status = Synchronize(static_cast<aclrtStream>(exec.execution.stream));
+    stream_sync.Finish();
     if (!status.ok()) return status;
     if (exec.execution.hbm_region) {
+      latency.mr_mode = "explicit";
+      ScopedLatency mr_time(latency.id ? &latency.mr_us : nullptr);
       if (!session_->Owns(exec.execution.hbm_region)) {
         return Status::InvalidArgument("BatchPut HBM region belongs to a different RoCE session or NPU");
       }
@@ -787,10 +886,16 @@ class RoceOperator final : public AccessOperator {
       if (!region) return Status::InvalidArgument("BatchPut HBM region has an unsupported implementation");
       auto registration = region->registration();
       if (!registration) return Status::InvalidState("BatchPut HBM region is closed");
-      return session_->ExecuteRegistered(*registration, transfers, false);
+      mr_time.Finish();
+      status = session_->ExecuteRegistered(*registration, transfers, false,
+                                           latency.id ? &latency.rdma : nullptr);
+    } else {
+      status = session_->Execute(request.input.data, request.input.bytes, transfers, false,
+                                 exec.execution.hbm_owner, exec.execution.hbm_storage,
+                                 latency.id ? &latency : nullptr);
     }
-    return session_->Execute(request.input.data, request.input.bytes, transfers, false,
-                             exec.execution.hbm_owner, exec.execution.hbm_storage);
+    latency.ok = status.ok();
+    return status;
   } catch (const std::bad_alloc&) {
     return Status::OutOfMemory("cannot stage RoCE BatchPut");
   }
@@ -866,6 +971,12 @@ class RoceOperator final : public AccessOperator {
     std::shared_ptr<void> hbm_owner;
     std::shared_ptr<void> hbm_region_lease;
     std::shared_ptr<HbmRegistration> registration;
+    std::uint64_t latency_id{};
+    MrClock::time_point enqueue_start;
+    MrClock::time_point callback_start;
+    RdmaLatency rdma;
+    double parse_us{};
+    std::int32_t active_requests{};
     Status result;
     GetJob* next{nullptr};
     bool worker_done{false};
@@ -875,12 +986,18 @@ class RoceOperator final : public AccessOperator {
   Status EnqueueGet(std::unique_ptr<GetJob> job, MutableBufferView output,
                     const BatchGetExecutionOptions& execution,
                     const std::array<ConstBufferView, 8>& inputs) {
+    RoceCallLatency latency(latency_enabled_, job->ranges ? "GET_RANGES" : "GET",
+                            session_->device_id());
+    latency.requests_or_capacity = job->capacity;
+    job->latency_id = latency.id;
     if (output.device != DeviceKind::kNpu) {
       return Status::InvalidArgument("RoCE Get requires NPU tensors");
     }
     auto status = CheckStream(execution.stream, session_->device_id());
     if (!status.ok()) return status;
+    ScopedLatency wait_prev(latency.id ? &latency.wait_prev_get_us : nullptr);
     status = FinishPendingRange();
+    wait_prev.Finish();
     if (!status.ok()) return status;
     ReapCompleted();
     if (pending_.size() == kMaxPendingGets) {
@@ -934,7 +1051,9 @@ class RoceOperator final : public AccessOperator {
     // temporary MR. Reaping on the caller thread also keeps Python destruction
     // off the worker while the submitting thread may be waiting with the GIL.
     job->hbm_owner = execution.hbm_owner;
+    ScopedLatency mr_time(latency.id ? &latency.mr_us : nullptr);
     if (execution.hbm_region) {
+      latency.mr_mode = "explicit";
       if (!session_->Owns(execution.hbm_region)) {
         return Status::InvalidArgument("BatchGet HBM region belongs to a different RoCE session or NPU");
       }
@@ -948,12 +1067,15 @@ class RoceOperator final : public AccessOperator {
     } else {
       status = session_->Register(output.data, output.bytes, true,
                                   job->hbm_owner, &job->registration, mr_timing_,
-                                  execution.hbm_storage);
+                                  execution.hbm_storage, latency.id ? &latency.mr_mode : nullptr);
     }
+    mr_time.Finish();
     if (!status.ok()) return status;
+    ScopedLatency staging_time(latency.id ? &latency.staging_us : nullptr);
     if (aclrtMallocHost(&job->staging, staging_bytes) != ACL_SUCCESS)
       return Status::OutOfMemory("cannot allocate pinned RoCE Get staging");
     std::memset(job->staging, 0, staging_bytes);
+    staging_time.Finish();
 
     pending_.push_back(std::move(job));
     staging_bytes_ += staging_bytes;
@@ -961,6 +1083,8 @@ class RoceOperator final : public AccessOperator {
     const auto staging = reinterpret_cast<std::uintptr_t>(queued.staging);
     auto* to = reinterpret_cast<std::uint8_t*>(
         (staging + kAclCopyAlignment - 1) / kAclCopyAlignment * kAclCopyAlignment);
+    queued.enqueue_start = MrTimingStart(latency.id != 0);
+    ScopedLatency enqueue_time(latency.id ? &latency.enqueue_us : nullptr);
     for (std::size_t i = 0; i < copies.size(); ++i) {
       if (i == 1) std::memset(to, 0xff, copies[i].stride);  // Invalid count until copied.
       const auto& copy = copies[i];
@@ -975,24 +1099,37 @@ class RoceOperator final : public AccessOperator {
     if (aclrtLaunchHostFunc(queued.stream, RunGetOnStream, &queued) != ACL_SUCCESS) {
       return CancelEnqueue(queued, "cannot enqueue RoCE Get host task");
     }
+    enqueue_time.Finish();
     if (queued.ranges) {
       pending_range_ = &queued;
       range_stream_ = queued.stream;
-      return queued.synchronous ? FinishPendingRange() : Status::OK();
+      if (queued.synchronous) {
+        ScopedLatency wait_current(latency.id ? &latency.wait_current_get_us : nullptr);
+        status = FinishPendingRange();
+      }
+      latency.ok = status.ok();
+      return status;
     }
-    if (!queued.synchronous) return Status::OK();
+    if (!queued.synchronous) {
+      latency.ok = true;
+      return Status::OK();
+    }
 
+    ScopedLatency wait_current(latency.id ? &latency.wait_current_get_us : nullptr);
     status = Synchronize(queued.stream);
+    wait_current.Finish();
     if (!queued.done.load(std::memory_order_acquire)) {
       UnsafeTeardown("RoCE Get host task did not finish after stream synchronization");
     }
     if (status.ok()) status = queued.result;
     ReapCompleted();
+    latency.ok = status.ok();
     return status;
   }
 
   static void RunGetOnStream(void* data) {
     auto& job = *static_cast<GetJob*>(data);
+    job.callback_start = MrTimingStart(job.latency_id != 0);
     auto& op = *job.owner;
     {
       // CANN host functions cannot call ACL. The worker owns parsing and verbs.
@@ -1021,12 +1158,39 @@ class RoceOperator final : public AccessOperator {
       work_head_ = job.next;
       if (work_head_ == nullptr) work_tail_ = &work_head_;
       lock.unlock();
+      const bool timing = job.latency_id != 0;
+      char timing_line[1024];
       try {
+        const auto worker_start = MrTimingStart(timing);
         job.result = job.ranges ? ExecuteRangeGet(job) : ExecuteGet(job);
         // A borrowed output may be freed as soon as the caller stream completes.
         // Release temporary MR/HAL references before the host task unblocks it.
+        const auto release_start = MrTimingStart(timing);
         job.registration.reset();
         job.hbm_region_lease.reset();
+        if (timing) {
+          const auto finished = MrClock::now();
+          std::snprintf(timing_line, sizeof(timing_line),
+                       "[KVAF_ROCE_LATENCY] pid=%ld id=%llu device=%u op=%s phase=worker ok=%d "
+                       "active_requests=%d enqueue_to_callback_us=%.3f worker_queue_us=%.3f "
+                       "worker_us=%.3f parse_us=%.3f mr_release_us=%.3f queue_lock_us=%.3f "
+                       "post_send_us=%.3f cq_wait_us=%.3f posted_bytes=%llu posted_wrs=%llu "
+                       "completed_wrs=%llu\n",
+                       static_cast<long>(getpid()),
+                       static_cast<unsigned long long>(job.latency_id), session_->device_id(),
+                       job.ranges ? "GET_RANGES" : "GET", job.result.ok(), job.active_requests,
+                       std::chrono::duration<double, std::micro>(
+                           job.callback_start - job.enqueue_start).count(),
+                       std::chrono::duration<double, std::micro>(
+                           worker_start - job.callback_start).count(),
+                       std::chrono::duration<double, std::micro>(finished - worker_start).count(),
+                       job.parse_us,
+                       std::chrono::duration<double, std::micro>(finished - release_start).count(),
+                       job.rdma.queue_lock_us, job.rdma.post_send_us, job.rdma.cq_wait_us,
+                       static_cast<unsigned long long>(job.rdma.posted_bytes),
+                       static_cast<unsigned long long>(job.rdma.posted_wrs),
+                       static_cast<unsigned long long>(job.rdma.completed_wrs));
+        }
       } catch (...) {
         // An exception in the posting/completion path may leave DMA outstanding.
         UnsafeTeardown("exception in RoCE Get worker");
@@ -1034,6 +1198,13 @@ class RoceOperator final : public AccessOperator {
       lock.lock();
       job.worker_done = true;
       worker_changed_.notify_all();
+      if (timing) {
+        // The callback may release the job after notification. Only the
+        // local formatted line is accessed after dropping the worker lock.
+        lock.unlock();
+        std::fputs(timing_line, stderr);
+        lock.lock();
+      }
     }
   }
 
@@ -1055,8 +1226,10 @@ class RoceOperator final : public AccessOperator {
     return value;
   }
 
-  Status ExecuteGet(const GetJob& job) {
+  Status ExecuteGet(GetJob& job) {
+    ScopedLatency parse(job.latency_id ? &job.parse_us : nullptr);
     const auto count = ReadMetadata<std::int32_t>(job.data[1], 0);
+    job.active_requests = count;
     const auto* valid = static_cast<const std::uint8_t*>(job.data[5]);
     if (count < 0 || static_cast<std::size_t>(count) > job.capacity) {
       return Status::InvalidArgument("RoCE Get miss_count exceeds request capacity");
@@ -1080,11 +1253,15 @@ class RoceOperator final : public AccessOperator {
       transfers.push_back({job.output + static_cast<std::uint64_t>(row) * job.token,
                            address + static_cast<std::uint64_t>(offset), job.token});
     }
-    return session_->ExecuteRegistered(*job.registration, transfers, true);
+    parse.Finish();
+    return session_->ExecuteRegistered(*job.registration, transfers, true,
+                                       job.latency_id ? &job.rdma : nullptr);
   }
 
-  Status ExecuteRangeGet(const GetJob& job) {
+  Status ExecuteRangeGet(GetJob& job) {
+    ScopedLatency parse(job.latency_id ? &job.parse_us : nullptr);
     const auto count = ReadMetadata<std::int32_t>(job.data[1], 0);
+    job.active_requests = count;
     if (count < 0 || static_cast<std::size_t>(count) > job.capacity)
       return Status::InvalidArgument("RoCE range Get request_count exceeds capacity");
     if (count == 0) return Status::OK();
@@ -1131,6 +1308,8 @@ class RoceOperator final : public AccessOperator {
                         static_cast<std::uint64_t>(bytes)});
     }
 
+    parse.Finish();
+    auto* latency = job.latency_id ? &job.rdma : nullptr;
     const std::uint64_t limit = job.chunk_bytes ? job.chunk_bytes : UINT32_MAX;
     for (const auto& range : ranges) {
       for (std::uint64_t offset = 0; offset < range.bytes;) {
@@ -1139,13 +1318,13 @@ class RoceOperator final : public AccessOperator {
                              static_cast<std::uint32_t>(bytes)});
         offset += bytes;
         if (transfers.size() == window) {
-          auto status = session_->ExecuteRegistered(*job.registration, transfers, true);
+          auto status = session_->ExecuteRegistered(*job.registration, transfers, true, latency);
           if (!status.ok()) return status;
           transfers.clear();
         }
       }
     }
-    return session_->ExecuteRegistered(*job.registration, transfers, true);
+    return session_->ExecuteRegistered(*job.registration, transfers, true, latency);
   }
 
   Status FinishPendingRange() {
@@ -1184,6 +1363,7 @@ class RoceOperator final : public AccessOperator {
 
   std::shared_ptr<RoceSession> session_;
   const bool mr_timing_{MrTimingEnabled()};
+  const bool latency_enabled_{RoceLatencyEnabled()};
   std::list<std::unique_ptr<GetJob>> pending_;
   GetJob* pending_range_{nullptr};
   aclrtStream range_stream_{};

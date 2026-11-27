@@ -313,6 +313,19 @@ remote.initialize(16 * slot_bytes, slot_bytes)
 
 ### RoCE 显式 HBM 注册与时延
 
+在启动业务进程前设置 `KVAF_ROCE_LATENCY=1` 可开启 RoCE Runtime 的诊断日志。
+所有耗时字段均为微秒，按 `pid` 和 `id` 关联同一次调用的记录。
+
+- `phase=call` 记录 RoCE 后端调用耗时。Put 包含等待上一批 range Get、等待调用方
+  stream、获取 MR、提交 WR 和等待 CQE 的耗时。Get 记录等待上一批、获取 MR、
+  分配并清零 Host staging，以及 D2H 拷贝和 Host 回调入队的耗时。同步 Get
+  另记录 `wait_current_get_us`。此处的 `total_us` 从 RoCE 后端入口开始计时。
+- `phase=worker` 记录 Get 的实际执行。包含从开始入队到回调开始、worker 排队、
+  元数据解析、MR 引用释放、QP 锁等待、提交 WR 和等待 CQE 的耗时。
+  `enqueue_to_callback_us` 含 stream 上已有的任务和元数据 D2H。
+- `posted_wrs`、`posted_bytes` 是 verbs 确认提交的数量和字节数，
+  `completed_wrs` 是实际确认成功的 WR 数。Get 的这些数据看 worker 行。
+
 默认使用 8 个 slot、每个 slot 4096 字节、1 次预热和 5 次采样。可通过
 `KVAF_HBM_TEST_BLOCKS`、`KVAF_HBM_TEST_TOKEN_BYTES`、
 `KVAF_HBM_TEST_TOKENS_PER_BLOCK`、`KVAF_HBM_TEST_WARMUP` 和
